@@ -6,6 +6,7 @@ import "encoding/json"
 type Role string
 
 const (
+	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
 	RoleTool      Role = "tool"
@@ -14,17 +15,17 @@ const (
 // Message is one message sent to the model. Tool calls live on the assistant
 // message; each tool result is its own role=tool message.
 type Message struct {
-	Role       Role
-	Content    string
-	ToolCalls  []ToolCall
-	ToolCallID string
-	Name       string
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
+	ToolCallID string     `json:"toolCallId,omitempty"`
+	Name       string     `json:"name,omitempty"`
 }
 
 type ToolCall struct {
-	ID        string
-	Name      string
-	Arguments string
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type ToolDef struct {

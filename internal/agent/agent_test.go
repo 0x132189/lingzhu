@@ -18,11 +18,15 @@ import (
 type fakeProvider struct {
 	requests []model.Request
 	chunks   [][]provider.Chunk
+	errs     []error
 }
 
 func (f *fakeProvider) Stream(_ context.Context, req model.Request) (provider.Stream, error) {
 	f.requests = append(f.requests, req)
 	index := len(f.requests) - 1
+	if index < len(f.errs) && f.errs[index] != nil {
+		return nil, f.errs[index]
+	}
 	if index >= len(f.chunks) {
 		return &fakeStream{}, nil
 	}
@@ -66,7 +70,7 @@ func newTestAgent(t *testing.T, fake *fakeProvider) (*Agent, *session.Store) {
 	}
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
-	return New(store, fake, registry, nil, "test-model", 4), store
+	return New(store, fake, registry, nil, Options{Model: "test-model", MaxSteps: 4}), store
 }
 
 func TestRunExecutesToolThenFinishes(t *testing.T) {
@@ -137,7 +141,7 @@ func TestRunRequiresModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := New(store, &fakeProvider{}, tool.NewRegistry(), nil, "", 4)
+	a := New(store, &fakeProvider{}, tool.NewRegistry(), nil, Options{Model: "", MaxSteps: 4})
 	if _, err := a.Run(context.Background(), "s1", "x"); err == nil {
 		t.Fatal("want error when model is empty")
 	}
@@ -156,7 +160,7 @@ func TestPermissionRejectContinuesRun(t *testing.T) {
 		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
 		{{Text: "understood"}},
 	}}
-	a := New(store, fake, registry, perm, "test-model", 4)
+	a := New(store, fake, registry, perm, Options{Model: "test-model", MaxSteps: 4})
 
 	stream, err := a.Run(context.Background(), "s1", "go")
 	if err != nil {

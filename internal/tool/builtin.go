@@ -14,12 +14,16 @@ import (
 
 const maxOutput = 64 * 1024
 
-// Builtins returns the built-in tools: bash, read_file and write_file.
+// Builtins returns the built-in tools: bash, read_file, write_file, edit, glob
+// and grep. All file access is rooted at workdir.
 func Builtins(shell []string, workdir string) []Tool {
 	return []Tool{
 		&Bash{Shell: shell, Dir: workdir},
 		&ReadFile{Dir: workdir},
 		&WriteFile{Dir: workdir},
+		&Edit{Dir: workdir},
+		&Glob{Dir: workdir},
+		&Grep{Dir: workdir},
 	}
 }
 
@@ -217,5 +221,5 @@ func truncate(s string) string {
 	if len(s) <= maxOutput {
 		return s
 	}
-	return s[:maxOutput] + "\n(output truncated)"
+	return strings.ToValidUTF8(s[:maxOutput], "") + "\n(output truncated)"
 }

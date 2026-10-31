@@ -50,7 +50,7 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request) (Stream, error) 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("provider %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, classifyError(resp.Status, string(body))
 	}
 	return &openAIStream{body: resp.Body, reader: bufio.NewReaderSize(resp.Body, 64*1024)}, nil
 }
@@ -72,7 +72,7 @@ func (s *openAIStream) Recv() (Chunk, error) {
 			if parseErr != nil {
 				return Chunk{}, parseErr
 			}
-			if chunk.Text != "" || len(chunk.ToolCalls) > 0 {
+			if chunk.Text != "" || len(chunk.ToolCalls) > 0 || chunk.Usage != nil {
 				return chunk, nil
 			}
 		}
@@ -85,10 +85,15 @@ func (s *openAIStream) Recv() (Chunk, error) {
 func (s *openAIStream) Close() error { return s.body.Close() }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Tools    []chatTool    `json:"tools,omitempty"`
-	Stream   bool          `json:"stream"`
+	Model         string             `json:"model"`
+	Messages      []chatMessage      `json:"messages"`
+	Tools         []chatTool         `json:"tools,omitempty"`
+	Stream        bool               `json:"stream"`
+	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
+}
+
+type chatStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {
@@ -121,7 +126,12 @@ type chatToolFunction struct {
 }
 
 func toChatRequest(req model.Request) chatRequest {
-	out := chatRequest{Model: req.Model, Stream: true, Messages: make([]chatMessage, 0, len(req.Messages))}
+	out := chatRequest{
+		Model:         req.Model,
+		Stream:        true,
+		StreamOptions: &chatStreamOptions{IncludeUsage: true},
+		Messages:      make([]chatMessage, 0, len(req.Messages)),
+	}
 	for _, m := range req.Messages {
 		msg := chatMessage{Role: string(m.Role), Content: m.Content, ToolCallID: m.ToolCallID}
 		for _, call := range m.ToolCalls {
@@ -160,9 +170,19 @@ type streamResponse struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage *chatUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+type chatUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptCacheHit      int `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 func parseChunk(payload string) (Chunk, error) {
@@ -171,7 +191,7 @@ func parseChunk(payload string) (Chunk, error) {
 		return Chunk{}, fmt.Errorf("decode stream chunk: %w", err)
 	}
 	if resp.Error != nil {
-		return Chunk{}, fmt.Errorf("provider error: %s", resp.Error.Message)
+		return Chunk{}, classifyError("stream error", resp.Error.Message)
 	}
 	var chunk Chunk
 	for _, choice := range resp.Choices {
@@ -185,5 +205,26 @@ func parseChunk(payload string) (Chunk, error) {
 			})
 		}
 	}
+	chunk.Usage = parseUsage(resp.Usage)
 	return chunk, nil
+}
+
+// parseUsage normalizes provider usage: prompt tokens include cached ones, so
+// cached tokens are moved out of Input and into CacheRead.
+func parseUsage(usage *chatUsage) *Usage {
+	if usage == nil || usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		return nil
+	}
+	cached := usage.PromptCacheHit
+	if usage.PromptTokensDetails != nil && usage.PromptTokensDetails.CachedTokens > cached {
+		cached = usage.PromptTokensDetails.CachedTokens
+	}
+	if cached > usage.PromptTokens {
+		cached = usage.PromptTokens
+	}
+	return &Usage{
+		Input:     usage.PromptTokens - cached,
+		Output:    usage.CompletionTokens,
+		CacheRead: cached,
+	}
 }

@@ -1,6 +1,8 @@
 package session
 
 import (
+	"errors"
+	"os"
 	"testing"
 
 	"lingzhu/internal/event"
@@ -20,11 +22,11 @@ func TestAppendAndRebuild(t *testing.T) {
 		event.Assistant("done"),
 	}
 	for _, ev := range events {
-		if err := store.Append("s1", ev); err != nil {
+		if _, err := store.Append("s1", ev); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := store.Append("s1", event.Delta("ignored")); err != nil {
+	if _, err := store.Append("s1", event.Delta("ignored")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -62,7 +64,7 @@ func TestRejectsInvalidID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Append("../escape", event.User("x")); err == nil {
+	if _, err := store.Append("../escape", event.User("x")); err == nil {
 		t.Fatal("want error for path traversal id")
 	}
 }
@@ -73,18 +75,101 @@ func TestList(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"b", "a"} {
-		if err := store.Append(id, event.User("x")); err != nil {
+		if _, err := store.Append(id, event.User("x")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ids, err := store.List()
+	infos, err := store.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 2 || ids[0] != "a" || ids[1] != "b" {
-		t.Fatalf("want sorted [a b], got %v", ids)
+	if len(infos) != 2 || infos[0].ID != "a" || infos[1].ID != "b" {
+		t.Fatalf("want sorted [a b], got %+v", infos)
+	}
+	if infos[0].Title != "x" {
+		t.Fatalf("title should fall back to the first user message, got %q", infos[0].Title)
 	}
 	if _, err := store.Events("missing"); err != nil {
 		t.Fatalf("missing session should read as empty: %v", err)
+	}
+}
+
+func TestAppendAssignsSequence(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range []event.Event{event.User("a"), event.Assistant("b")} {
+		if _, err := store.Append("s1", ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Append("s1", event.Delta("not durable")); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Seq != 1 || events[1].Seq != 2 {
+		t.Fatalf("unexpected sequence numbers: %+v", events)
+	}
+	after, err := store.EventsAfter("s1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 || after[0].Seq != 2 {
+		t.Fatalf("unexpected replay: %+v", after)
+	}
+}
+
+func TestSequenceSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.User("a")); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Append("s1", event.Assistant("b")); err != nil {
+		t.Fatal(err)
+	}
+	events, err := reopened.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[1].Seq != 2 {
+		t.Fatalf("sequence should continue after reopen: %+v", events)
+	}
+}
+
+func TestSetTitleAndDelete(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.User("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTitle("s1", "My session"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.Info("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Title != "My session" {
+		t.Fatalf("unexpected title: %+v", info)
+	}
+	if err := store.Delete("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Info("s1"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted session should be missing, got %v", err)
 	}
 }

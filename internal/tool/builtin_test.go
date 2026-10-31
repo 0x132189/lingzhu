@@ -95,8 +95,8 @@ func TestUnknownTool(t *testing.T) {
 func TestDefinitionsSorted(t *testing.T) {
 	registry, _ := newRegistry(t, nil)
 	defs := registry.Definitions()
-	if len(defs) != 3 {
-		t.Fatalf("want 3 definitions, got %d", len(defs))
+	if len(defs) != 6 {
+		t.Fatalf("want 6 definitions, got %d", len(defs))
 	}
 	for i := 1; i < len(defs); i++ {
 		if defs[i-1].Name > defs[i].Name {

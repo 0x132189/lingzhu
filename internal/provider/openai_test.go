@@ -63,6 +63,9 @@ func TestStreamParsesSSE(t *testing.T) {
 	if gotBody.Model != "m" || !gotBody.Stream || len(gotBody.Tools) != 1 {
 		t.Fatalf("unexpected request body: %+v", gotBody)
 	}
+	if gotBody.StreamOptions == nil || !gotBody.StreamOptions.IncludeUsage {
+		t.Fatalf("usage was not requested: %+v", gotBody.StreamOptions)
+	}
 	if gotBody.Messages[0].Role != "user" || gotBody.Messages[0].Content != "hi" {
 		t.Fatalf("unexpected messages: %+v", gotBody.Messages)
 	}
@@ -77,5 +80,55 @@ func TestStreamReportsHTTPError(t *testing.T) {
 	p := NewOpenAI(server.URL, "key")
 	if _, err := p.Stream(context.Background(), model.Request{Model: "m"}); err == nil {
 		t.Fatal("want error on non-200 response")
+	}
+}
+
+func TestStreamNormalizesUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := NewOpenAI(server.URL, "key")
+	stream, err := p.Stream(context.Background(), model.Request{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	var usage *Usage
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+	}
+	if usage == nil {
+		t.Fatal("usage chunk not reported")
+	}
+	if usage.Input != 60 || usage.CacheRead != 40 || usage.Output != 7 {
+		t.Fatalf("unexpected usage: %+v", usage)
+	}
+}
+
+func TestStreamClassifiesOverflow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"This model's maximum context length is 8192 tokens"}}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	p := NewOpenAI(server.URL, "key")
+	_, err := p.Stream(context.Background(), model.Request{Model: "m"})
+	if !IsContextOverflow(err) {
+		t.Fatalf("want context overflow, got %v", err)
 	}
 }

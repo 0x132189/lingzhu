@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -56,7 +57,10 @@ Environment:
   LINGZHU_CONFIG      config file path
   LINGZHU_ADDR        listen address, default 127.0.0.1:8787
   LINGZHU_DATA_DIR    data directory, default "data" next to config.json
+  LINGZHU_WORKDIR     agent working directory, default the process directory
   LINGZHU_MODEL       model name
+  LINGZHU_CONTEXT_WINDOW  model context size, 0 disables auto compaction
+  LINGZHU_COMPACT_KEEP    recent tokens kept beside a summary, default 15000
   OPENAI_BASE_URL     model endpoint, default https://api.openai.com/v1
   OPENAI_API_KEY      endpoint API key
 `)
@@ -68,9 +72,10 @@ func serve(args []string) {
 	addr := fs.String("addr", "", "listen address")
 	data := fs.String("data", "", "data directory")
 	model := fs.String("model", "", "model name")
+	workdir := fs.String("workdir", "", "agent working directory")
 	_ = fs.Parse(args)
 
-	cfg := mustConfig(*configPath, *addr, *data, *model)
+	cfg := mustConfig(*configPath, *addr, *data, *model, *workdir)
 	application, err := app.New(cfg)
 	if err != nil {
 		log.Fatalf("init: %v", err)
@@ -88,13 +93,39 @@ func serve(args []string) {
 		}
 	}()
 
+	// A desktop client can ask the core to stop through the shutdown endpoint;
+	// signals do the same thing from a terminal.
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	application.Server.OnShutdown(func() { quitOnce.Do(func() { close(quit) }) })
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+
+	// A desktop client that spawns this process sets LINGZHU_PARENT_PID; when
+	// the client disappears, shut down instead of outliving it.
+	watchParent(func() { quitOnce.Do(func() { close(quit) }) })
+
+	select {
+	case <-stop:
+	case <-quit:
+	}
+
+	// Interrupt running turns first so their SSE handlers return, then close
+	// the listener and wait for in-flight requests.
+	log.Print("shutting down")
+	runCtx, cancelRuns := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := application.Shutdown(runCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
+	cancelRuns()
+	application.Server.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = server.Shutdown(ctx)
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("server shutdown: %v", err)
+	}
 }
 
 func run(args []string) {
@@ -104,6 +135,7 @@ func run(args []string) {
 	addr := fs.String("addr", "", "listen address")
 	data := fs.String("data", "", "data directory")
 	model := fs.String("model", "", "model name")
+	workdir := fs.String("workdir", "", "agent working directory")
 	_ = fs.Parse(args)
 
 	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -111,7 +143,7 @@ func run(args []string) {
 		log.Fatal("run: prompt is empty")
 	}
 
-	cfg := mustConfig(*configPath, *addr, *data, *model)
+	cfg := mustConfig(*configPath, *addr, *data, *model, *workdir)
 	application, err := app.New(cfg)
 	if err != nil {
 		log.Fatalf("init: %v", err)
@@ -132,6 +164,8 @@ func run(args []string) {
 			fmt.Fprintf(os.Stderr, "\n[tool] %v %v\n", ev.Data["name"], ev.Data["arguments"])
 		case event.ToolResult:
 			fmt.Fprintf(os.Stderr, "[result] %v\n", ev.Data["output"])
+		case event.CompactionStart:
+			fmt.Fprint(os.Stderr, "\n[compact] summarizing older context\n")
 		case event.Error:
 			failed = true
 			fmt.Fprintf(os.Stderr, "\n[error] %v\n", ev.Data["message"])
@@ -176,7 +210,7 @@ func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) er
 }
 
 // mustConfig loads the config file and applies non-empty command-line overrides.
-func mustConfig(path, addr, data, model string) config.Config {
+func mustConfig(path, addr, data, model, workdir string) config.Config {
 	cfg, err := config.Load(path)
 	if err != nil {
 		log.Fatalf("config %s: %v", path, err)
@@ -192,6 +226,9 @@ func mustConfig(path, addr, data, model string) config.Config {
 	}
 	if model != "" {
 		cfg.Model = model
+	}
+	if workdir != "" {
+		cfg.Workdir = workdir
 	}
 	return cfg
 }

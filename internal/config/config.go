@@ -13,14 +13,18 @@ import (
 )
 
 type Config struct {
-	Addr       string
-	DataDir    string
-	Model      string
-	BaseURL    string
-	APIKey     string
-	MaxSteps   int
-	Shell      []string
-	Permission []Rule
+	Addr          string
+	DataDir       string
+	Workdir       string
+	Model         string
+	BaseURL       string
+	APIKey        string
+	MaxSteps      int
+	Shell         []string
+	Permission    []Rule
+	SystemPrompt  string
+	ContextWindow int
+	CompactKeep   int
 }
 
 // Rule is a permission rule; action and resource support wildcards.
@@ -32,14 +36,18 @@ type Rule struct {
 
 // File is the config file shape; fields use snake_case.
 type File struct {
-	Addr       string   `json:"addr"`
-	DataDir    string   `json:"data_dir"`
-	Model      string   `json:"model"`
-	BaseURL    string   `json:"base_url"`
-	APIKey     string   `json:"api_key"`
-	MaxSteps   int      `json:"max_steps"`
-	Shell      []string `json:"shell"`
-	Permission []Rule   `json:"permission"`
+	Addr          string   `json:"addr"`
+	DataDir       string   `json:"data_dir"`
+	Workdir       string   `json:"workdir"`
+	Model         string   `json:"model"`
+	BaseURL       string   `json:"base_url"`
+	APIKey        string   `json:"api_key"`
+	MaxSteps      int      `json:"max_steps"`
+	Shell         []string `json:"shell"`
+	Permission    []Rule   `json:"permission"`
+	SystemPrompt  string   `json:"system_prompt"`
+	ContextWindow *int     `json:"context_window"`
+	CompactKeep   int      `json:"compact_keep"`
 }
 
 // DefaultPath returns the config file path: an explicit path wins, otherwise
@@ -58,11 +66,14 @@ func DefaultPath() string {
 
 func Load(path string) (Config, error) {
 	cfg := Config{
-		Addr:     "127.0.0.1:8787",
-		DataDir:  "data",
-		BaseURL:  "https://api.openai.com/v1",
-		MaxSteps: 16,
-		Shell:    DefaultShell(),
+		Addr:          "127.0.0.1:8787",
+		DataDir:       "data",
+		Workdir:       "",
+		BaseURL:       "https://api.openai.com/v1",
+		MaxSteps:      16,
+		Shell:         DefaultShell(),
+		ContextWindow: 128000,
+		CompactKeep:   15000,
 	}
 
 	if path != "" {
@@ -98,6 +109,9 @@ func applyFile(cfg *Config, file File, dir string) {
 	if file.DataDir != "" {
 		cfg.DataDir = filepath.Join(dir, file.DataDir)
 	}
+	if file.Workdir != "" {
+		cfg.Workdir = filepath.Join(dir, file.Workdir)
+	}
 	if file.Model != "" {
 		cfg.Model = file.Model
 	}
@@ -116,6 +130,15 @@ func applyFile(cfg *Config, file File, dir string) {
 	if len(file.Permission) > 0 {
 		cfg.Permission = file.Permission
 	}
+	if file.SystemPrompt != "" {
+		cfg.SystemPrompt = file.SystemPrompt
+	}
+	if file.ContextWindow != nil && *file.ContextWindow >= 0 {
+		cfg.ContextWindow = *file.ContextWindow
+	}
+	if file.CompactKeep > 0 {
+		cfg.CompactKeep = file.CompactKeep
+	}
 }
 
 func applyEnv(cfg *Config) {
@@ -126,13 +149,21 @@ func applyEnv(cfg *Config) {
 	}
 	set("LINGZHU_ADDR", &cfg.Addr)
 	set("LINGZHU_DATA_DIR", &cfg.DataDir)
+	set("LINGZHU_WORKDIR", &cfg.Workdir)
 	set("LINGZHU_MODEL", &cfg.Model)
+	set("LINGZHU_SYSTEM_PROMPT", &cfg.SystemPrompt)
 	set("OPENAI_API_KEY", &cfg.APIKey)
 	if v := os.Getenv("OPENAI_BASE_URL"); v != "" {
 		cfg.BaseURL = strings.TrimRight(v, "/")
 	}
 	if n, err := strconv.Atoi(os.Getenv("LINGZHU_MAX_STEPS")); err == nil && n > 0 {
 		cfg.MaxSteps = n
+	}
+	if n, err := strconv.Atoi(os.Getenv("LINGZHU_CONTEXT_WINDOW")); err == nil && n >= 0 {
+		cfg.ContextWindow = n
+	}
+	if n, err := strconv.Atoi(os.Getenv("LINGZHU_COMPACT_KEEP")); err == nil && n > 0 {
+		cfg.CompactKeep = n
 	}
 }
 

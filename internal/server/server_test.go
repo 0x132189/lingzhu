@@ -40,11 +40,49 @@ func (s *staticStream) Close() error { return nil }
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	return newServerWith(t, staticProvider{})
+}
+
+func newServerWith(t *testing.T, p provider.Provider) *Server {
+	t.Helper()
 	store, err := session.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(agent.New(store, staticProvider{}, tool.NewRegistry(), nil, "test-model", 2), store)
+	return New(agent.New(store, p, tool.NewRegistry(), nil, agent.Options{Model: "test-model", MaxSteps: 2}), store)
+}
+
+// blockProvider never answers until its run is cancelled.
+type blockProvider struct {
+	started chan struct{}
+}
+
+func (p *blockProvider) Stream(ctx context.Context, _ model.Request) (provider.Stream, error) {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	return &blockStream{ctx: ctx}, nil
+}
+
+type blockStream struct {
+	ctx context.Context
+}
+
+func (s *blockStream) Recv() (provider.Chunk, error) {
+	<-s.ctx.Done()
+	return provider.Chunk{}, s.ctx.Err()
+}
+
+func (s *blockStream) Close() error { return nil }
+
+func prompt(t *testing.T, url, session, text string) *http.Response {
+	t.Helper()
+	resp, err := http.Post(url+"/sessions/"+session+"/prompt", "application/json", strings.NewReader(`{"text":"`+text+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func TestPromptStreamsSSE(t *testing.T) {
@@ -79,8 +117,8 @@ func TestPromptStreamsSSE(t *testing.T) {
 	defer messages.Body.Close()
 	var payload struct {
 		Messages []struct {
-			Role    string `json:"Role"`
-			Content string `json:"Content"`
+			Role    string `json:"role"`
+			Content string `json:"content"`
 		} `json:"messages"`
 	}
 	if err := json.NewDecoder(messages.Body).Decode(&payload); err != nil {

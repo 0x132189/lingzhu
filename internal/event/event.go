@@ -15,12 +15,18 @@ const (
 	ToolResult        Type = "tool.result"
 	PermissionAsked   Type = "permission.asked"
 	PermissionReplied Type = "permission.replied"
+	Usage             Type = "usage"
+	CompactionStart   Type = "compaction.start"
+	Compaction        Type = "compaction"
 	RunEnd            Type = "run.end"
 	Error             Type = "error"
 )
 
 type Event struct {
-	Type Type           `json:"type"`
+	Type Type `json:"type"`
+	// Seq is the durable sequence number within one session; zero for events
+	// that are not persisted.
+	Seq  int64          `json:"seq,omitempty"`
 	At   time.Time      `json:"at"`
 	Data map[string]any `json:"data,omitempty"`
 }
@@ -28,7 +34,7 @@ type Event struct {
 // Durable reports whether the event is written to the session log.
 func (e Event) Durable() bool {
 	switch e.Type {
-	case StepStart, TextDelta, RunEnd, Error, PermissionAsked, PermissionReplied:
+	case StepStart, TextDelta, RunEnd, Error, PermissionAsked, PermissionReplied, CompactionStart:
 		return false
 	}
 	return true
@@ -60,6 +66,26 @@ func ToolCallEvent(id, name, arguments string) Event {
 
 func ToolResultEvent(id, name, output string, failed bool) Event {
 	return New(ToolResult, map[string]any{"id": id, "name": name, "output": output, "failed": failed})
+}
+
+// UsageEvent records what the provider reported for one model call. Input
+// excludes cached tokens, so input + cacheRead is the whole prompt.
+func UsageEvent(input, output, cacheRead, cacheWrite int) Event {
+	return New(Usage, map[string]any{
+		"input":      input,
+		"output":     output,
+		"cacheRead":  cacheRead,
+		"cacheWrite": cacheWrite,
+	})
+}
+
+// CompactionEvent replaces all earlier messages with checkpoint.
+func CompactionEvent(checkpoint string, covered int) Event {
+	return New(Compaction, map[string]any{"checkpoint": checkpoint, "covered": covered})
+}
+
+func CompactionStartEvent() Event {
+	return New(CompactionStart, nil)
 }
 
 func End(reason string) Event {
