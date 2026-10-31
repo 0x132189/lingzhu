@@ -11,6 +11,7 @@ import (
 
 	"lingzhu/internal/event"
 	"lingzhu/internal/model"
+	"lingzhu/internal/permission"
 	"lingzhu/internal/provider"
 	"lingzhu/internal/session"
 	"lingzhu/internal/tool"
@@ -20,12 +21,29 @@ type Agent struct {
 	store    *session.Store
 	provider provider.Provider
 	tools    *tool.Registry
+	perm     *permission.Manager
 	model    string
 	maxSteps int
 }
 
-func New(store *session.Store, p provider.Provider, tools *tool.Registry, modelName string, maxSteps int) *Agent {
-	return &Agent{store: store, provider: p, tools: tools, model: modelName, maxSteps: maxSteps}
+func New(store *session.Store, p provider.Provider, tools *tool.Registry, perm *permission.Manager, modelName string, maxSteps int) *Agent {
+	return &Agent{store: store, provider: p, tools: tools, perm: perm, model: modelName, maxSteps: maxSteps}
+}
+
+// Reply 回答一次待批的权限请求。
+func (a *Agent) Reply(id string, decision permission.Decision, message string) error {
+	if a.perm == nil {
+		return errors.New("permission is not configured")
+	}
+	return a.perm.Reply(id, decision, message)
+}
+
+// Pending 列出待批的权限请求，sessionID 为空时返回全部。
+func (a *Agent) Pending(sessionID string) []permission.Request {
+	if a.perm == nil {
+		return nil
+	}
+	return a.perm.Pending(sessionID)
 }
 
 // Run 异步执行一轮对话，返回事件流。事件流在结束时关闭。
@@ -132,7 +150,15 @@ func (a *Agent) runTools(ctx context.Context, sessionID string, calls []model.To
 			a.fail(events, err)
 			return false
 		}
-		output, err := a.tools.Run(ctx, call.Name, []byte(call.Arguments))
+		output, err := a.tools.Run(ctx, tool.Call{
+			SessionID: sessionID,
+			Name:      call.Name,
+			Input:     []byte(call.Arguments),
+			Perm:      a.perm,
+			OnAsk: func(req permission.Request) {
+				sendRealtime(events, event.PermissionAskedEvent(req.ID, req.SessionID, req.Action, req.Resources, req.Message))
+			},
+		})
 		failed := err != nil
 		if err != nil {
 			output = strings.TrimSpace(output + "\n" + err.Error())

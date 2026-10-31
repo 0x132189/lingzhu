@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"lingzhu/internal/agent"
+	"lingzhu/internal/permission"
 	"lingzhu/internal/session"
 )
 
@@ -40,8 +41,36 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"messages": messages})
 	})
+	mux.HandleFunc("GET /sessions/{id}/permission", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"requests": s.agent.Pending(r.PathValue("id"))})
+	})
+	mux.HandleFunc("POST /sessions/{id}/permission/{rid}", s.replyPermission)
 	mux.HandleFunc("POST /sessions/{id}/prompt", s.prompt)
 	return mux
+}
+
+// replyPermission 回答一次待批的权限请求。
+func (s *Server) replyPermission(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Decision string `json:"decision"`
+		Message  string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	decision := permission.Decision(body.Decision)
+	switch decision {
+	case permission.Once, permission.Always, permission.Reject:
+	default:
+		writeError(w, http.StatusBadRequest, errText("decision must be once, always or reject"))
+		return
+	}
+	if err := s.agent.Reply(r.PathValue("rid"), decision, body.Message); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // prompt 以 SSE 返回一轮对话的全部事件。

@@ -7,14 +7,16 @@ import "time"
 type Type string
 
 const (
-	StepStart        Type = "step.start"
-	TextDelta        Type = "text.delta"
-	UserMessage      Type = "user.message"
-	AssistantMessage Type = "assistant.message"
-	ToolCall         Type = "tool.call"
-	ToolResult       Type = "tool.result"
-	RunEnd           Type = "run.end"
-	Error            Type = "error"
+	StepStart         Type = "step.start"
+	TextDelta         Type = "text.delta"
+	UserMessage       Type = "user.message"
+	AssistantMessage  Type = "assistant.message"
+	ToolCall          Type = "tool.call"
+	ToolResult        Type = "tool.result"
+	PermissionAsked   Type = "permission.asked"
+	PermissionReplied Type = "permission.replied"
+	RunEnd            Type = "run.end"
+	Error             Type = "error"
 )
 
 type Event struct {
@@ -26,7 +28,7 @@ type Event struct {
 // Durable 表示该事件是否写入会话日志。增量与运行控制事件不落盘。
 func (e Event) Durable() bool {
 	switch e.Type {
-	case StepStart, TextDelta, RunEnd, Error:
+	case StepStart, TextDelta, RunEnd, Error, PermissionAsked, PermissionReplied:
 		return false
 	}
 	return true
@@ -62,6 +64,18 @@ func ToolResultEvent(id, name, output string, failed bool) Event {
 
 func End(reason string) Event {
 	return New(RunEnd, map[string]any{"reason": reason})
+}
+
+func PermissionAskedEvent(id, sessionID, action string, resources []string, message string) Event {
+	data := map[string]any{"id": id, "sessionId": sessionID, "action": action, "resources": resources}
+	if message != "" {
+		data["message"] = message
+	}
+	return New(PermissionAsked, data)
+}
+
+func PermissionRepliedEvent(id, sessionID, decision string) Event {
+	return New(PermissionReplied, map[string]any{"id": id, "sessionId": sessionID, "decision": decision})
 }
 
 func ErrorEvent(message string) Event {

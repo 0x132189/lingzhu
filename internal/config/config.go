@@ -13,24 +13,33 @@ import (
 )
 
 type Config struct {
-	Addr     string
-	DataDir  string
-	Model    string
-	BaseURL  string
-	APIKey   string
-	MaxSteps int
-	Shell    []string
+	Addr       string
+	DataDir    string
+	Model      string
+	BaseURL    string
+	APIKey     string
+	MaxSteps   int
+	Shell      []string
+	Permission []Rule
+}
+
+// Rule 是权限规则，action 与 resource 支持通配符。
+type Rule struct {
+	Action   string `json:"action"`
+	Resource string `json:"resource"`
+	Effect   string `json:"effect"`
 }
 
 // File 是配置文件的结构，字段名用下划线。
 type File struct {
-	Addr     string   `json:"addr"`
-	DataDir  string   `json:"data_dir"`
-	Model    string   `json:"model"`
-	BaseURL  string   `json:"base_url"`
-	APIKey   string   `json:"api_key"`
-	MaxSteps int      `json:"max_steps"`
-	Shell    []string `json:"shell"`
+	Addr       string   `json:"addr"`
+	DataDir    string   `json:"data_dir"`
+	Model      string   `json:"model"`
+	BaseURL    string   `json:"base_url"`
+	APIKey     string   `json:"api_key"`
+	MaxSteps   int      `json:"max_steps"`
+	Shell      []string `json:"shell"`
+	Permission []Rule   `json:"permission"`
 }
 
 // DefaultPath 返回实际使用的配置文件路径：显式传入优先，
@@ -103,6 +112,9 @@ func applyFile(cfg *Config, file File, dir string) {
 	}
 	if len(file.Shell) > 0 {
 		cfg.Shell = file.Shell
+	}
+	if len(file.Permission) > 0 {
+		cfg.Permission = file.Permission
 	}
 }
 

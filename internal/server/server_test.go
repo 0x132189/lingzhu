@@ -44,7 +44,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(agent.New(store, staticProvider{}, tool.NewRegistry(), "test-model", 2), store)
+	return New(agent.New(store, staticProvider{}, tool.NewRegistry(), nil, "test-model", 2), store)
 }
 
 func TestPromptStreamsSSE(t *testing.T) {
@@ -103,4 +103,28 @@ func TestPromptRejectsEmptyText(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", resp.StatusCode)
 	}
+}
+
+func TestReplyPermissionValidatesInput(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Handler())
+	defer srv.Close()
+
+	bad := post(t, srv.URL+"/sessions/s1/permission/per_1", `{"decision":"maybe"}`)
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for unknown decision, got %d", bad.StatusCode)
+	}
+	missing := post(t, srv.URL+"/sessions/s1/permission/per_missing", `{"decision":"once"}`)
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for unknown request, got %d", missing.StatusCode)
+	}
+}
+
+func post(t *testing.T, url, body string) *http.Response {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
 }

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -17,6 +18,7 @@ import (
 	"lingzhu/internal/app"
 	"lingzhu/internal/config"
 	"lingzhu/internal/event"
+	"lingzhu/internal/permission"
 )
 
 const version = "0.1.0-dev"
@@ -114,7 +116,10 @@ func run(args []string) {
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
-	events, err := application.Agent.Run(context.Background(), *sessionID, prompt)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := bufio.NewReader(os.Stdin)
+	events, err := application.Agent.Run(ctx, *sessionID, prompt)
 	if err != nil {
 		log.Fatalf("run: %v", err)
 	}
@@ -130,12 +135,44 @@ func run(args []string) {
 		case event.Error:
 			failed = true
 			fmt.Fprintf(os.Stderr, "\n[error] %v\n", ev.Data["message"])
+		case event.PermissionAsked:
+			if err := askPermission(application, ev, stdin); err != nil {
+				failed = true
+				fmt.Fprintf(os.Stderr, "\n[error] %v\n", err)
+				cancel()
+			}
 		}
 	}
 	fmt.Println()
 	if failed {
 		os.Exit(1)
 	}
+}
+
+// askPermission 在终端询问一次待批的权限请求。
+func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) error {
+	id, _ := ev.Data["id"].(string)
+	action, _ := ev.Data["action"].(string)
+	resources, _ := ev.Data["resources"].([]string)
+	fmt.Fprintf(os.Stderr, "\n[permission] %s %s  [y] 本次允许 / [a] 总是允许 / [n] 拒绝: ", action, strings.Join(resources, ", "))
+
+	line, err := stdin.ReadString('\n')
+	answer := strings.Trim(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(line)), "\ufeff"), "\x00 ")
+	decision := permission.Reject
+	switch answer {
+	case "y", "yes":
+		decision = permission.Once
+	case "a", "always":
+		decision = permission.Always
+	}
+	// 读不到输入也要回答，否则工具调用会一直等待。
+	if replyErr := application.Agent.Reply(id, decision, ""); replyErr != nil {
+		return replyErr
+	}
+	if err != nil && line == "" {
+		return fmt.Errorf("permission: %w", err)
+	}
+	return nil
 }
 
 // mustConfig 读取配置文件并叠加命令行参数，命令行非空才覆盖。

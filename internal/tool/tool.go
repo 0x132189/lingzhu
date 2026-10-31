@@ -10,16 +10,49 @@ import (
 	"sync"
 
 	"lingzhu/internal/model"
+	"lingzhu/internal/permission"
 )
 
 var ErrNotFound = errors.New("tool not found")
+
+// Call 是一次工具调用的上下文。
+type Call struct {
+	SessionID string
+	Name      string
+	Input     json.RawMessage
+	Perm      *permission.Manager
+	OnAsk     func(permission.Request)
+}
+
+// Allow 在工具执行前向权限管理器申请 action 权限。
+func (c Call) Allow(ctx context.Context, action string, resources []string, message string) error {
+	if c.Perm == nil {
+		return nil
+	}
+	return c.Perm.Check(ctx, permission.Request{
+		SessionID: c.SessionID,
+		Action:    action,
+		Resources: resources,
+		Message:   message,
+	}, c.OnAsk)
+}
+
+// AllowFile 先处理越界目录，再申请文件动作权限。
+func (c Call) AllowFile(ctx context.Context, action, resource string, external bool) error {
+	if external {
+		if err := c.Allow(ctx, "external_directory", []string{resource}, ""); err != nil {
+			return err
+		}
+	}
+	return c.Allow(ctx, action, []string{resource}, "")
+}
 
 type Tool interface {
 	Name() string
 	Description() string
 	// Schema 是该工具入参的 JSON Schema。
 	Schema() json.RawMessage
-	Run(ctx context.Context, input json.RawMessage) (string, error)
+	Run(ctx context.Context, call Call) (string, error)
 }
 
 type Registry struct {
@@ -55,10 +88,10 @@ func (r *Registry) Definitions() []model.ToolDef {
 	return defs
 }
 
-func (r *Registry) Run(ctx context.Context, name string, input json.RawMessage) (string, error) {
-	t, ok := r.Get(name)
+func (r *Registry) Run(ctx context.Context, call Call) (string, error) {
+	t, ok := r.Get(call.Name)
 	if !ok {
-		return "", fmt.Errorf("%w: %s", ErrNotFound, name)
+		return "", fmt.Errorf("%w: %s", ErrNotFound, call.Name)
 	}
-	return t.Run(ctx, input)
+	return t.Run(ctx, call)
 }

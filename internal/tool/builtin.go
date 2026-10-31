@@ -45,17 +45,22 @@ func (b *Bash) Schema() json.RawMessage {
 	}`)
 }
 
-func (b *Bash) Run(ctx context.Context, input json.RawMessage) (string, error) {
+func (b *Bash) Run(ctx context.Context, call Call) (string, error) {
 	var args struct {
 		Command        string `json:"command"`
 		TimeoutSeconds int    `json:"timeout_seconds"`
 	}
-	if err := json.Unmarshal(input, &args); err != nil {
+	if err := json.Unmarshal(call.Input, &args); err != nil {
 		return "", fmt.Errorf("bash: %w", err)
 	}
-	if strings.TrimSpace(args.Command) == "" {
+	command := strings.TrimSpace(args.Command)
+	if command == "" {
 		return "", fmt.Errorf("bash: command is empty")
 	}
+	if err := call.Allow(ctx, "bash", []string{command}, ""); err != nil {
+		return "", err
+	}
+
 	timeout := 60 * time.Second
 	if args.TimeoutSeconds > 0 {
 		timeout = time.Duration(args.TimeoutSeconds) * time.Second
@@ -63,7 +68,7 @@ func (b *Bash) Run(ctx context.Context, input json.RawMessage) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, b.Shell[0], append(b.Shell[1:], args.Command)...)
+	cmd := exec.CommandContext(ctx, b.Shell[0], append(b.Shell[1:], command)...)
 	cmd.Dir = b.Dir
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -101,19 +106,23 @@ func (r *ReadFile) Schema() json.RawMessage {
 	}`)
 }
 
-func (r *ReadFile) Run(_ context.Context, input json.RawMessage) (string, error) {
+func (r *ReadFile) Run(ctx context.Context, call Call) (string, error) {
 	var args struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset"`
 		Limit  int    `json:"limit"`
 	}
-	if err := json.Unmarshal(input, &args); err != nil {
+	if err := json.Unmarshal(call.Input, &args); err != nil {
 		return "", fmt.Errorf("read_file: %w", err)
 	}
-	path, err := r.resolve(args.Path)
+	path, err := resolvePath(r.Dir, args.Path)
 	if err != nil {
 		return "", err
 	}
+	if err := call.AllowFile(ctx, "read", path, external(r.Dir, path)); err != nil {
+		return "", err
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read_file: %w", err)
@@ -157,16 +166,19 @@ func (w *WriteFile) Schema() json.RawMessage {
 	}`)
 }
 
-func (w *WriteFile) Run(_ context.Context, input json.RawMessage) (string, error) {
+func (w *WriteFile) Run(ctx context.Context, call Call) (string, error) {
 	var args struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
-	if err := json.Unmarshal(input, &args); err != nil {
+	if err := json.Unmarshal(call.Input, &args); err != nil {
 		return "", fmt.Errorf("write_file: %w", err)
 	}
-	path, err := w.resolve(args.Path)
+	path, err := resolvePath(w.Dir, args.Path)
 	if err != nil {
+		return "", err
+	}
+	if err := call.AllowFile(ctx, "write", path, external(w.Dir, path)); err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -178,18 +190,27 @@ func (w *WriteFile) Run(_ context.Context, input json.RawMessage) (string, error
 	return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), path), nil
 }
 
-func (r *ReadFile) resolve(p string) (string, error) { return resolvePath(r.Dir, p) }
-
-func (w *WriteFile) resolve(p string) (string, error) { return resolvePath(w.Dir, p) }
-
 func resolvePath(dir, p string) (string, error) {
 	if strings.TrimSpace(p) == "" {
 		return "", fmt.Errorf("path is empty")
 	}
 	if filepath.IsAbs(p) {
-		return p, nil
+		return filepath.Clean(p), nil
 	}
 	return filepath.Join(dir, p), nil
+}
+
+// external 判断路径是否越出工作目录。
+func external(dir, path string) bool {
+	base, err := filepath.Abs(dir)
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func truncate(s string) string {

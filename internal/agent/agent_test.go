@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 
 	"lingzhu/internal/event"
 	"lingzhu/internal/model"
+	"lingzhu/internal/permission"
 	"lingzhu/internal/provider"
 	"lingzhu/internal/session"
 	"lingzhu/internal/tool"
@@ -49,8 +51,11 @@ func (echoTool) Name() string            { return "echo" }
 func (echoTool) Description() string     { return "echo text" }
 func (echoTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 
-func (echoTool) Run(_ context.Context, in json.RawMessage) (string, error) {
-	return "echo:" + string(in), nil
+func (echoTool) Run(ctx context.Context, call tool.Call) (string, error) {
+	if err := call.Allow(ctx, "echo", []string{"*"}, ""); err != nil {
+		return "", err
+	}
+	return "echo:" + string(call.Input), nil
 }
 
 func newTestAgent(t *testing.T, fake *fakeProvider) (*Agent, *session.Store) {
@@ -61,7 +66,7 @@ func newTestAgent(t *testing.T, fake *fakeProvider) (*Agent, *session.Store) {
 	}
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
-	return New(store, fake, registry, "test-model", 4), store
+	return New(store, fake, registry, nil, "test-model", 4), store
 }
 
 func TestRunExecutesToolThenFinishes(t *testing.T) {
@@ -132,8 +137,60 @@ func TestRunRequiresModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := New(store, &fakeProvider{}, tool.NewRegistry(), "", 4)
+	a := New(store, &fakeProvider{}, tool.NewRegistry(), nil, "", 4)
 	if _, err := a.Run(context.Background(), "s1", "x"); err == nil {
 		t.Fatal("want error when model is empty")
+	}
+}
+
+func TestPermissionRejectContinuesRun(t *testing.T) {
+	rules := permission.Rules{{Action: "echo", Resource: "*", Effect: permission.Ask}}
+	perm := permission.New(rules)
+	store, err := session.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
+		{{Text: "understood"}},
+	}}
+	a := New(store, fake, registry, perm, "test-model", 4)
+
+	stream, err := a.Run(context.Background(), "s1", "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := 0
+	for ev := range stream {
+		if ev.Type != event.PermissionAsked {
+			continue
+		}
+		asked++
+		id, _ := ev.Data["id"].(string)
+		if err := a.Reply(id, permission.Reject, "not allowed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if asked != 1 {
+		t.Fatalf("want 1 permission request, got %d", asked)
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolResult string
+	for _, m := range messages {
+		if m.Role == model.RoleTool {
+			toolResult = m.Content
+		}
+	}
+	if !strings.Contains(toolResult, "permission denied") || !strings.Contains(toolResult, "not allowed") {
+		t.Fatalf("model should see the denial and feedback, got %q", toolResult)
+	}
+	if messages[len(messages)-1].Content != "understood" {
+		t.Fatalf("run should continue after denial, got %+v", messages[len(messages)-1])
 	}
 }
