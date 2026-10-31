@@ -47,27 +47,27 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `lingzhu - AI agent core
 
-用法:
-  lingzhu serve [flags]      启动 HTTP 服务
-  lingzhu run <prompt>       在终端执行一轮对话
-  lingzhu version            打印版本
+Usage:
+  lingzhu serve [flags]      start the HTTP server
+  lingzhu run <prompt>       run one conversation turn in the terminal
+  lingzhu version            print the version
 
-环境变量:
-  LINGZHU_CONFIG      配置文件路径
-  LINGZHU_ADDR        监听地址，默认 127.0.0.1:8787
-  LINGZHU_DATA_DIR    数据目录，默认 config.json 同级的 data
-  LINGZHU_MODEL       模型名
-  OPENAI_BASE_URL     模型接口，默认 https://api.openai.com/v1
-  OPENAI_API_KEY      接口密钥
+Environment:
+  LINGZHU_CONFIG      config file path
+  LINGZHU_ADDR        listen address, default 127.0.0.1:8787
+  LINGZHU_DATA_DIR    data directory, default "data" next to config.json
+  LINGZHU_MODEL       model name
+  OPENAI_BASE_URL     model endpoint, default https://api.openai.com/v1
+  OPENAI_API_KEY      endpoint API key
 `)
 }
 
 func serve(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	configPath := fs.String("config", config.DefaultPath(), "配置文件路径")
-	addr := fs.String("addr", "", "监听地址")
-	data := fs.String("data", "", "数据目录")
-	model := fs.String("model", "", "模型名")
+	configPath := fs.String("config", config.DefaultPath(), "config file path")
+	addr := fs.String("addr", "", "listen address")
+	data := fs.String("data", "", "data directory")
+	model := fs.String("model", "", "model name")
 	_ = fs.Parse(args)
 
 	cfg := mustConfig(*configPath, *addr, *data, *model)
@@ -99,11 +99,11 @@ func serve(args []string) {
 
 func run(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	configPath := fs.String("config", config.DefaultPath(), "配置文件路径")
-	sessionID := fs.String("session", "cli", "会话 ID")
-	addr := fs.String("addr", "", "监听地址")
-	data := fs.String("data", "", "数据目录")
-	model := fs.String("model", "", "模型名")
+	configPath := fs.String("config", config.DefaultPath(), "config file path")
+	sessionID := fs.String("session", "cli", "session ID")
+	addr := fs.String("addr", "", "listen address")
+	data := fs.String("data", "", "data directory")
+	model := fs.String("model", "", "model name")
 	_ = fs.Parse(args)
 
 	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -154,7 +154,7 @@ func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) er
 	id, _ := ev.Data["id"].(string)
 	action, _ := ev.Data["action"].(string)
 	resources, _ := ev.Data["resources"].([]string)
-	fmt.Fprintf(os.Stderr, "\n[permission] %s %s  [y] 本次允许 / [a] 总是允许 / [n] 拒绝: ", action, strings.Join(resources, ", "))
+	fmt.Fprintf(os.Stderr, "\n[permission] %s %s  [y] allow once / [a] always allow / [n] reject: ", action, strings.Join(resources, ", "))
 
 	line, err := stdin.ReadString('\n')
 	answer := strings.Trim(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(line)), "\ufeff"), "\x00 ")

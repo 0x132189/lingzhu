@@ -31,15 +31,15 @@ type Bash struct {
 func (b *Bash) Name() string { return "bash" }
 
 func (b *Bash) Description() string {
-	return "运行一条 shell 命令，返回合并后的 stdout 与 stderr。"
+	return "Run a shell command and return combined stdout and stderr."
 }
 
 func (b *Bash) Schema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"command": {"type": "string", "description": "要执行的命令"},
-			"timeout_seconds": {"type": "integer", "description": "超时秒数，默认 60"}
+			"command": {"type": "string", "description": "Command to execute"},
+			"timeout_seconds": {"type": "integer", "description": "Timeout in seconds, default 60"}
 		},
 		"required": ["command"]
 	}`)
@@ -91,7 +91,7 @@ type ReadFile struct {
 func (r *ReadFile) Name() string { return "read_file" }
 
 func (r *ReadFile) Description() string {
-	return "读取文本文件，按行返回，可指定 offset 与 limit。"
+	return "Read a text file line by line; offset and limit are optional."
 }
 
 func (r *ReadFile) Schema() json.RawMessage {
@@ -99,8 +99,8 @@ func (r *ReadFile) Schema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"path": {"type": "string"},
-			"offset": {"type": "integer", "description": "起始行号，从 1 开始"},
-			"limit": {"type": "integer", "description": "最多返回行数，默认 2000"}
+			"offset": {"type": "integer", "description": "Start line, 1-based"},
+			"limit": {"type": "integer", "description": "Maximum lines to return, default 2000"}
 		},
 		"required": ["path"]
 	}`)
@@ -152,7 +152,7 @@ type WriteFile struct {
 func (w *WriteFile) Name() string { return "write_file" }
 
 func (w *WriteFile) Description() string {
-	return "写入文本文件，父目录不存在时自动创建。"
+	return "Write a text file, creating parent directories when missing."
 }
 
 func (w *WriteFile) Schema() json.RawMessage {
