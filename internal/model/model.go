@@ -1,4 +1,4 @@
-// Package model 定义 provider、tool、session、agent 共用的消息类型。
+// Package model defines messages shared by provider, tool, session and agent.
 package model
 
 import "encoding/json"
@@ -11,8 +11,8 @@ const (
 	RoleTool      Role = "tool"
 )
 
-// Message 是发给模型的一条消息。工具调用挂在 assistant 消息上，
-// 工具结果单独成为 role=tool 的消息。
+// Message is one message sent to the model. Tool calls live on the assistant
+// message; each tool result is its own role=tool message.
 type Message struct {
 	Role       Role
 	Content    string

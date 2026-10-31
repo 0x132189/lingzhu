@@ -1,4 +1,4 @@
-// Package app 是唯一知道所有依赖如何组装的地方。
+// Package app is the only place that knows how dependencies are wired.
 package app
 
 import (

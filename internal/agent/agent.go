@@ -1,5 +1,5 @@
-// Package agent 实现单步执行的会话主循环：一步一次模型调用，
-// 工具结果回填后继续下一步，直到模型不再请求工具。
+// Package agent implements the session loop: one model call per step,
+// feeding tool results back until the model stops requesting tools.
 package agent
 
 import (
@@ -30,7 +30,7 @@ func New(store *session.Store, p provider.Provider, tools *tool.Registry, perm *
 	return &Agent{store: store, provider: p, tools: tools, perm: perm, model: modelName, maxSteps: maxSteps}
 }
 
-// Reply 回答一次待批的权限请求。
+// Reply answers a pending permission request.
 func (a *Agent) Reply(id string, decision permission.Decision, message string) error {
 	if a.perm == nil {
 		return errors.New("permission is not configured")
@@ -38,7 +38,7 @@ func (a *Agent) Reply(id string, decision permission.Decision, message string) e
 	return a.perm.Reply(id, decision, message)
 }
 
-// Pending 列出待批的权限请求，sessionID 为空时返回全部。
+// Pending lists pending permission requests; an empty sessionID returns all.
 func (a *Agent) Pending(sessionID string) []permission.Request {
 	if a.perm == nil {
 		return nil
@@ -46,7 +46,8 @@ func (a *Agent) Pending(sessionID string) []permission.Request {
 	return a.perm.Pending(sessionID)
 }
 
-// Run 异步执行一轮对话，返回事件流。事件流在结束时关闭。
+// Run executes one conversation turn asynchronously and returns an event
+// stream that closes when the turn ends.
 func (a *Agent) Run(ctx context.Context, sessionID, prompt string) (<-chan event.Event, error) {
 	if a.model == "" {
 		return nil, errors.New("model is not configured")

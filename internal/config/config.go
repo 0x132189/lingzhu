@@ -1,5 +1,5 @@
-// Package config 提供运行所需的全部配置。
-// 优先级：默认值 < 配置文件 < 环境变量 < 命令行参数。
+// Package config provides all runtime configuration.
+// Precedence: defaults < config file < environment < command line.
 package config
 
 import (
@@ -23,14 +23,14 @@ type Config struct {
 	Permission []Rule
 }
 
-// Rule 是权限规则，action 与 resource 支持通配符。
+// Rule is a permission rule; action and resource support wildcards.
 type Rule struct {
 	Action   string `json:"action"`
 	Resource string `json:"resource"`
 	Effect   string `json:"effect"`
 }
 
-// File 是配置文件的结构，字段名用下划线。
+// File is the config file shape; fields use snake_case.
 type File struct {
 	Addr       string   `json:"addr"`
 	DataDir    string   `json:"data_dir"`
@@ -42,8 +42,8 @@ type File struct {
 	Permission []Rule   `json:"permission"`
 }
 
-// DefaultPath 返回实际使用的配置文件路径：显式传入优先，
-// 否则按 config.json、build/config.json、../build/config.json 依次查找。
+// DefaultPath returns the config file path: an explicit path wins, otherwise
+// config.json, build/config.json and ../build/config.json are tried in order.
 func DefaultPath() string {
 	if p := os.Getenv("LINGZHU_CONFIG"); p != "" {
 		return p
@@ -136,7 +136,7 @@ func applyEnv(cfg *Config) {
 	}
 }
 
-// DefaultShell 返回构建内置 bash 工具所需的命令前缀。
+// DefaultShell returns the command prefix used by the built-in bash tool.
 func DefaultShell() []string {
 	if runtime.GOOS == "windows" {
 		return []string{"powershell", "-NoProfile", "-NonInteractive", "-Command"}

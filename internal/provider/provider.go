@@ -1,4 +1,4 @@
-// Package provider 定义模型适配接口与 OpenAI 兼容实现。
+// Package provider defines the model adapter interface and the OpenAI implementation.
 package provider
 
 import (
@@ -12,7 +12,7 @@ type Chunk struct {
 	ToolCalls []ToolCallDelta
 }
 
-// ToolCallDelta 是流式返回中的一个工具调用片段，按 Index 合并。
+// ToolCallDelta is one streamed tool-call fragment, merged by Index.
 type ToolCallDelta struct {
 	Index     int
 	ID        string

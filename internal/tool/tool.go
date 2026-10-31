@@ -1,4 +1,4 @@
-// Package tool 定义工具接口、注册表与内置工具。
+// Package tool defines the tool interface, registry and built-in tools.
 package tool
 
 import (
@@ -15,7 +15,7 @@ import (
 
 var ErrNotFound = errors.New("tool not found")
 
-// Call 是一次工具调用的上下文。
+// Call is the context of one tool invocation.
 type Call struct {
 	SessionID string
 	Name      string
@@ -24,7 +24,7 @@ type Call struct {
 	OnAsk     func(permission.Request)
 }
 
-// Allow 在工具执行前向权限管理器申请 action 权限。
+// Allow requests permission for action before the tool runs.
 func (c Call) Allow(ctx context.Context, action string, resources []string, message string) error {
 	if c.Perm == nil {
 		return nil
@@ -37,7 +37,7 @@ func (c Call) Allow(ctx context.Context, action string, resources []string, mess
 	}, c.OnAsk)
 }
 
-// AllowFile 先处理越界目录，再申请文件动作权限。
+// AllowFile checks the external directory first, then the file action.
 func (c Call) AllowFile(ctx context.Context, action, resource string, external bool) error {
 	if external {
 		if err := c.Allow(ctx, "external_directory", []string{resource}, ""); err != nil {
@@ -50,7 +50,7 @@ func (c Call) AllowFile(ctx context.Context, action, resource string, external b
 type Tool interface {
 	Name() string
 	Description() string
-	// Schema 是该工具入参的 JSON Schema。
+	// Schema is the JSON Schema of the tool input.
 	Schema() json.RawMessage
 	Run(ctx context.Context, call Call) (string, error)
 }

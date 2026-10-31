@@ -1,4 +1,4 @@
-// Package server 把 agent 的事件流转成 HTTP + SSE 协议。
+// Package server turns the agent event stream into HTTP + SSE.
 package server
 
 import (
@@ -49,7 +49,7 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// replyPermission 回答一次待批的权限请求。
+// replyPermission answers a pending permission request.
 func (s *Server) replyPermission(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Decision string `json:"decision"`
@@ -73,7 +73,7 @@ func (s *Server) replyPermission(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// prompt 以 SSE 返回一轮对话的全部事件。
+// prompt streams all events of one conversation turn as SSE.
 func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Text string `json:"text"`

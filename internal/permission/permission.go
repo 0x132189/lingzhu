@@ -1,4 +1,4 @@
-// Package permission 实现工具执行前的动作级权限判定。
+// Package permission evaluates action-level permissions before a tool runs.
 package permission
 
 import (
@@ -27,7 +27,8 @@ const (
 	Reject Decision = "reject"
 )
 
-// Rule 是权限规则：action 与 resource 都支持 * 与 ?，最后一条匹配的生效。
+// Rule is a permission rule: action and resource support * and ?, and the last
+// matching rule wins.
 type Rule struct {
 	Action   string `json:"action"`
 	Resource string `json:"resource"`
@@ -36,7 +37,7 @@ type Rule struct {
 
 type Rules []Rule
 
-// Default 是未配置时的规则：默认询问，读取放行。
+// Default is the fallback ruleset: ask by default, allow reads.
 func Default() Rules {
 	return Rules{
 		{Action: "*", Resource: "*", Effect: Ask},
@@ -44,7 +45,7 @@ func Default() Rules {
 	}
 }
 
-// Evaluate 对单个资源返回生效的 effect。
+// Evaluate returns the effective effect for a single resource.
 func (r Rules) Evaluate(action, resource string) Effect {
 	effect := Ask
 	for _, rule := range r {
@@ -55,7 +56,7 @@ func (r Rules) Evaluate(action, resource string) Effect {
 	return effect
 }
 
-// EvaluateAll 合并多个资源的判定：任一 deny 即 deny，任一 ask 即 ask。
+// EvaluateAll merges resources: any deny wins, otherwise any ask wins.
 func (r Rules) EvaluateAll(action string, resources []string) Effect {
 	if len(resources) == 0 {
 		return r.Evaluate(action, "*")
@@ -101,7 +102,7 @@ type answer struct {
 	message  string
 }
 
-// Manager 持有规则与待批请求。Check 在需要询问时会阻塞，直到 Reply 或 ctx 结束。
+// Manager holds rules and pending requests. Check blocks until Reply or ctx ends.
 type Manager struct {
 	mu      sync.Mutex
 	rules   Rules
@@ -127,7 +128,7 @@ func (m *Manager) Rules() Rules {
 	return append(Rules(nil), m.rules...)
 }
 
-// Check 按规则判定；ask 时通过 announce 通知调用方，并等待 Reply。
+// Check evaluates the rules; on ask it announces the request and waits for a reply.
 func (m *Manager) Check(ctx context.Context, req Request, announce func(Request)) error {
 	effect := m.rules.EvaluateAll(req.Action, req.Resources)
 	switch effect {
@@ -206,7 +207,7 @@ func (m *Manager) release(id string) {
 	m.mu.Unlock()
 }
 
-// match 是大小写不敏感的通配符匹配，* 匹配任意串，? 匹配单字符。
+// match is a case-insensitive wildcard match: * matches any run, ? one character.
 func match(input, pattern string) bool {
 	normalized := strings.ReplaceAll(input, "\\", "/")
 	pattern = strings.ReplaceAll(pattern, "\\", "/")

@@ -13,7 +13,7 @@ import (
 	"lingzhu/internal/model"
 )
 
-// OpenAI 适配任何 OpenAI 兼容的 chat/completions 接口。
+// OpenAI adapts any OpenAI-compatible chat/completions endpoint.
 type OpenAI struct {
 	BaseURL string
 	APIKey  string

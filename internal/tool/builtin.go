@@ -14,7 +14,7 @@ import (
 
 const maxOutput = 64 * 1024
 
-// Builtins 返回内置工具：bash、read_file、write_file。
+// Builtins returns the built-in tools: bash, read_file and write_file.
 func Builtins(shell []string, workdir string) []Tool {
 	return []Tool{
 		&Bash{Shell: shell, Dir: workdir},
@@ -200,7 +200,7 @@ func resolvePath(dir, p string) (string, error) {
 	return filepath.Join(dir, p), nil
 }
 
-// external 判断路径是否越出工作目录。
+// external reports whether path escapes the working directory.
 func external(dir, path string) bool {
 	base, err := filepath.Abs(dir)
 	if err != nil {

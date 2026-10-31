@@ -1,5 +1,5 @@
-// Package event 定义运行时事件。持久事件写入会话日志，
-// 增量事件只发给当前订阅者。
+// Package event defines runtime events. Durable events are persisted to the
+// session log; delta and control events only reach current subscribers.
 package event
 
 import "time"
@@ -25,7 +25,7 @@ type Event struct {
 	Data map[string]any `json:"data,omitempty"`
 }
 
-// Durable 表示该事件是否写入会话日志。增量与运行控制事件不落盘。
+// Durable reports whether the event is written to the session log.
 func (e Event) Durable() bool {
 	switch e.Type {
 	case StepStart, TextDelta, RunEnd, Error, PermissionAsked, PermissionReplied:

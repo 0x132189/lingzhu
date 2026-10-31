@@ -1,4 +1,4 @@
-// Package session 负责会话事件的持久化与消息重建。
+// Package session persists session events and rebuilds messages from them.
 package session
 
 import (
@@ -32,7 +32,7 @@ func Open(dir string) (*Store, error) {
 	return &Store{dir: path}, nil
 }
 
-// Append 追加一条持久事件，非持久事件直接忽略。
+// Append writes a durable event; non-durable events are ignored.
 func (s *Store) Append(id string, ev event.Event) error {
 	if !ev.Durable() {
 		return nil
@@ -87,7 +87,7 @@ func (s *Store) Events(id string) ([]event.Event, error) {
 	return events, scan.Err()
 }
 
-// Messages 由事件日志重建对话，供下一次模型请求使用。
+// Messages rebuilds the conversation from the event log for the next request.
 func (s *Store) Messages(id string) ([]model.Message, error) {
 	events, err := s.Events(id)
 	if err != nil {

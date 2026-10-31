@@ -1,4 +1,4 @@
-// Command lingzhu 是核心程序入口。
+// Command lingzhu is the core program entry point.
 package main
 
 import (
@@ -149,7 +149,7 @@ func run(args []string) {
 	}
 }
 
-// askPermission 在终端询问一次待批的权限请求。
+// askPermission asks the user about a pending permission request in the terminal.
 func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) error {
 	id, _ := ev.Data["id"].(string)
 	action, _ := ev.Data["action"].(string)
@@ -165,7 +165,7 @@ func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) er
 	case "a", "always":
 		decision = permission.Always
 	}
-	// 读不到输入也要回答，否则工具调用会一直等待。
+	// Answer even when reading fails, otherwise the tool call waits forever.
 	if replyErr := application.Agent.Reply(id, decision, ""); replyErr != nil {
 		return replyErr
 	}
@@ -175,7 +175,7 @@ func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) er
 	return nil
 }
 
-// mustConfig 读取配置文件并叠加命令行参数，命令行非空才覆盖。
+// mustConfig loads the config file and applies non-empty command-line overrides.
 func mustConfig(path, addr, data, model string) config.Config {
 	cfg, err := config.Load(path)
 	if err != nil {
