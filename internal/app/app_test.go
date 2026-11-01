@@ -9,6 +9,7 @@ import (
 
 	"lingzhu/internal/config"
 	"lingzhu/internal/event"
+	"lingzhu/internal/provider"
 )
 
 func TestShutdownInterruptsRunningTurn(t *testing.T) {
@@ -33,6 +34,7 @@ func TestShutdownInterruptsRunningTurn(t *testing.T) {
 		Workdir:  t.TempDir(),
 		Model:    "test-model",
 		BaseURL:  model.URL,
+		APIKey:   "test-key",
 		MaxSteps: 2,
 		Shell:    []string{"bash", "-lc"},
 	})
@@ -40,7 +42,7 @@ func TestShutdownInterruptsRunningTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := application.Agent.Run(context.Background(), "s1", "hi")
+	events, err := application.Agent.Run(context.Background(), "s1", "hi", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}

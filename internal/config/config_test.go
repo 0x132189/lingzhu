@@ -82,3 +82,25 @@ func TestBrokenFileFails(t *testing.T) {
 		t.Fatal("want error for invalid json")
 	}
 }
+
+func TestLoadProviders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"provider":"work","model":"fast","providers":{"work":{"name":"Work","base_url":"https://work.test/v1/","api_key_env":"WORK_KEY","models":[{"id":"fast","name":"Fast","context_window":32000}]}}}`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "work" || cfg.Model != "fast" {
+		t.Fatalf("unexpected selection: %+v", cfg)
+	}
+	provider := cfg.Providers["work"]
+	if provider.Name != "Work" || provider.BaseURL != "https://work.test/v1" {
+		t.Fatalf("unexpected provider: %+v", provider)
+	}
+	if len(provider.Models) != 1 || provider.Models[0].ContextWindow == nil || *provider.Models[0].ContextWindow != 32000 {
+		t.Fatalf("unexpected models: %+v", provider.Models)
+	}
+}

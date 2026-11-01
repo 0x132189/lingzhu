@@ -33,7 +33,7 @@ func (bigTool) Run(ctx context.Context, call tool.Call) (string, error) {
 
 func collect(t *testing.T, a *Agent, sessionID, prompt string) []event.Event {
 	t.Helper()
-	stream, err := a.Run(context.Background(), sessionID, prompt)
+	stream, err := a.Run(context.Background(), sessionID, prompt, provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,11 +65,9 @@ func TestCompactsWhenOverBudget(t *testing.T) {
 		{{Text: "## Objective\n- resume the task"}},
 		{{Text: "done"}},
 	}}
-	a := New(store, fake, registry, nil, Options{
-		Model:         "test-model",
-		MaxSteps:      4,
-		ContextWindow: 2000,
-		CompactKeep:   100,
+	a := New(store, testCatalog(fake, "test-model", 2000), registry, nil, Options{
+		MaxSteps:    4,
+		CompactKeep: 100,
 	})
 
 	events := collect(t, a, "s1", "go")
@@ -119,11 +117,9 @@ func TestOverflowCompactsAndRetries(t *testing.T) {
 			{{Text: "recovered"}},
 		},
 	}
-	a := New(store, fake, tool.NewRegistry(), nil, Options{
-		Model:         "test-model",
-		MaxSteps:      4,
-		ContextWindow: 8000,
-		CompactKeep:   100,
+	a := New(store, testCatalog(fake, "test-model", 8000), tool.NewRegistry(), nil, Options{
+		MaxSteps:    4,
+		CompactKeep: 100,
 	})
 
 	events := collect(t, a, "s1", "c")
@@ -179,9 +175,9 @@ func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &waitProvider{started: make(chan struct{}, 1)}
-	a := New(store, fake, tool.NewRegistry(), nil, Options{Model: "test-model", MaxSteps: 2})
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2})
 
-	events, err := a.Run(context.Background(), "s1", "hi")
+	events, err := a.Run(context.Background(), "s1", "hi", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +187,7 @@ func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
 		t.Fatal("run did not reach the provider")
 	}
 
-	if _, err := a.Run(context.Background(), "s1", "again"); !errors.Is(err, ErrBusy) {
+	if _, err := a.Run(context.Background(), "s1", "again", provider.Selection{}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("want ErrBusy for a concurrent turn, got %v", err)
 	}
 	if !a.Interrupt("s1") {
@@ -220,9 +216,9 @@ func TestWaitReturnsWhenBaseContextIsCancelled(t *testing.T) {
 	}
 	base, stopBase := context.WithCancel(context.Background())
 	fake := &waitProvider{started: make(chan struct{}, 1)}
-	a := New(store, fake, tool.NewRegistry(), nil, Options{Model: "test-model", MaxSteps: 2, Base: base})
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2, Base: base})
 
-	events, err := a.Run(context.Background(), "s1", "hi")
+	events, err := a.Run(context.Background(), "s1", "hi", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,9 +266,9 @@ func TestWaitHonoursItsDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &waitProvider{started: make(chan struct{}, 1)}
-	a := New(store, fake, tool.NewRegistry(), nil, Options{Model: "test-model", MaxSteps: 2})
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2})
 
-	if _, err := a.Run(context.Background(), "s1", "hi"); err != nil {
+	if _, err := a.Run(context.Background(), "s1", "hi", provider.Selection{}); err != nil {
 		t.Fatal(err)
 	}
 	<-fake.started
@@ -291,8 +287,8 @@ func TestSystemPromptIsSentWithoutPersisting(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "ok"}}}}
-	a := New(store, fake, tool.NewRegistry(), nil, Options{
-		Model: "test-model", MaxSteps: 2, System: "you are a test agent",
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{
+		MaxSteps: 2, System: "you are a test agent",
 	})
 
 	collect(t, a, "s1", "hi")

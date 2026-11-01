@@ -49,7 +49,8 @@ func newServerWith(t *testing.T, p provider.Provider) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(agent.New(store, p, tool.NewRegistry(), nil, agent.Options{Model: "test-model", MaxSteps: 2}), store)
+	catalog := provider.Static("test", "Test", p, []provider.ModelSpec{{ID: "test-model", Name: "test-model"}}, "test-model")
+	return New(agent.New(store, catalog, tool.NewRegistry(), nil, agent.Options{MaxSteps: 2}), store)
 }
 
 // blockProvider never answers until its run is cancelled.
@@ -165,4 +166,72 @@ func post(t *testing.T, url, body string) *http.Response {
 	}
 	resp.Body.Close()
 	return resp
+}
+
+type recordingProvider struct {
+	model string
+}
+
+func (p *recordingProvider) Stream(_ context.Context, req model.Request) (provider.Stream, error) {
+	p.model = req.Model
+	return &staticStream{chunks: []provider.Chunk{{Text: "ok"}}}, nil
+}
+
+func TestSessionModelSelectionRoundTrip(t *testing.T) {
+	store, err := session.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingProvider{}
+	catalog := provider.Static("p1", "P1", recorder, []provider.ModelSpec{
+		{ID: "m1", ContextWindow: 1000},
+		{ID: "m2", ContextWindow: 2000},
+	}, "m1")
+	srv := httptest.NewServer(New(agent.New(store, catalog, tool.NewRegistry(), nil, agent.Options{MaxSteps: 2}), store).Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/sessions/s1/prompt", "application/json",
+		strings.NewReader(`{"text":"hello","provider":"p1","model":"m2"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if recorder.model != "m2" {
+		t.Fatalf("prompt used %q, want m2", recorder.model)
+	}
+	if info, err := store.Info("s1"); err != nil || info.Provider != "p1" || info.Model != "m2" {
+		t.Fatalf("selection was not stored: %+v %v", info, err)
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, srv.URL+"/sessions/s1", strings.NewReader(`{"model":"m1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	patch, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch.Body.Close()
+	if patch.StatusCode != http.StatusNoContent {
+		t.Fatalf("want 204, got %d", patch.StatusCode)
+	}
+
+	contextResp, err := http.Get(srv.URL + "/sessions/s1/context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contextResp.Body.Close()
+	var contextPayload struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		Window   int    `json:"window"`
+	}
+	if err := json.NewDecoder(contextResp.Body).Decode(&contextPayload); err != nil {
+		t.Fatal(err)
+	}
+	if contextPayload.Provider != "p1" || contextPayload.Model != "m1" || contextPayload.Window != 1000 {
+		t.Fatalf("unexpected context: %+v", contextPayload)
+	}
 }

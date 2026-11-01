@@ -176,9 +176,26 @@ func build(events []event.Event, observe func(messages int, ev event.Event)) []m
 
 // Info is the session summary returned by listing and metadata endpoints.
 type Info struct {
-	ID      string    `json:"id"`
-	Title   string    `json:"title,omitempty"`
-	Updated time.Time `json:"updated"`
+	ID       string    `json:"id"`
+	Title    string    `json:"title,omitempty"`
+	Provider string    `json:"provider,omitempty"`
+	Model    string    `json:"model,omitempty"`
+	Updated  time.Time `json:"updated"`
+}
+
+// Meta is the stored per-session metadata.
+type Meta struct {
+	Title    string `json:"title,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+}
+
+// Meta returns the stored metadata; a missing file is an empty Meta.
+func (s *Store) Meta(id string) (Meta, error) {
+	if !validID.MatchString(id) {
+		return Meta{}, fmt.Errorf("invalid session id %q", id)
+	}
+	return s.readMeta(id), nil
 }
 
 // List returns every session, sorted by ID.
@@ -213,14 +230,10 @@ func (s *Store) Info(id string) (Info, error) {
 		return Info{}, err
 	}
 	info := Info{ID: id, Updated: stat.ModTime()}
-	if data, err := os.ReadFile(s.metaPath(id)); err == nil {
-		var meta struct {
-			Title string `json:"title"`
-		}
-		if json.Unmarshal(data, &meta) == nil {
-			info.Title = meta.Title
-		}
-	}
+	meta := s.readMeta(id)
+	info.Title = meta.Title
+	info.Provider = meta.Provider
+	info.Model = meta.Model
 	if info.Title == "" {
 		info.Title = s.deriveTitle(id)
 	}
@@ -239,11 +252,21 @@ func (s *Store) SetTitle(id, title string) error {
 	if title == "" {
 		return errors.New("title is empty")
 	}
-	data, err := json.Marshal(map[string]string{"title": title})
-	if err != nil {
-		return err
+	meta := s.readMeta(id)
+	meta.Title = title
+	return s.writeMeta(id, meta)
+}
+
+// SetModel stores the session-level provider/model override. A prompt can set it
+// before the session log exists, so the meta file is written on its own.
+func (s *Store) SetModel(id, provider, model string) error {
+	if !validID.MatchString(id) {
+		return fmt.Errorf("invalid session id %q", id)
 	}
-	return os.WriteFile(s.metaPath(id), data, 0o644)
+	meta := s.readMeta(id)
+	meta.Provider = strings.TrimSpace(provider)
+	meta.Model = strings.TrimSpace(model)
+	return s.writeMeta(id, meta)
 }
 
 // Delete removes a session log and its metadata.
@@ -302,6 +325,27 @@ func (s *Store) path(id string) string {
 
 func (s *Store) metaPath(id string) string {
 	return filepath.Join(s.dir, id+".meta.json")
+}
+
+// readMeta ignores unreadable or corrupt metadata; the session still opens.
+func (s *Store) readMeta(id string) Meta {
+	var meta Meta
+	data, err := os.ReadFile(s.metaPath(id))
+	if err != nil {
+		return meta
+	}
+	if json.Unmarshal(data, &meta) != nil {
+		return Meta{}
+	}
+	return meta
+}
+
+func (s *Store) writeMeta(id string, meta Meta) error {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.metaPath(id), data, 0o644)
 }
 
 func str(ev event.Event, key string) string {

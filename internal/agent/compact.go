@@ -33,7 +33,7 @@ Rules:
 // compact summarizes everything before the kept tail and records a checkpoint.
 // keep is the token budget of the tail left verbatim; zero keeps only the last
 // exchange.
-func (a *Agent) compact(ctx context.Context, sessionID string, current session.Context, keep int) error {
+func (a *Agent) compact(ctx context.Context, sessionID string, target provider.Target, current session.Context, keep int) error {
 	split := keepTail(current.Messages, keep)
 	if split <= 0 {
 		return errors.New("compact: nothing to compact yet")
@@ -42,7 +42,7 @@ func (a *Agent) compact(ctx context.Context, sessionID string, current session.C
 		return err
 	}
 
-	summary, usage, err := a.summarize(ctx, current.Messages[:split])
+	summary, usage, err := a.summarize(ctx, target, current.Messages[:split])
 	if err != nil {
 		return fmt.Errorf("compact: %w", err)
 	}
@@ -60,8 +60,8 @@ func (a *Agent) compact(ctx context.Context, sessionID string, current session.C
 }
 
 // summarize runs one model call that writes the structured summary.
-func (a *Agent) summarize(ctx context.Context, history []model.Message) (string, *provider.Usage, error) {
-	budget := session.Ceiling(a.window)
+func (a *Agent) summarize(ctx context.Context, target provider.Target, history []model.Message) (string, *provider.Usage, error) {
+	budget := session.Ceiling(target.Window)
 	overhead := session.Estimate(a.system) + session.Estimate(compactionPrompt)
 	text := transcript(history, 0)
 	if budget > 0 && session.Estimate(text)+overhead > budget {
@@ -72,7 +72,7 @@ func (a *Agent) summarize(ctx context.Context, history []model.Message) (string,
 	}
 
 	messages := []model.Message{{Role: model.RoleUser, Content: text + "\n\n" + compactionPrompt}}
-	stream, err := a.provider.Stream(ctx, model.Request{Model: a.model, Messages: a.withSystem(messages)})
+	stream, err := target.Provider.Stream(ctx, model.Request{Model: target.Model, Messages: a.withSystem(messages)})
 	if err != nil {
 		return "", nil, err
 	}

@@ -173,3 +173,50 @@ func TestSetTitleAndDelete(t *testing.T) {
 		t.Fatalf("deleted session should be missing, got %v", err)
 	}
 }
+
+func TestSetModelPreservesTitleAndInfo(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.User("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTitle("s1", "Keep me"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetModel("s1", "work", "fast-model"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.Info("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Title != "Keep me" || info.Provider != "work" || info.Model != "fast-model" {
+		t.Fatalf("unexpected info: %+v", info)
+	}
+	meta, err := store.Meta("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Provider != "work" || meta.Model != "fast-model" {
+		t.Fatalf("unexpected meta: %+v", meta)
+	}
+}
+
+func TestSetModelBeforeLogExists(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetModel("draft", "p", "m"); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.Meta("draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Provider != "p" || meta.Model != "m" {
+		t.Fatalf("draft selection was not stored: %+v", meta)
+	}
+}

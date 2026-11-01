@@ -24,12 +24,9 @@ var ErrBusy = errors.New("session is already running")
 
 // Options are the per-agent settings that come from configuration.
 type Options struct {
-	Model    string
 	MaxSteps int
 	// System is the derived system prompt sent with every request.
 	System string
-	// ContextWindow is the model context size; zero disables automatic compaction.
-	ContextWindow int
 	// CompactKeep is how many recent tokens stay verbatim beside a summary.
 	CompactKeep int
 	// Base ends every run when it is cancelled; nil means Background.
@@ -38,14 +35,13 @@ type Options struct {
 
 type Agent struct {
 	store    *session.Store
-	provider provider.Provider
+	catalog  *provider.Catalog
+	target   provider.Target
 	tools    *tool.Registry
 	perm     *permission.Manager
 	hub      *event.Hub
-	model    string
 	maxSteps int
 	system   string
-	window   int
 	keep     int
 	base     context.Context
 
@@ -54,21 +50,20 @@ type Agent struct {
 	runs map[string]context.CancelFunc
 }
 
-func New(store *session.Store, p provider.Provider, tools *tool.Registry, perm *permission.Manager, opts Options) *Agent {
+func New(store *session.Store, catalog *provider.Catalog, tools *tool.Registry, perm *permission.Manager, opts Options) *Agent {
 	base := opts.Base
 	if base == nil {
 		base = context.Background()
 	}
 	a := &Agent{
 		store:    store,
-		provider: p,
+		catalog:  catalog,
+		target:   catalog.Default(),
 		tools:    tools,
 		perm:     perm,
 		hub:      event.NewHub(),
-		model:    opts.Model,
 		maxSteps: opts.MaxSteps,
 		system:   opts.System,
-		window:   opts.ContextWindow,
 		keep:     opts.CompactKeep,
 		base:     base,
 		runs:     map[string]context.CancelFunc{},
@@ -93,11 +88,16 @@ func (a *Agent) Pending(sessionID string) []permission.Request {
 	return a.perm.Pending(sessionID)
 }
 
-// Run starts one conversation turn. The turn is owned by the session, not by
-// the caller: cancelling ctx stops it, and so does Interrupt. The returned
-// channel delivers live events and closes when the turn ends.
-func (a *Agent) Run(ctx context.Context, sessionID, prompt string) (<-chan event.Event, error) {
-	if a.model == "" {
+// Run starts one conversation turn for the selected provider/model. The turn
+// is owned by the session, not by the caller: cancelling ctx stops it, and so
+// does Interrupt. The returned channel delivers live events and closes when the
+// turn ends.
+func (a *Agent) Run(ctx context.Context, sessionID, prompt string, selection provider.Selection) (<-chan event.Event, error) {
+	target, err := a.catalog.Resolve(selection)
+	if err != nil {
+		return nil, err
+	}
+	if target.Model == "" {
 		return nil, errors.New("model is not configured")
 	}
 	a.mu.Lock()
@@ -119,7 +119,7 @@ func (a *Agent) Run(ctx context.Context, sessionID, prompt string) (<-chan event
 			release()
 			sub.Close()
 		}()
-		a.loop(runCtx, sessionID, prompt)
+		a.loop(runCtx, sessionID, prompt, target)
 	}()
 	return sub.Events(), nil
 }
@@ -181,11 +181,24 @@ func (a *Agent) Subscribe(sessionID string) *event.Subscription {
 	return a.hub.Subscribe(sessionID)
 }
 
-// Window is the configured context window, zero when compaction is disabled.
-func (a *Agent) Window() int { return a.window }
+// Window is the context window of a resolved target, zero when compaction is
+// disabled.
+func (a *Agent) Resolve(selection provider.Selection) (provider.Target, error) {
+	return a.catalog.Resolve(selection)
+}
+
+// DefaultTarget is the configured default provider/model.
+func (a *Agent) DefaultTarget() provider.Target { return a.catalog.Default() }
 
 // Compact summarizes the conversation on demand, even when it is under budget.
-func (a *Agent) Compact(ctx context.Context, sessionID string) error {
+func (a *Agent) Compact(ctx context.Context, sessionID string, selection provider.Selection) error {
+	target, err := a.catalog.Resolve(selection)
+	if err != nil {
+		return err
+	}
+	if target.Model == "" {
+		return errors.New("model is not configured")
+	}
 	if a.Running(sessionID) {
 		return ErrBusy
 	}
@@ -195,10 +208,10 @@ func (a *Agent) Compact(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return err
 	}
-	return a.compact(ctx, sessionID, current, a.keep)
+	return a.compact(ctx, sessionID, target, current, a.keep)
 }
 
-func (a *Agent) loop(ctx context.Context, sessionID, prompt string) {
+func (a *Agent) loop(ctx context.Context, sessionID, prompt string, target provider.Target) {
 	if err := a.emit(sessionID, event.User(prompt)); err != nil {
 		a.fail(sessionID, err)
 		return
@@ -219,8 +232,8 @@ func (a *Agent) loop(ctx context.Context, sessionID, prompt string) {
 			a.fail(sessionID, err)
 			return
 		}
-		if a.due(current.Tokens) {
-			if err := a.compact(ctx, sessionID, current, a.keep); err != nil {
+		if a.due(current.Tokens, target.Window) {
+			if err := a.compact(ctx, sessionID, target, current, a.keep); err != nil {
 				a.fail(sessionID, err)
 				return
 			}
@@ -231,7 +244,7 @@ func (a *Agent) loop(ctx context.Context, sessionID, prompt string) {
 			recovered = true
 		}
 
-		text, calls, usage, err := a.stream(ctx, sessionID, current.Messages)
+		text, calls, usage, err := a.stream(ctx, sessionID, current.Messages, target)
 		if usage != nil {
 			if recordErr := a.emit(sessionID, event.UsageEvent(usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite)); recordErr != nil {
 				a.fail(sessionID, recordErr)
@@ -247,10 +260,10 @@ func (a *Agent) loop(ctx context.Context, sessionID, prompt string) {
 			// retry the same step once.
 			if provider.IsContextOverflow(err) && !recovered {
 				recovered = true
-				if compactErr := a.compact(ctx, sessionID, current, a.keep/2); compactErr == nil {
+				if compactErr := a.compact(ctx, sessionID, target, current, a.keep/2); compactErr == nil {
 					continue
 				}
-				if compactErr := a.compact(ctx, sessionID, current, 0); compactErr == nil {
+				if compactErr := a.compact(ctx, sessionID, target, current, 0); compactErr == nil {
 					continue
 				}
 			}
@@ -278,14 +291,14 @@ func (a *Agent) loop(ctx context.Context, sessionID, prompt string) {
 }
 
 // due reports whether the conversation should be compacted before the next call.
-func (a *Agent) due(tokens int) bool {
-	ceiling := session.Ceiling(a.window)
+func (a *Agent) due(tokens, window int) bool {
+	ceiling := session.Ceiling(window)
 	return ceiling > 0 && tokens >= ceiling
 }
 
-func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.Message) (string, []model.ToolCall, *provider.Usage, error) {
-	req := model.Request{Model: a.model, Messages: a.withSystem(messages), Tools: a.tools.Definitions()}
-	stream, err := a.provider.Stream(ctx, req)
+func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.Message, target provider.Target) (string, []model.ToolCall, *provider.Usage, error) {
+	req := model.Request{Model: target.Model, Messages: a.withSystem(messages), Tools: a.tools.Definitions()}
+	stream, err := target.Provider.Stream(ctx, req)
 	if err != nil {
 		return "", nil, nil, err
 	}

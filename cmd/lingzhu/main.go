@@ -20,6 +20,7 @@ import (
 	"lingzhu/internal/config"
 	"lingzhu/internal/event"
 	"lingzhu/internal/permission"
+	"lingzhu/internal/provider"
 )
 
 const version = "0.1.0-dev"
@@ -72,10 +73,11 @@ func serve(args []string) {
 	addr := fs.String("addr", "", "listen address")
 	data := fs.String("data", "", "data directory")
 	model := fs.String("model", "", "model name")
+	providerID := fs.String("provider", "", "provider id")
 	workdir := fs.String("workdir", "", "agent working directory")
 	_ = fs.Parse(args)
 
-	cfg := mustConfig(*configPath, *addr, *data, *model, *workdir)
+	cfg := mustConfig(*configPath, *addr, *data, *providerID, *model, *workdir)
 	application, err := app.New(cfg)
 	if err != nil {
 		log.Fatalf("init: %v", err)
@@ -135,6 +137,7 @@ func run(args []string) {
 	addr := fs.String("addr", "", "listen address")
 	data := fs.String("data", "", "data directory")
 	model := fs.String("model", "", "model name")
+	providerID := fs.String("provider", "", "provider id")
 	workdir := fs.String("workdir", "", "agent working directory")
 	_ = fs.Parse(args)
 
@@ -143,7 +146,7 @@ func run(args []string) {
 		log.Fatal("run: prompt is empty")
 	}
 
-	cfg := mustConfig(*configPath, *addr, *data, *model, *workdir)
+	cfg := mustConfig(*configPath, *addr, *data, *providerID, *model, *workdir)
 	application, err := app.New(cfg)
 	if err != nil {
 		log.Fatalf("init: %v", err)
@@ -151,7 +154,7 @@ func run(args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stdin := bufio.NewReader(os.Stdin)
-	events, err := application.Agent.Run(ctx, *sessionID, prompt)
+	events, err := application.Agent.Run(ctx, *sessionID, prompt, provider.Selection{Provider: cfg.Provider, Model: cfg.Model})
 	if err != nil {
 		log.Fatalf("run: %v", err)
 	}
@@ -210,7 +213,7 @@ func askPermission(application *app.App, ev event.Event, stdin *bufio.Reader) er
 }
 
 // mustConfig loads the config file and applies non-empty command-line overrides.
-func mustConfig(path, addr, data, model, workdir string) config.Config {
+func mustConfig(path, addr, data, providerID, model, workdir string) config.Config {
 	cfg, err := config.Load(path)
 	if err != nil {
 		log.Fatalf("config %s: %v", path, err)
@@ -223,6 +226,9 @@ func mustConfig(path, addr, data, model, workdir string) config.Config {
 	}
 	if data != "" {
 		cfg.DataDir = data
+	}
+	if providerID != "" {
+		cfg.Provider = providerID
 	}
 	if model != "" {
 		cfg.Model = model

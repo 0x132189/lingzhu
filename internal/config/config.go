@@ -17,6 +17,8 @@ type Config struct {
 	DataDir       string
 	Workdir       string
 	Model         string
+	Provider      string
+	Providers     map[string]Provider
 	BaseURL       string
 	APIKey        string
 	MaxSteps      int
@@ -25,6 +27,22 @@ type Config struct {
 	SystemPrompt  string
 	ContextWindow int
 	CompactKeep   int
+}
+
+// Model is one selectable model inside a provider.
+type Model struct {
+	ID            string `json:"id"`
+	Name          string `json:"name,omitempty"`
+	ContextWindow *int   `json:"context_window,omitempty"`
+}
+
+// Provider is one OpenAI-compatible endpoint and its model catalog.
+type Provider struct {
+	Name      string  `json:"name,omitempty"`
+	BaseURL   string  `json:"base_url"`
+	APIKey    string  `json:"api_key,omitempty"`
+	APIKeyEnv string  `json:"api_key_env,omitempty"`
+	Models    []Model `json:"models"`
 }
 
 // Rule is a permission rule; action and resource support wildcards.
@@ -36,18 +54,20 @@ type Rule struct {
 
 // File is the config file shape; fields use snake_case.
 type File struct {
-	Addr          string   `json:"addr"`
-	DataDir       string   `json:"data_dir"`
-	Workdir       string   `json:"workdir"`
-	Model         string   `json:"model"`
-	BaseURL       string   `json:"base_url"`
-	APIKey        string   `json:"api_key"`
-	MaxSteps      int      `json:"max_steps"`
-	Shell         []string `json:"shell"`
-	Permission    []Rule   `json:"permission"`
-	SystemPrompt  string   `json:"system_prompt"`
-	ContextWindow *int     `json:"context_window"`
-	CompactKeep   int      `json:"compact_keep"`
+	Addr          string              `json:"addr"`
+	DataDir       string              `json:"data_dir"`
+	Workdir       string              `json:"workdir"`
+	Model         string              `json:"model"`
+	Provider      string              `json:"provider"`
+	Providers     map[string]Provider `json:"providers"`
+	BaseURL       string              `json:"base_url"`
+	APIKey        string              `json:"api_key"`
+	MaxSteps      int                 `json:"max_steps"`
+	Shell         []string            `json:"shell"`
+	Permission    []Rule              `json:"permission"`
+	SystemPrompt  string              `json:"system_prompt"`
+	ContextWindow *int                `json:"context_window"`
+	CompactKeep   int                 `json:"compact_keep"`
 }
 
 // DefaultPath returns the config file path: an explicit path wins, otherwise
@@ -115,6 +135,22 @@ func applyFile(cfg *Config, file File, dir string) {
 	if file.Model != "" {
 		cfg.Model = file.Model
 	}
+	if file.Provider != "" {
+		cfg.Provider = strings.TrimSpace(file.Provider)
+	}
+	if len(file.Providers) > 0 {
+		cfg.Providers = make(map[string]Provider, len(file.Providers))
+		for id, provider := range file.Providers {
+			provider.BaseURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+			for i := range provider.Models {
+				provider.Models[i].ID = strings.TrimSpace(provider.Models[i].ID)
+				if provider.Models[i].Name == "" {
+					provider.Models[i].Name = provider.Models[i].ID
+				}
+			}
+			cfg.Providers[id] = provider
+		}
+	}
 	if file.BaseURL != "" {
 		cfg.BaseURL = strings.TrimRight(file.BaseURL, "/")
 	}
@@ -151,6 +187,7 @@ func applyEnv(cfg *Config) {
 	set("LINGZHU_DATA_DIR", &cfg.DataDir)
 	set("LINGZHU_WORKDIR", &cfg.Workdir)
 	set("LINGZHU_MODEL", &cfg.Model)
+	set("LINGZHU_PROVIDER", &cfg.Provider)
 	set("LINGZHU_SYSTEM_PROMPT", &cfg.SystemPrompt)
 	set("OPENAI_API_KEY", &cfg.APIKey)
 	if v := os.Getenv("OPENAI_BASE_URL"); v != "" {

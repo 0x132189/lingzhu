@@ -70,7 +70,17 @@ func newTestAgent(t *testing.T, fake *fakeProvider) (*Agent, *session.Store) {
 	}
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
-	return New(store, fake, registry, nil, Options{Model: "test-model", MaxSteps: 4}), store
+	catalog := testCatalog(fake, "test-model", 0)
+	return New(store, catalog, registry, nil, Options{MaxSteps: 4}), store
+}
+
+// testCatalog wraps a fake provider so tests can select a model and window.
+func testCatalog(p provider.Provider, model string, window int) *provider.Catalog {
+	var models []provider.ModelSpec
+	if model != "" {
+		models = append(models, provider.ModelSpec{ID: model, Name: model, ContextWindow: window})
+	}
+	return provider.Static("test", "Test", p, models, model)
 }
 
 func TestRunExecutesToolThenFinishes(t *testing.T) {
@@ -81,7 +91,7 @@ func TestRunExecutesToolThenFinishes(t *testing.T) {
 	a, store := newTestAgent(t, fake)
 
 	var events []event.Event
-	stream, err := a.Run(context.Background(), "s1", "hello")
+	stream, err := a.Run(context.Background(), "s1", "hello", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +134,7 @@ func TestRunStopsAtMaxSteps(t *testing.T) {
 	a, _ := newTestAgent(t, fake)
 
 	var last event.Event
-	stream, err := a.Run(context.Background(), "s1", "loop")
+	stream, err := a.Run(context.Background(), "s1", "loop", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,8 +151,8 @@ func TestRunRequiresModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := New(store, &fakeProvider{}, tool.NewRegistry(), nil, Options{Model: "", MaxSteps: 4})
-	if _, err := a.Run(context.Background(), "s1", "x"); err == nil {
+	a := New(store, testCatalog(&fakeProvider{}, "", 0), tool.NewRegistry(), nil, Options{MaxSteps: 4})
+	if _, err := a.Run(context.Background(), "s1", "x", provider.Selection{}); err == nil {
 		t.Fatal("want error when model is empty")
 	}
 }
@@ -160,9 +170,9 @@ func TestPermissionRejectContinuesRun(t *testing.T) {
 		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
 		{{Text: "understood"}},
 	}}
-	a := New(store, fake, registry, perm, Options{Model: "test-model", MaxSteps: 4})
+	a := New(store, testCatalog(fake, "test-model", 0), registry, perm, Options{MaxSteps: 4})
 
-	stream, err := a.Run(context.Background(), "s1", "go")
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}

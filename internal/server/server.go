@@ -15,6 +15,7 @@ import (
 	"lingzhu/internal/agent"
 	"lingzhu/internal/event"
 	"lingzhu/internal/permission"
+	"lingzhu/internal/provider"
 	"lingzhu/internal/session"
 )
 
@@ -93,20 +94,52 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) renameSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	var body struct {
-		Title string `json:"title"`
+		Title    *string `json:"title"`
+		Provider *string `json:"provider"`
+		Model    *string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if strings.TrimSpace(body.Title) == "" {
-		writeError(w, http.StatusBadRequest, errText("title is empty"))
+	if body.Title == nil && body.Provider == nil && body.Model == nil {
+		writeError(w, http.StatusBadRequest, errText("nothing to update"))
 		return
 	}
-	if err := s.store.SetTitle(r.PathValue("id"), body.Title); err != nil {
+	if _, err := s.store.Info(id); err != nil {
 		writeStoreError(w, err)
 		return
+	}
+	if body.Title != nil {
+		if strings.TrimSpace(*body.Title) == "" {
+			writeError(w, http.StatusBadRequest, errText("title is empty"))
+			return
+		}
+		if err := s.store.SetTitle(id, *body.Title); err != nil {
+			writeStoreError(w, err)
+			return
+		}
+	}
+	if body.Provider != nil || body.Model != nil {
+		meta, _ := s.store.Meta(id)
+		selection := provider.Selection{Provider: meta.Provider, Model: meta.Model}
+		if body.Provider != nil {
+			selection.Provider = *body.Provider
+		}
+		if body.Model != nil {
+			selection.Model = *body.Model
+		}
+		target, err := s.agent.Resolve(selection)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.SetModel(id, target.ProviderID, target.Model); err != nil {
+			writeStoreError(w, err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -141,10 +174,13 @@ func (s *Server) context(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	target := s.targetFor(r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages": current.Messages,
 		"tokens":   current.Tokens,
-		"window":   s.agent.Window(),
+		"window":   target.Window,
+		"provider": target.ProviderID,
+		"model":    target.Model,
 	})
 }
 
@@ -220,7 +256,8 @@ func (s *Server) interrupt(w http.ResponseWriter, r *http.Request) {
 // compact summarizes the session on demand.
 func (s *Server) compact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	err := s.agent.Compact(context.Background(), id)
+	target := s.targetFor(id)
+	err := s.agent.Compact(context.Background(), id, provider.Selection{Provider: target.ProviderID, Model: target.Model})
 	switch {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
@@ -231,6 +268,17 @@ func (s *Server) compact(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeStoreError(w, err)
 	}
+}
+
+// targetFor resolves the session's saved selection, falling back to the
+// configured default when the provider or model no longer exists.
+func (s *Server) targetFor(id string) provider.Target {
+	meta, _ := s.store.Meta(id)
+	target, err := s.agent.Resolve(provider.Selection{Provider: meta.Provider, Model: meta.Model})
+	if err != nil {
+		return s.agent.DefaultTarget()
+	}
+	return target
 }
 
 func (s *Server) listPermissions(w http.ResponseWriter, r *http.Request) {
@@ -266,7 +314,9 @@ func (s *Server) replyPermission(w http.ResponseWriter, r *http.Request) {
 // interrupt endpoint for that.
 func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Text string `json:"text"`
+		Text     string `json:"text"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -277,7 +327,23 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, err := s.agent.Run(context.Background(), r.PathValue("id"), body.Text)
+	id := r.PathValue("id")
+	meta, _ := s.store.Meta(id)
+	selection := provider.Selection{Provider: meta.Provider, Model: meta.Model}
+	if body.Provider != "" || body.Model != "" {
+		selection = provider.Selection{Provider: body.Provider, Model: body.Model}
+	}
+	target, err := s.agent.Resolve(selection)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.SetModel(id, target.ProviderID, target.Model); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	events, err := s.agent.Run(context.Background(), id, body.Text, provider.Selection{Provider: target.ProviderID, Model: target.Model})
 	if err != nil {
 		if errors.Is(err, agent.ErrBusy) {
 			writeError(w, http.StatusConflict, err)

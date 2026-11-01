@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"lingzhu/internal/agent"
@@ -41,7 +42,11 @@ func New(cfg config.Config) (*App, error) {
 	for _, t := range tool.Builtins(cfg.Shell, workdir) {
 		registry.Add(t)
 	}
-	prov := provider.NewOpenAI(cfg.BaseURL, cfg.APIKey)
+	catalog, err := buildCatalog(cfg)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("provider catalog: %w", err)
+	}
 	rules := make(permission.Rules, 0, len(cfg.Permission))
 	for _, r := range cfg.Permission {
 		rules = append(rules, permission.Rule{Action: r.Action, Resource: r.Resource, Effect: permission.Effect(r.Effect)})
@@ -54,13 +59,11 @@ func New(cfg config.Config) (*App, error) {
 		Extra:   cfg.SystemPrompt,
 		Now:     time.Now(),
 	})
-	runner := agent.New(store, prov, registry, perm, agent.Options{
-		Model:         cfg.Model,
-		MaxSteps:      cfg.MaxSteps,
-		System:        system,
-		ContextWindow: cfg.ContextWindow,
-		CompactKeep:   cfg.CompactKeep,
-		Base:          base,
+	runner := agent.New(store, catalog, registry, perm, agent.Options{
+		MaxSteps:    cfg.MaxSteps,
+		System:      system,
+		CompactKeep: cfg.CompactKeep,
+		Base:        base,
 	})
 	return &App{
 		Config: cfg,
@@ -76,6 +79,64 @@ func New(cfg config.Config) (*App, error) {
 func (a *App) Shutdown(ctx context.Context) error {
 	a.cancel()
 	return a.Agent.Wait(ctx)
+}
+
+// buildCatalog maps config providers onto the provider package. Configs that do
+// not declare providers keep the legacy single endpoint and model; once a
+// providers block exists, the top-level base_url/api_key are ignored.
+func buildCatalog(cfg config.Config) (*provider.Catalog, error) {
+	specs := make([]provider.ProviderSpec, 0, len(cfg.Providers)+1)
+	ids := make([]string, 0, len(cfg.Providers))
+	for id := range cfg.Providers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		p := cfg.Providers[id]
+		key := p.APIKey
+		if key == "" && p.APIKeyEnv != "" {
+			key = os.Getenv(p.APIKeyEnv)
+		}
+		models := make([]provider.ModelSpec, 0, len(p.Models))
+		for _, model := range p.Models {
+			window := cfg.ContextWindow
+			if model.ContextWindow != nil {
+				window = *model.ContextWindow
+			}
+			models = append(models, provider.ModelSpec{ID: model.ID, Name: model.Name, ContextWindow: window})
+		}
+		specs = append(specs, provider.ProviderSpec{
+			ID:      id,
+			Name:    p.Name,
+			BaseURL: p.BaseURL,
+			APIKey:  key,
+			Models:  models,
+		})
+	}
+
+	legacy := len(cfg.Providers) == 0
+	if legacy {
+		models := []provider.ModelSpec{}
+		if cfg.Model != "" {
+			models = append(models, provider.ModelSpec{
+				ID:            cfg.Model,
+				Name:          cfg.Model,
+				ContextWindow: cfg.ContextWindow,
+			})
+		}
+		specs = append(specs, provider.ProviderSpec{
+			ID:      "default",
+			Name:    "Default",
+			BaseURL: cfg.BaseURL,
+			APIKey:  cfg.APIKey,
+			Models:  models,
+		})
+	}
+	selected := cfg.Provider
+	if selected == "" && legacy {
+		selected = "default"
+	}
+	return provider.NewCatalog(specs, selected, cfg.Model)
 }
 
 // resolveWorkdir turns the configured working directory into an absolute path,
