@@ -13,7 +13,6 @@ import (
 	"lingzhu/internal/event"
 	"lingzhu/internal/model"
 	"lingzhu/internal/provider"
-	"lingzhu/internal/session"
 	"lingzhu/internal/tool"
 )
 
@@ -54,10 +53,7 @@ func find(events []event.Event, kind event.Type) (event.Event, bool) {
 }
 
 func TestCompactsWhenOverBudget(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	registry := tool.NewRegistry()
 	registry.Add(bigTool{})
 	fake := &fakeProvider{chunks: [][]provider.Chunk{
@@ -98,10 +94,7 @@ func TestCompactsWhenOverBudget(t *testing.T) {
 }
 
 func TestOverflowCompactsAndRetries(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	if _, err := store.Append("s1", event.User("a"+strings.Repeat("x", 4000))); err != nil {
 		t.Fatal(err)
 	}
@@ -170,10 +163,7 @@ func (s *waitStream) Recv() (provider.Chunk, error) {
 func (s *waitStream) Close() error { return nil }
 
 func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	fake := &waitProvider{started: make(chan struct{}, 1)}
 	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2})
 
@@ -210,10 +200,7 @@ func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
 }
 
 func TestWaitReturnsWhenBaseContextIsCancelled(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	base, stopBase := context.WithCancel(context.Background())
 	fake := &waitProvider{started: make(chan struct{}, 1)}
 	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2, Base: base})
@@ -261,10 +248,7 @@ func TestWaitReturnsWhenBaseContextIsCancelled(t *testing.T) {
 }
 
 func TestWaitHonoursItsDeadline(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	fake := &waitProvider{started: make(chan struct{}, 1)}
 	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2})
 
@@ -282,10 +266,7 @@ func TestWaitHonoursItsDeadline(t *testing.T) {
 }
 
 func TestSystemPromptIsSentWithoutPersisting(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "ok"}}}}
 	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{
 		MaxSteps: 2, System: "you are a test agent",

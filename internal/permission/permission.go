@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"sync"
@@ -111,6 +112,10 @@ type Manager struct {
 	rules   Rules
 	pending map[string]pendingRequest
 	seq     atomic.Int64
+	// saver persists the full rule set after an "always" answer. It runs
+	// outside mu but under saveMu so file writes stay ordered.
+	saver  func(Rules) error
+	saveMu sync.Mutex
 }
 
 type pendingRequest struct {
@@ -123,6 +128,14 @@ func New(rules Rules) *Manager {
 		rules = Default()
 	}
 	return &Manager{rules: rules, pending: map[string]pendingRequest{}}
+}
+
+// SetSaver registers how "always" answers are persisted. The callback receives
+// the complete, already updated rule set; nil keeps changes in memory only.
+func (m *Manager) SetSaver(save func(Rules) error) {
+	m.mu.Lock()
+	m.saver = save
+	m.mu.Unlock()
 }
 
 func (m *Manager) Rules() Rules {
@@ -197,10 +210,26 @@ func (m *Manager) Pending(sessionID string) []Request {
 }
 
 func (m *Manager) save(req Request) {
+	// Serialize persistence so two quick "always" answers cannot write stale
+	// snapshots over each other.
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, resource := range req.Resources {
 		m.rules = append(m.rules, Rule{Action: req.Action, Resource: resource, Effect: Allow})
+	}
+	snapshot := append(Rules(nil), m.rules...)
+	saver := m.saver
+	m.mu.Unlock()
+
+	if saver == nil {
+		return
+	}
+	if err := saver(snapshot); err != nil {
+		// The answer already unblocked the tool; a write failure must not turn
+		// an approval into a rejection.
+		log.Printf("permission: save rules: %v", err)
 	}
 }
 

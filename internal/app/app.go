@@ -46,6 +46,7 @@ func New(cfg config.Config) (*App, error) {
 	catalog, err := buildCatalog(cfg)
 	if err != nil {
 		cancel()
+		_ = store.Close()
 		return nil, fmt.Errorf("provider catalog: %w", err)
 	}
 	rules := make(permission.Rules, 0, len(cfg.Permission))
@@ -53,6 +54,20 @@ func New(cfg config.Config) (*App, error) {
 		rules = append(rules, permission.Rule{Action: r.Action, Resource: r.Resource, Effect: permission.Effect(r.Effect)})
 	}
 	perm := permission.New(rules)
+	if cfg.Path != "" {
+		path := cfg.Path
+		perm.SetSaver(func(rules permission.Rules) error {
+			out := make([]config.Rule, 0, len(rules))
+			for _, rule := range rules {
+				out = append(out, config.Rule{
+					Action:   rule.Action,
+					Resource: rule.Resource,
+					Effect:   string(rule.Effect),
+				})
+			}
+			return config.SavePermission(path, out)
+		})
+	}
 
 	runner := agent.New(store, catalog, registry, perm, agent.Options{
 		MaxSteps: cfg.MaxSteps,

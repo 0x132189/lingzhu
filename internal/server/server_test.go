@@ -41,6 +41,16 @@ func (s *staticStream) Recv() (provider.Chunk, error) {
 
 func (s *staticStream) Close() error { return nil }
 
+func testStore(t *testing.T) *session.Store {
+	t.Helper()
+	store, err := session.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	return newServerWith(t, staticProvider{})
@@ -48,10 +58,7 @@ func newTestServer(t *testing.T) *Server {
 
 func newServerWith(t *testing.T, p provider.Provider) *Server {
 	t.Helper()
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	catalog := provider.Static("test", "Test", p, []provider.ModelSpec{{ID: "test-model", Name: "test-model"}}, "test-model")
 	return New(agent.New(store, catalog, tool.NewRegistry(), nil, agent.Options{MaxSteps: 2}), store)
 }
@@ -175,10 +182,7 @@ func (s *gateStream) Close() error { return nil }
 
 func TestInputQueuesWhileRunIsActive(t *testing.T) {
 	p := &gateProvider{started: make(chan struct{}, 1), release: make(chan struct{})}
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	catalog := provider.Static("test", "Test", p, []provider.ModelSpec{{ID: "m", Name: "m"}}, "m")
 	srv := httptest.NewServer(New(agent.New(store, catalog, tool.NewRegistry(), nil, agent.Options{MaxSteps: 4}), store).Handler())
 	defer srv.Close()
@@ -306,6 +310,25 @@ func TestGlobalEventsTagSessions(t *testing.T) {
 	}
 }
 
+func TestListSessionsEmptyIsAnArray(t *testing.T) {
+	srv := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/sessions", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Sessions []session.Info `json:"sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Sessions == nil {
+		t.Fatalf("empty session list must encode as [], got %s", rec.Body.String())
+	}
+}
+
 func TestPromptRejectsEmptyText(t *testing.T) {
 	srv := httptest.NewServer(newTestServer(t).Handler())
 	defer srv.Close()
@@ -354,10 +377,7 @@ func (p *recordingProvider) Stream(_ context.Context, req model.Request) (provid
 }
 
 func TestSessionModelSelectionRoundTrip(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	recorder := &recordingProvider{}
 	catalog := provider.Static("p1", "P1", recorder, []provider.ModelSpec{
 		{ID: "m1", ContextWindow: 1000},

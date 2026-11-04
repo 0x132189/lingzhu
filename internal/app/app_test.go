@@ -32,6 +32,7 @@ func TestRecoverResumesClaimAndQueuedInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = application.Store.Close() })
 	if _, err := application.Store.Append("s1", event.TurnStartedEvent("turn_1")); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +96,7 @@ func TestShutdownInterruptsRunningTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = application.Store.Close() })
 
 	events, err := application.Agent.Run(context.Background(), "s1", "hi", provider.Selection{})
 	if err != nil {

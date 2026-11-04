@@ -3,16 +3,20 @@ package session
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"lingzhu/internal/event"
 	"lingzhu/internal/model"
@@ -20,18 +24,186 @@ import (
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// Store keeps durable events in SQLite. A transaction commits a whole event, so
+// readers never observe a half-written record; WAL lets a read run while a
+// write is in progress.
 type Store struct {
-	dir  string
-	mu   sync.Mutex
-	seqs map[string]int64
+	dir string
+	db  *sql.DB
 }
+
+const sessionSchema = `
+CREATE TABLE IF NOT EXISTS sessions (
+	id       TEXT PRIMARY KEY,
+	title    TEXT NOT NULL DEFAULT '',
+	provider TEXT NOT NULL DEFAULT '',
+	model    TEXT NOT NULL DEFAULT '',
+	updated  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+	session_id TEXT NOT NULL,
+	seq        INTEGER NOT NULL,
+	type       TEXT NOT NULL,
+	at         INTEGER NOT NULL,
+	data       TEXT NOT NULL,
+	PRIMARY KEY (session_id, seq),
+	FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);`
 
 func Open(dir string) (*Store, error) {
 	path := filepath.Join(dir, "sessions")
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, err
 	}
-	return &Store{dir: path, seqs: map[string]int64{}}, nil
+	db, err := sql.Open("sqlite", filepath.Join(path, "sessions.db"))
+	if err != nil {
+		return nil, err
+	}
+	// One connection serializes writers and keeps per-connection pragmas
+	// predictable. Reads are short enough that WAL parallelism is not needed.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	store := &Store{dir: path, db: db}
+	if err := store.setup(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// Close releases the database handle. It is used by tests and by callers that
+// reopen the same data directory.
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) setup() error {
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		return err
+	}
+	for _, pragma := range []string{
+		"PRAGMA busy_timeout=5000",
+		// NORMAL in WAL mode keeps a committed event across an app crash while
+		// avoiding an fsync per append.
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA foreign_keys=ON",
+	} {
+		if _, err := s.db.Exec(pragma); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(sessionSchema); err != nil {
+		return err
+	}
+
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version >= 1 {
+		return nil
+	}
+	return s.migrateLegacy()
+}
+
+// migrateLegacy imports JSONL logs written by older versions. The files are
+// left in place as a backup; the database becomes the source of truth.
+func (s *Store) migrateLegacy() error {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".jsonl")
+		if !validID.MatchString(id) {
+			continue
+		}
+		events, err := readLegacyEvents(filepath.Join(s.dir, entry.Name()))
+		if err != nil {
+			// One damaged old file must not stop the core from starting. Its
+			// JSONL stays on disk for manual recovery.
+			log.Printf("session: skip legacy %s: %v", id, err)
+			continue
+		}
+		meta := readLegacyMeta(filepath.Join(s.dir, id+".meta.json"))
+		title := strings.TrimSpace(meta.Title)
+		if title == "" {
+			title = titleFromEvents(events)
+		}
+		updated := time.Now().UnixMilli()
+		if info, err := entry.Info(); err == nil {
+			updated = info.ModTime().UnixMilli()
+		}
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO sessions(id, title, provider, model, updated) VALUES(?, ?, ?, ?, ?)`,
+			id, title, meta.Provider, meta.Model, updated,
+		); err != nil {
+			return err
+		}
+		var last int64
+		for _, ev := range events {
+			if !ev.Durable() {
+				continue
+			}
+			seq := ev.Seq
+			if seq <= last {
+				seq = last + 1
+			}
+			last = seq
+			at := int64(0)
+			if !ev.At.IsZero() {
+				at = ev.At.UnixMilli()
+			}
+			data, err := json.Marshal(ev.Data)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(
+				`INSERT OR IGNORE INTO events(session_id, seq, type, at, data) VALUES(?, ?, ?, ?, ?)`,
+				id, seq, string(ev.Type), at, string(data),
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Metadata without a log is a draft selection written by the old client
+	// before its first prompt. Keep it addressable through Meta, but List still
+	// hides sessions without events.
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".meta.json")
+		if !validID.MatchString(id) {
+			continue
+		}
+		meta := readLegacyMeta(filepath.Join(s.dir, entry.Name()))
+		updated := time.Now().UnixMilli()
+		if info, err := entry.Info(); err == nil {
+			updated = info.ModTime().UnixMilli()
+		}
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO sessions(id, title, provider, model, updated) VALUES(?, ?, ?, ?, ?)`,
+			id, strings.TrimSpace(meta.Title), meta.Provider, meta.Model, updated,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec("PRAGMA user_version = 1"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Append writes a durable event and returns its sequence number. Non-durable
@@ -43,85 +215,105 @@ func (s *Store) Append(id string, ev event.Event) (int64, error) {
 	if !validID.MatchString(id) {
 		return 0, fmt.Errorf("invalid session id %q", id)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ev.Seq = s.nextSeqLocked(id) + 1
-	line, err := json.Marshal(ev)
+	data, err := json.Marshal(ev.Data)
 	if err != nil {
 		return 0, err
 	}
-	f, err := os.OpenFile(s.path(id), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	at := int64(0)
+	if !ev.At.IsZero() {
+		at = ev.At.UnixMilli()
+	}
+
+	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
-	if _, err := f.Write(append(line, '\n')); err != nil {
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UnixMilli()
+	if _, err := tx.Exec(
+		`INSERT INTO sessions(id, updated) VALUES(?, ?)
+		 ON CONFLICT(id) DO UPDATE SET updated = excluded.updated`,
+		id, now,
+	); err != nil {
 		return 0, err
 	}
-	if err := f.Sync(); err != nil {
+
+	var seq int64
+	if err := tx.QueryRow(
+		`INSERT INTO events(session_id, seq, type, at, data)
+		 VALUES(?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?), ?, ?, ?)
+		 RETURNING seq`,
+		id, id, string(ev.Type), at, string(data),
+	).Scan(&seq); err != nil {
 		return 0, err
 	}
-	s.seqs[id] = ev.Seq
-	return ev.Seq, nil
+
+	// The first user message becomes the title unless the user already named
+	// the session. Keeping it in the session row means listing never reads the
+	// event log.
+	if ev.Type == event.UserMessage {
+		if title := titleFromText(text(ev)); title != "" {
+			if _, err := tx.Exec(
+				`UPDATE sessions SET title = ? WHERE id = ? AND title = ''`,
+				title, id,
+			); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
-// nextSeqLocked returns the last sequence of a session, loading it from the log
-// on first use. Logs written before sequence numbers existed count their
-// durable lines instead.
-func (s *Store) nextSeqLocked(id string) int64 {
-	if n, ok := s.seqs[id]; ok {
-		return n
-	}
-	events, err := s.Events(id)
-	if err != nil {
-		return 0
-	}
-	var last int64
-	var count int64
-	for _, ev := range events {
-		if !ev.Durable() {
-			continue
-		}
-		count++
-		if ev.Seq > last {
-			last = ev.Seq
-		}
-	}
-	if last == 0 {
-		last = count
-	}
-	s.seqs[id] = last
-	return last
-}
-
+// Events returns every durable event of a session in sequence order.
 func (s *Store) Events(id string) ([]event.Event, error) {
+	return s.events(id, 0)
+}
+
+// EventsAfter returns durable events with a sequence greater than after.
+func (s *Store) EventsAfter(id string, after int64) ([]event.Event, error) {
+	return s.events(id, after)
+}
+
+func (s *Store) events(id string, after int64) ([]event.Event, error) {
 	if !validID.MatchString(id) {
 		return nil, fmt.Errorf("invalid session id %q", id)
 	}
-	f, err := os.Open(s.path(id))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	rows, err := s.db.Query(
+		`SELECT seq, type, at, data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq`,
+		id, after,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer rows.Close()
 
 	var events []event.Event
-	scan := bufio.NewScanner(f)
-	scan.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for scan.Scan() {
-		line := strings.TrimSpace(scan.Text())
-		if line == "" {
-			continue
+	for rows.Next() {
+		var (
+			seq  int64
+			typ  string
+			at   int64
+			data string
+		)
+		if err := rows.Scan(&seq, &typ, &at, &data); err != nil {
+			return nil, err
 		}
-		var ev event.Event
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			return nil, fmt.Errorf("session %s: %w", id, err)
+		ev := event.Event{Type: event.Type(typ), Seq: seq}
+		if at != 0 {
+			ev.At = time.UnixMilli(at).UTC()
+		}
+		if data != "" && data != "null" {
+			if err := json.Unmarshal([]byte(data), &ev.Data); err != nil {
+				return nil, fmt.Errorf("session %s event %d: %w", id, seq, err)
+			}
 		}
 		events = append(events, ev)
 	}
-	return events, scan.Err()
+	return events, rows.Err()
 }
 
 // Messages rebuilds the conversation from the event log for the next request.
@@ -238,16 +430,27 @@ func (s *Store) Recovery(id string) (Recovery, error) {
 
 // Recoveries lists sessions with an open turn claim or undelivered input.
 func (s *Store) Recoveries() ([]Recovery, error) {
-	entries, err := os.ReadDir(s.dir)
+	rows, err := s.db.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Recovery, 0)
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
 		}
-		id := strings.TrimSuffix(entry.Name(), ".jsonl")
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	out := make([]Recovery, 0, len(ids))
+	for _, id := range ids {
 		events, err := s.Events(id)
 		if err != nil {
 			return nil, err
@@ -342,33 +545,54 @@ func (s *Store) SettleTools(id string) error {
 	return nil
 }
 
-// Meta returns the stored metadata; a missing file is an empty Meta.
+// Meta returns the stored metadata; a missing session is an empty Meta.
 func (s *Store) Meta(id string) (Meta, error) {
 	if !validID.MatchString(id) {
 		return Meta{}, fmt.Errorf("invalid session id %q", id)
 	}
-	return s.readMeta(id), nil
+	var meta Meta
+	err := s.db.QueryRow(`SELECT title, provider, model FROM sessions WHERE id = ?`, id).
+		Scan(&meta.Title, &meta.Provider, &meta.Model)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Meta{}, nil
+	}
+	return meta, err
 }
 
-// List returns every session, sorted by ID.
+// List returns every session with durable events, sorted by ID.
 func (s *Store) List() ([]Info, error) {
-	entries, err := os.ReadDir(s.dir)
+	rows, err := s.db.Query(
+		`SELECT s.id, s.title, s.provider, s.model, s.updated FROM sessions s
+		 WHERE EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.id)
+		 ORDER BY s.id`,
+	)
 	if err != nil {
 		return nil, err
 	}
-	infos := make([]Info, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
+	infos := make([]Info, 0)
+	for rows.Next() {
+		var (
+			info    Info
+			updated int64
+		)
+		if err := rows.Scan(&info.ID, &info.Title, &info.Provider, &info.Model, &updated); err != nil {
+			rows.Close()
+			return nil, err
 		}
-		id := strings.TrimSuffix(entry.Name(), ".jsonl")
-		info, err := s.Info(id)
-		if err != nil {
-			continue
-		}
+		info.Updated = time.UnixMilli(updated).UTC()
 		infos = append(infos, info)
 	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	for i := range infos {
+		if infos[i].Title == "" {
+			infos[i].Title = s.firstUserTitle(infos[i].ID)
+		}
+	}
 	return infos, nil
 }
 
@@ -377,17 +601,24 @@ func (s *Store) Info(id string) (Info, error) {
 	if !validID.MatchString(id) {
 		return Info{}, fmt.Errorf("invalid session id %q", id)
 	}
-	stat, err := os.Stat(s.path(id))
+	var (
+		info    Info
+		updated int64
+	)
+	err := s.db.QueryRow(
+		`SELECT s.id, s.title, s.provider, s.model, s.updated FROM sessions s
+		 WHERE s.id = ? AND EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.id)`,
+		id,
+	).Scan(&info.ID, &info.Title, &info.Provider, &info.Model, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Info{}, os.ErrNotExist
+	}
 	if err != nil {
 		return Info{}, err
 	}
-	info := Info{ID: id, Updated: stat.ModTime()}
-	meta := s.readMeta(id)
-	info.Title = meta.Title
-	info.Provider = meta.Provider
-	info.Model = meta.Model
+	info.Updated = time.UnixMilli(updated).UTC()
 	if info.Title == "" {
-		info.Title = s.deriveTitle(id)
+		info.Title = s.firstUserTitle(id)
 	}
 	return info, nil
 }
@@ -397,92 +628,148 @@ func (s *Store) SetTitle(id, title string) error {
 	if !validID.MatchString(id) {
 		return fmt.Errorf("invalid session id %q", id)
 	}
-	if _, err := os.Stat(s.path(id)); err != nil {
-		return err
-	}
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return errors.New("title is empty")
 	}
-	meta := s.readMeta(id)
-	meta.Title = title
-	return s.writeMeta(id, meta)
+	res, err := s.db.Exec(
+		`UPDATE sessions SET title = ? WHERE id = ?
+		 AND EXISTS (SELECT 1 FROM events WHERE session_id = ?)`,
+		title, id, id,
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return os.ErrNotExist
+	}
+	return nil
 }
 
 // SetModel stores the session-level provider/model override. A prompt can set it
-// before the session log exists, so the meta file is written on its own.
+// before the session log exists, so the session row is written on its own.
 func (s *Store) SetModel(id, provider, model string) error {
 	if !validID.MatchString(id) {
 		return fmt.Errorf("invalid session id %q", id)
 	}
-	meta := s.readMeta(id)
-	meta.Provider = strings.TrimSpace(provider)
-	meta.Model = strings.TrimSpace(model)
-	return s.writeMeta(id, meta)
+	_, err := s.db.Exec(
+		`INSERT INTO sessions(id, provider, model, updated) VALUES(?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, model = excluded.model`,
+		id, strings.TrimSpace(provider), strings.TrimSpace(model), time.Now().UnixMilli(),
+	)
+	return err
 }
 
-// Delete removes a session log and its metadata.
+// Delete removes a session, its events, and any legacy files.
 func (s *Store) Delete(id string) error {
 	if !validID.MatchString(id) {
 		return fmt.Errorf("invalid session id %q", id)
 	}
-	if err := os.Remove(s.path(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	delete(s.seqs, id)
-	s.mu.Unlock()
-	_ = os.Remove(s.metaPath(id))
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM events WHERE session_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	_ = os.Remove(s.legacyPath(id))
+	_ = os.Remove(s.legacyMetaPath(id))
 	return nil
 }
 
-// EventsAfter returns durable events with a sequence greater than after.
-func (s *Store) EventsAfter(id string, after int64) ([]event.Event, error) {
-	events, err := s.Events(id)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]event.Event, 0, len(events))
-	for _, ev := range events {
-		if ev.Seq > after {
-			out = append(out, ev)
-		}
-	}
-	return out, nil
+func (s *Store) legacyPath(id string) string {
+	return filepath.Join(s.dir, id+".jsonl")
 }
 
-// deriveTitle falls back to the first user message when no title is stored.
-func (s *Store) deriveTitle(id string) string {
-	events, err := s.Events(id)
+func (s *Store) legacyMetaPath(id string) string {
+	return filepath.Join(s.dir, id+".meta.json")
+}
+
+// firstUserTitle reads only the first user message. It backs sessions migrated
+// without a stored title; normal sessions get their title when the message is
+// appended.
+func (s *Store) firstUserTitle(id string) string {
+	var data string
+	err := s.db.QueryRow(
+		`SELECT data FROM events WHERE session_id = ? AND type = ? ORDER BY seq LIMIT 1`,
+		id, string(event.UserMessage),
+	).Scan(&data)
 	if err != nil {
 		return ""
 	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(data), &payload) != nil {
+		return ""
+	}
+	text, _ := payload["text"].(string)
+	return titleFromText(text)
+}
+
+func titleFromEvents(events []event.Event) string {
 	for _, ev := range events {
-		if ev.Type != event.UserMessage {
-			continue
+		if ev.Type == event.UserMessage {
+			if title := titleFromText(text(ev)); title != "" {
+				return title
+			}
 		}
-		text := strings.Join(strings.Fields(str(ev, "text")), " ")
-		runes := []rune(text)
-		if len(runes) > 60 {
-			return string(runes[:60]) + "…"
-		}
-		return text
 	}
 	return ""
 }
 
-func (s *Store) path(id string) string {
-	return filepath.Join(s.dir, id+".jsonl")
+// titleFromText collapses whitespace and keeps titles short in the sidebar.
+func titleFromText(value string) string {
+	text := strings.Join(strings.Fields(value), " ")
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) > 60 {
+		return string(runes[:60]) + "…"
+	}
+	return text
 }
 
-func (s *Store) metaPath(id string) string {
-	return filepath.Join(s.dir, id+".meta.json")
+// readLegacyEvents decodes the old JSONL format. A torn final record is ignored
+// because the append that produced it never completed.
+func readLegacyEvents(path string) ([]event.Event, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var events []event.Event
+	dec := json.NewDecoder(bufio.NewReaderSize(f, 64*1024))
+	for {
+		var ev event.Event
+		if err := dec.Decode(&ev); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return nil, err
+		}
+		events = append(events, ev)
+	}
+	return events, nil
 }
 
-// readMeta ignores unreadable or corrupt metadata; the session still opens.
-func (s *Store) readMeta(id string) Meta {
+func readLegacyMeta(path string) Meta {
 	var meta Meta
-	data, err := os.ReadFile(s.metaPath(id))
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return meta
 	}
@@ -490,14 +777,6 @@ func (s *Store) readMeta(id string) Meta {
 		return Meta{}
 	}
 	return meta
-}
-
-func (s *Store) writeMeta(id string, meta Meta) error {
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.metaPath(id), data, 0o644)
 }
 
 func str(ev event.Event, key string) string {

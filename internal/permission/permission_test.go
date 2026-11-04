@@ -134,6 +134,54 @@ func TestAlwaysSavesRule(t *testing.T) {
 	}
 }
 
+func TestAlwaysPersistsFullRuleSet(t *testing.T) {
+	m := New(Rules{
+		{Action: "*", Resource: "*", Effect: Allow},
+		{Action: "bash", Resource: "*", Effect: Ask},
+	})
+	var saved Rules
+	m.SetSaver(func(rules Rules) error {
+		saved = append(Rules(nil), rules...)
+		return nil
+	})
+	asked := make(chan Request, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Check(context.Background(), Request{Action: "bash", Resources: []string{"git status"}}, func(r Request) { asked <- r })
+	}()
+	req := <-asked
+	if err := m.Reply(req.ID, Always, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("want allowed, got %v", err)
+	}
+	if len(saved) != 3 {
+		t.Fatalf("saver should receive the full rule set, got %+v", saved)
+	}
+	last := saved[len(saved)-1]
+	if last.Action != "bash" || last.Resource != "git status" || last.Effect != Allow {
+		t.Fatalf("unexpected saved rule: %+v", last)
+	}
+}
+
+func TestAlwaysSurvivesSaveFailure(t *testing.T) {
+	m := New(Rules{{Action: "bash", Resource: "*", Effect: Ask}})
+	m.SetSaver(func(Rules) error { return errors.New("disk full") })
+	asked := make(chan Request, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Check(context.Background(), Request{Action: "bash", Resources: []string{"ls"}}, func(r Request) { asked <- r })
+	}()
+	req := <-asked
+	if err := m.Reply(req.ID, Always, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("a failed write must not reject the approved tool: %v", err)
+	}
+}
+
 func TestCancelUnblocks(t *testing.T) {
 	m := New(Rules{{Action: "bash", Resource: "*", Effect: Ask}})
 	ctx, cancel := context.WithCancel(context.Background())

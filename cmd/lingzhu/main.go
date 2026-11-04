@@ -131,6 +131,7 @@ func serve(args []string) {
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("server shutdown: %v", err)
 	}
+	_ = application.Store.Close()
 }
 
 func run(args []string) {
@@ -154,6 +155,7 @@ func run(args []string) {
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
+	defer application.Store.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stdin := bufio.NewReader(os.Stdin)

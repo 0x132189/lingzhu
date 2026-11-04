@@ -1,5 +1,5 @@
 // Package event defines runtime events. Durable events are persisted to the
-// session log; delta and control events only reach current subscribers.
+// session store; delta and control events only reach current subscribers.
 package event
 
 import "time"
@@ -35,7 +35,7 @@ type Event struct {
 	Data map[string]any `json:"data,omitempty"`
 }
 
-// Durable reports whether the event is written to the session log.
+// Durable reports whether the event is written to the session store.
 func (e Event) Durable() bool {
 	switch e.Type {
 	case StepStart, TextDelta, RunEnd, Error, PermissionAsked, PermissionReplied, CompactionStart:

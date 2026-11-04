@@ -103,12 +103,19 @@ func (b barrierTool) Run(ctx context.Context, _ tool.Call) (string, error) {
 	}
 }
 
-func newTestAgent(t *testing.T, fake *fakeProvider) (*Agent, *session.Store) {
+func testStore(t *testing.T) *session.Store {
 	t.Helper()
 	store, err := session.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func newTestAgent(t *testing.T, fake *fakeProvider) (*Agent, *session.Store) {
+	t.Helper()
+	store := testStore(t)
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
 	catalog := testCatalog(fake, "test-model", 0)
@@ -187,10 +194,7 @@ func TestRunExecutesToolCallsConcurrently(t *testing.T) {
 		}}},
 		{{Text: "done"}},
 	}}
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
 
 	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
@@ -257,10 +261,7 @@ func TestMaxStepsWrapUpDisablesTools(t *testing.T) {
 		{Index: 0, ID: "call_1", Name: "echo", Arguments: `{}`},
 	}}
 	fake := &fakeProvider{chunks: [][]provider.Chunk{{call}, {call}, {{Text: "summary"}}}}
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
 	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 2})
@@ -457,10 +458,7 @@ func TestSystemPromptIsRebuiltForEachRequest(t *testing.T) {
 		{Index: 0, ID: "call_1", Name: "echo", Arguments: `{}`},
 	}}
 	fake := &fakeProvider{chunks: [][]provider.Chunk{{call}, {{Text: "done"}}}}
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
 	built := 0
@@ -508,10 +506,7 @@ func TestEnqueueDeliversInputAtNextBoundary(t *testing.T) {
 		}}},
 		{{Text: "done"}},
 	}}
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 1})
 
 	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
@@ -571,10 +566,7 @@ func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 	fake := &fakeProvider{chunks: [][]provider.Chunk{
 		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
 	}}
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
 
 	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
@@ -610,10 +602,7 @@ func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 }
 
 func TestResumeDeliversQueuedInputAndReleasesClaim(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	if _, err := store.Append("s1", event.TurnStartedEvent("turn_1")); err != nil {
 		t.Fatal(err)
 	}
@@ -647,10 +636,7 @@ func TestResumeDeliversQueuedInputAndReleasesClaim(t *testing.T) {
 }
 
 func TestResumeSettlesInterruptedToolCall(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	if _, err := store.Append("s1", event.TurnStartedEvent("turn_1")); err != nil {
 		t.Fatal(err)
 	}
@@ -682,10 +668,7 @@ func TestResumeSettlesInterruptedToolCall(t *testing.T) {
 }
 
 func TestShutdownKeepsClaimForRecovery(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	base, stop := context.WithCancel(context.Background())
 	fake := &waitProvider{started: make(chan struct{}, 1)}
 	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2, Base: base})
@@ -718,10 +701,7 @@ func TestShutdownKeepsClaimForRecovery(t *testing.T) {
 }
 
 func TestRunRequiresModel(t *testing.T) {
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	a := New(store, testCatalog(&fakeProvider{}, "", 0), tool.NewRegistry(), nil, Options{MaxSteps: 4})
 	if _, err := a.Run(context.Background(), "s1", "x", provider.Selection{}); err == nil {
 		t.Fatal("want error when model is empty")
@@ -731,10 +711,7 @@ func TestRunRequiresModel(t *testing.T) {
 func TestPermissionRejectContinuesRun(t *testing.T) {
 	rules := permission.Rules{{Action: "echo", Resource: "*", Effect: permission.Ask}}
 	perm := permission.New(rules)
-	store, err := session.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testStore(t)
 	registry := tool.NewRegistry()
 	registry.Add(echoTool{})
 	fake := &fakeProvider{chunks: [][]provider.Chunk{

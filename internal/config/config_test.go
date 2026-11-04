@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,6 +29,45 @@ func TestLoadFromFile(t *testing.T) {
 	}
 	if cfg.ContextWindow != 64000 || cfg.CompactKeep != 8000 {
 		t.Fatalf("unexpected context settings: %+v", cfg)
+	}
+	if cfg.Path != path {
+		t.Fatalf("config path not recorded: want %q, got %q", path, cfg.Path)
+	}
+}
+
+func TestSavePermissionPreservesOtherFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"addr":":9000","custom":{"keep":true},"permission":[{"action":"read","resource":"*.env","effect":"ask"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rules := []Rule{
+		{Action: "*", Resource: "*", Effect: "allow"},
+		{Action: "bash", Resource: "git *", Effect: "allow"},
+	}
+	if err := SavePermission(path, rules); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file map[string]any
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatal(err)
+	}
+	if file["addr"] != ":9000" {
+		t.Fatalf("other fields should be preserved: %+v", file)
+	}
+	if custom, ok := file["custom"].(map[string]any); !ok || custom["keep"] != true {
+		t.Fatalf("unknown fields should be preserved: %+v", file["custom"])
+	}
+	entries, ok := file["permission"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("permission should be replaced: %+v", file["permission"])
+	}
+	if last, _ := entries[1].(map[string]any); last["action"] != "bash" || last["resource"] != "git *" {
+		t.Fatalf("unexpected last rule: %+v", entries[1])
 	}
 }
 

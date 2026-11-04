@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,6 +28,9 @@ type Config struct {
 	SystemPrompt  string
 	ContextWindow int
 	CompactKeep   int
+	// Path is the file the configuration was loaded from, empty when no file was
+	// used. It is not part of the file format.
+	Path string
 }
 
 // Model is one selectable model inside a provider.
@@ -102,6 +106,7 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 		applyFile(&cfg, file, filepath.Dir(path))
+		cfg.Path = path
 	}
 	applyEnv(&cfg)
 	return cfg, nil
@@ -202,6 +207,55 @@ func applyEnv(cfg *Config) {
 	if n, err := strconv.Atoi(os.Getenv("LINGZHU_COMPACT_KEEP")); err == nil && n > 0 {
 		cfg.CompactKeep = n
 	}
+}
+
+// SavePermission replaces the permission list in the config file and keeps
+// every other field, so an "always allow" answer survives a restart. The write
+// goes through a temp file in the same directory.
+func SavePermission(path string, rules []Rule) error {
+	if path == "" {
+		return errors.New("config path is unknown")
+	}
+	file := map[string]any{}
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &file); err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+	}
+	file["permission"] = rules
+	out, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return nil
 }
 
 // DefaultShell returns the command prefix used by the built-in bash tool.
