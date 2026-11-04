@@ -20,6 +20,10 @@ const (
 	Compaction        Type = "compaction"
 	RunEnd            Type = "run.end"
 	Error             Type = "error"
+	InputQueued       Type = "input.queued"
+	TurnStarted       Type = "turn.started"
+	TurnFinished      Type = "turn.finished"
+	TurnCancelled     Type = "turn.cancelled"
 )
 
 type Event struct {
@@ -56,6 +60,33 @@ func User(text string) Event {
 	return New(UserMessage, map[string]any{"text": text})
 }
 
+// UserInput is a queued input being delivered. The id marks the queue item as
+// delivered so a restart never delivers it twice.
+func UserInput(text, inputID string) Event {
+	return New(UserMessage, map[string]any{"text": text, "inputId": inputID})
+}
+
+// InputQueued persists an input before it can be delivered.
+func InputQueuedEvent(inputID, text string) Event {
+	return New(InputQueued, map[string]any{"id": inputID, "text": text})
+}
+
+// TurnStarted claims a session turn before any work runs. A claim that survives
+// a process exit is the signal to resume the turn on the next start.
+func TurnStartedEvent(turnID string) Event {
+	return New(TurnStarted, map[string]any{"id": turnID})
+}
+
+// TurnFinished releases a completed or failed turn claim.
+func TurnFinishedEvent(turnID string) Event {
+	return New(TurnFinished, map[string]any{"id": turnID})
+}
+
+// TurnCancelled releases a claim and cancels every input queued before it.
+func TurnCancelledEvent(turnID string) Event {
+	return New(TurnCancelled, map[string]any{"id": turnID})
+}
+
 func Assistant(text string) Event {
 	return New(AssistantMessage, map[string]any{"text": text})
 }
@@ -65,7 +96,17 @@ func ToolCallEvent(id, name, arguments string) Event {
 }
 
 func ToolResultEvent(id, name, output string, failed bool) Event {
-	return New(ToolResult, map[string]any{"id": id, "name": name, "output": output, "failed": failed})
+	return ToolResultWithDiff(id, name, output, "", failed)
+}
+
+// ToolResultWithDiff records a UI-only unified diff beside the model-visible
+// output.
+func ToolResultWithDiff(id, name, output, diff string, failed bool) Event {
+	data := map[string]any{"id": id, "name": name, "output": output, "failed": failed}
+	if diff != "" {
+		data["diff"] = diff
+	}
+	return New(ToolResult, data)
 }
 
 // UsageEvent records what the provider reported for one model call. Input

@@ -50,7 +50,7 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request) (Stream, error) 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, classifyError(resp.Status, string(body))
+		return nil, classifyError(resp.StatusCode, resp.Status, string(body))
 	}
 	return &openAIStream{body: resp.Body, reader: bufio.NewReaderSize(resp.Body, 64*1024)}, nil
 }
@@ -72,7 +72,7 @@ func (s *openAIStream) Recv() (Chunk, error) {
 			if parseErr != nil {
 				return Chunk{}, parseErr
 			}
-			if chunk.Text != "" || len(chunk.ToolCalls) > 0 || chunk.Usage != nil {
+			if chunk.Text != "" || len(chunk.ToolCalls) > 0 || chunk.FinishReason != "" || chunk.Usage != nil {
 				return chunk, nil
 			}
 		}
@@ -169,6 +169,7 @@ type streamResponse struct {
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *chatUsage `json:"usage"`
 	Error *struct {
@@ -191,11 +192,14 @@ func parseChunk(payload string) (Chunk, error) {
 		return Chunk{}, fmt.Errorf("decode stream chunk: %w", err)
 	}
 	if resp.Error != nil {
-		return Chunk{}, classifyError("stream error", resp.Error.Message)
+		return Chunk{}, classifyError(0, "stream error", resp.Error.Message)
 	}
 	var chunk Chunk
 	for _, choice := range resp.Choices {
 		chunk.Text += choice.Delta.Content
+		if choice.FinishReason != "" {
+			chunk.FinishReason = choice.FinishReason
+		}
 		for _, call := range choice.Delta.ToolCalls {
 			chunk.ToolCalls = append(chunk.ToolCalls, ToolCallDelta{
 				Index:     call.Index,

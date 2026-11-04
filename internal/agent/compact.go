@@ -62,7 +62,7 @@ func (a *Agent) compact(ctx context.Context, sessionID string, target provider.T
 // summarize runs one model call that writes the structured summary.
 func (a *Agent) summarize(ctx context.Context, target provider.Target, history []model.Message) (string, *provider.Usage, error) {
 	budget := session.Ceiling(target.Window)
-	overhead := session.Estimate(a.system) + session.Estimate(compactionPrompt)
+	overhead := session.Estimate(a.system()) + session.Estimate(compactionPrompt)
 	text := transcript(history, 0)
 	if budget > 0 && session.Estimate(text)+overhead > budget {
 		text = transcript(history, max(budget-overhead-1000, 1000))

@@ -188,9 +188,11 @@ func (w *WriteFile) Run(ctx context.Context, call Call) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("write_file: %w", err)
 	}
+	old, _ := os.ReadFile(path)
 	if err := os.WriteFile(path, []byte(args.Content), 0o644); err != nil {
 		return "", fmt.Errorf("write_file: %w", err)
 	}
+	call.SetDiff(lineDiff(w.Dir, path, string(old), args.Content))
 	return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), path), nil
 }
 

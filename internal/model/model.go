@@ -20,6 +20,8 @@ type Message struct {
 	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string     `json:"toolCallId,omitempty"`
 	Name       string     `json:"name,omitempty"`
+	// Diff is UI metadata for a tool result; providers never receive it.
+	Diff string `json:"diff,omitempty"`
 }
 
 type ToolCall struct {

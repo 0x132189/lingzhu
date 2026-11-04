@@ -204,6 +204,101 @@ func TestSetModelPreservesTitleAndInfo(t *testing.T) {
 	}
 }
 
+func TestRecoveriesTracksClaimsAndInput(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueueInput("s1", "inp_1", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.TurnStartedEvent("turn_1")); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := store.Recoveries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ClaimID != "turn_1" || len(list[0].Inputs) != 1 {
+		t.Fatalf("unexpected recovery: %+v", list)
+	}
+	if list[0].Inputs[0].ID != "inp_1" || list[0].Inputs[0].Text != "hello" {
+		t.Fatalf("unexpected queued input: %+v", list[0].Inputs)
+	}
+
+	if _, err := store.Append("s1", event.UserInput("hello", "inp_1")); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = store.Recoveries()
+	if len(list) != 1 || len(list[0].Inputs) != 0 {
+		t.Fatalf("delivered input should not recover: %+v", list)
+	}
+
+	if err := store.FinishTurn("s1", "turn_1"); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = store.Recoveries()
+	if len(list) != 0 {
+		t.Fatalf("finished turn should not recover: %+v", list)
+	}
+
+	if _, err := store.QueueInput("s1", "inp_2", "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.TurnStartedEvent("turn_2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelTurn("s1", "turn_2"); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = store.Recoveries()
+	if len(list) != 0 {
+		t.Fatalf("cancelled turn should clear its input: %+v", list)
+	}
+
+	if _, err := store.QueueInput("s1", "inp_3", "after cancel"); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = store.Recoveries()
+	if len(list) != 1 || list[0].ClaimID != "" || len(list[0].Inputs) != 1 {
+		t.Fatalf("input after cancel should recover: %+v", list)
+	}
+}
+
+func TestSettleToolsOnlyAfterLatestCompaction(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range []event.Event{
+		event.ToolCallEvent("old", "bash", `{}`),
+		event.CompactionEvent("summary", 1),
+		event.ToolCallEvent("new", "read_file", `{}`),
+	} {
+		if _, err := store.Append("s1", ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SettleTools("s1"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []string
+	for _, ev := range events {
+		if ev.Type == event.ToolResult {
+			id, _ := ev.Data["id"].(string)
+			results = append(results, id)
+		}
+	}
+	if len(results) != 1 || results[0] != "new" {
+		t.Fatalf("only the post-compaction call should settle, got %+v", results)
+	}
+}
+
 func TestSetModelBeforeLogExists(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {

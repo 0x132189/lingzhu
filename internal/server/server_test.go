@@ -1,13 +1,16 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"lingzhu/internal/agent"
 	"lingzhu/internal/model"
@@ -127,6 +130,179 @@ func TestPromptStreamsSSE(t *testing.T) {
 	}
 	if len(payload.Messages) != 2 || payload.Messages[1].Content != "hi!" {
 		t.Fatalf("unexpected messages: %+v", payload.Messages)
+	}
+}
+
+// gateProvider pauses the first response until the test releases it, so input
+// can be queued while the turn is active.
+type gateProvider struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *gateProvider) Stream(context.Context, model.Request) (provider.Stream, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		select {
+		case p.started <- struct{}{}:
+		default:
+		}
+		return &gateStream{release: p.release}, nil
+	}
+	return &staticStream{chunks: []provider.Chunk{{Text: "second"}}}, nil
+}
+
+type gateStream struct {
+	release <-chan struct{}
+	sent    bool
+}
+
+func (s *gateStream) Recv() (provider.Chunk, error) {
+	if s.sent {
+		return provider.Chunk{}, io.EOF
+	}
+	<-s.release
+	s.sent = true
+	return provider.Chunk{Text: "first"}, nil
+}
+
+func (s *gateStream) Close() error { return nil }
+
+func TestInputQueuesWhileRunIsActive(t *testing.T) {
+	p := &gateProvider{started: make(chan struct{}, 1), release: make(chan struct{})}
+	store, err := session.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := provider.Static("test", "Test", p, []provider.ModelSpec{{ID: "m", Name: "m"}}, "m")
+	srv := httptest.NewServer(New(agent.New(store, catalog, tool.NewRegistry(), nil, agent.Options{MaxSteps: 4}), store).Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/sessions/s1/prompt", "application/json", strings.NewReader(`{"text":"start"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	select {
+	case <-p.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not start")
+	}
+	running, err := http.Get(srv.URL + "/sessions/s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runningInfo struct {
+		Running bool `json:"running"`
+	}
+	if err := json.NewDecoder(running.Body).Decode(&runningInfo); err != nil {
+		t.Fatal(err)
+	}
+	running.Body.Close()
+	if !runningInfo.Running {
+		t.Fatal("session should report running while the model is active")
+	}
+
+	queued := post(t, srv.URL+"/sessions/s1/input", `{"text":"queued"}`)
+	if queued.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202 for queued input, got %d", queued.StatusCode)
+	}
+	close(p.release)
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	running, err = http.Get(srv.URL + "/sessions/s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(running.Body).Decode(&runningInfo); err != nil {
+		t.Fatal(err)
+	}
+	running.Body.Close()
+	if runningInfo.Running {
+		t.Fatal("session should be idle after run.end")
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"start", "first", "queued", "second"}
+	if len(messages) != len(want) {
+		t.Fatalf("want %d messages, got %+v", len(want), messages)
+	}
+	for index, text := range want {
+		if messages[index].Content != text {
+			t.Fatalf("message %d = %q, want %q", index, messages[index].Content, text)
+		}
+	}
+}
+
+func TestInputRequiresActiveRun(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Handler())
+	defer srv.Close()
+
+	resp := post(t, srv.URL+"/sessions/s1/input", `{"text":"late"}`)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 without a run, got %d", resp.StatusCode)
+	}
+}
+
+func TestGlobalEventsTagSessions(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+
+	lines := make(chan string, 128)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	go func() {
+		response, err := http.Post(srv.URL+"/sessions/s1/prompt", "application/json", strings.NewReader(`{"text":"hello"}`))
+		if err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+		}
+	}()
+
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatal("global event stream closed")
+			}
+			if strings.HasPrefix(line, "data: ") &&
+				strings.Contains(line, `"sessionId":"s1"`) &&
+				strings.Contains(line, `"type":"run.end"`) {
+				return
+			}
+		case <-timeout:
+			t.Fatal("global event stream did not report run.end")
+		}
 	}
 }
 

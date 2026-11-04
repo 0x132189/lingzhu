@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,15 +54,16 @@ func New(cfg config.Config) (*App, error) {
 	}
 	perm := permission.New(rules)
 
-	system := prompt.Build(prompt.Context{
-		Workdir: workdir,
-		Shell:   cfg.Shell,
-		Extra:   cfg.SystemPrompt,
-		Now:     time.Now(),
-	})
 	runner := agent.New(store, catalog, registry, perm, agent.Options{
-		MaxSteps:    cfg.MaxSteps,
-		System:      system,
+		MaxSteps: cfg.MaxSteps,
+		SystemFunc: func() string {
+			return prompt.Build(prompt.Context{
+				Workdir: workdir,
+				Shell:   cfg.Shell,
+				Extra:   cfg.SystemPrompt,
+				Now:     time.Now(),
+			})
+		},
 		CompactKeep: cfg.CompactKeep,
 		Base:        base,
 	})
@@ -72,6 +74,31 @@ func New(cfg config.Config) (*App, error) {
 		Store:  store,
 		cancel: cancel,
 	}, nil
+}
+
+// Recover resumes sessions a previous process left with an open turn claim or
+// undelivered input. It starts the turns and returns; their events are durable.
+func (a *App) Recover(ctx context.Context) error {
+	list, err := a.Store.Recoveries()
+	if err != nil {
+		return err
+	}
+	for _, item := range list {
+		meta, _ := a.Store.Meta(item.SessionID)
+		events, err := a.Agent.Resume(ctx, item.SessionID, item.ClaimID, provider.Selection{
+			Provider: meta.Provider,
+			Model:    meta.Model,
+		})
+		if err != nil {
+			log.Printf("recover %s: %v", item.SessionID, err)
+			continue
+		}
+		go func() {
+			for range events {
+			}
+		}()
+	}
+	return nil
 }
 
 // Shutdown interrupts every running turn and waits for them to finish, or for

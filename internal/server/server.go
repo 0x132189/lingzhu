@@ -55,11 +55,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}/messages", s.messages)
 	mux.HandleFunc("GET /sessions/{id}/context", s.context)
 	mux.HandleFunc("GET /sessions/{id}/events", s.events)
+	mux.HandleFunc("GET /events", s.allEvents)
 	mux.HandleFunc("POST /sessions/{id}/interrupt", s.interrupt)
 	mux.HandleFunc("POST /sessions/{id}/compact", s.compact)
 	mux.HandleFunc("GET /sessions/{id}/permission", s.listPermissions)
 	mux.HandleFunc("POST /sessions/{id}/permission/{rid}", s.replyPermission)
 	mux.HandleFunc("POST /sessions/{id}/prompt", s.prompt)
+	mux.HandleFunc("POST /sessions/{id}/input", s.input)
 	mux.HandleFunc("POST /shutdown", s.shutdown)
 	return mux
 }
@@ -81,6 +83,9 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	for i := range infos {
+		infos[i].Running = s.agent.Running(infos[i].ID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": infos})
 }
 
@@ -90,6 +95,7 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	info.Running = s.agent.Running(info.ID)
 	writeJSON(w, http.StatusOK, info)
 }
 
@@ -181,6 +187,7 @@ func (s *Server) context(w http.ResponseWriter, r *http.Request) {
 		"window":   target.Window,
 		"provider": target.ProviderID,
 		"model":    target.Model,
+		"running":  s.agent.Running(r.PathValue("id")),
 	})
 }
 
@@ -378,6 +385,94 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// input appends a prompt to the active turn. It never starts a run: clients
+// call prompt when idle, and input only while an SSE stream is already open.
+func (s *Server) input(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
+		writeError(w, http.StatusBadRequest, errText("text is empty"))
+		return
+	}
+	if _, err := s.agent.Enqueue(r.PathValue("id"), body.Text); err != nil {
+		if errors.Is(err, agent.ErrNotRunning) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusTooManyRequests, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true})
+}
+
+// allEvents streams events from every session, each tagged with its session ID.
+// It carries live events only; clients replay history through the per-session
+// endpoint.
+func (s *Server) allEvents(w http.ResponseWriter, r *http.Request) {
+	sub := s.agent.SubscribeAll()
+	defer sub.Close()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errText("streaming unsupported"))
+		return
+	}
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-r.Context().Done():
+			return
+		case item, ok := <-sub.Events():
+			if !ok {
+				return
+			}
+			if !writeSessionEvent(w, item) {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// writeSessionEvent emits one tagged SSE frame.
+func writeSessionEvent(w http.ResponseWriter, item event.SessionEvent) bool {
+	payload, err := json.Marshal(map[string]any{
+		"sessionId": item.SessionID,
+		"seq":       item.Event.Seq,
+		"type":      item.Event.Type,
+		"at":        item.Event.At,
+		"data":      item.Event.Data,
+	})
+	if err != nil {
+		log.Printf("marshal event: %v", err)
+		return true
+	}
+	if _, err := w.Write([]byte("event: " + string(item.Event.Type) + "\n")); err != nil {
+		return false
+	}
+	if _, err := w.Write([]byte("data: ")); err != nil {
+		return false
+	}
+	if _, err := w.Write(payload); err != nil {
+		return false
+	}
+	_, err = w.Write([]byte("\n\n"))
+	return err == nil
 }
 
 // writeEvent emits one SSE frame.

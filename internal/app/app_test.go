@@ -12,6 +12,60 @@ import (
 	"lingzhu/internal/provider"
 )
 
+func TestRecoverResumesClaimAndQueuedInput(t *testing.T) {
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer model.Close()
+
+	application, err := New(config.Config{
+		DataDir:  t.TempDir(),
+		Workdir:  t.TempDir(),
+		Model:    "test-model",
+		BaseURL:  model.URL,
+		APIKey:   "test-key",
+		MaxSteps: 2,
+		Shell:    []string{"bash", "-lc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Store.Append("s1", event.TurnStartedEvent("turn_1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Store.QueueInput("s1", "inp_1", "queued while away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		recoveries, err := application.Store.Recoveries()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(recoveries) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("recovery did not finish: %+v", recoveries)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	messages, err := application.Store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0].Content != "queued while away" || messages[1].Content != "recovered" {
+		t.Fatalf("unexpected recovered history: %+v", messages)
+	}
+}
+
 func TestShutdownInterruptsRunningTurn(t *testing.T) {
 	arrived := make(chan struct{}, 1)
 	release := make(chan struct{})

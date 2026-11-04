@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
+	"syscall"
 
 	"lingzhu/internal/model"
 )
@@ -13,6 +16,8 @@ import (
 type Chunk struct {
 	Text      string
 	ToolCalls []ToolCallDelta
+	// FinishReason is "stop", "length", "tool_calls" and so on when reported.
+	FinishReason string
 	// Usage is set on the final chunk when the provider reports it.
 	Usage *Usage
 }
@@ -62,12 +67,54 @@ var overflowHints = []string{
 	"exceeds the maximum",
 }
 
-func classifyError(status string, body string) error {
+// StatusError is a non-2xx response or an in-stream provider error. Code is
+// zero when the failure happened after the response started.
+type StatusError struct {
+	Code     int
+	Message  string
+	Overflow bool
+}
+
+func (e *StatusError) Error() string { return e.Message }
+
+func (e *StatusError) Unwrap() error {
+	if e.Overflow {
+		return ErrContextOverflow
+	}
+	return nil
+}
+
+// IsRetryable reports whether the same request may succeed after a short wait.
+// Only transport and rate-limit failures qualify; authentication, invalid
+// request and content errors do not.
+func IsRetryable(err error) bool {
+	var status *StatusError
+	if errors.As(err, &status) {
+		return status.Code == 408 || status.Code == 429 || status.Code >= 500
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED)
+}
+
+func classifyError(code int, status string, body string) error {
 	text := strings.ToLower(status + " " + body)
+	overflow := false
 	for _, hint := range overflowHints {
 		if strings.Contains(text, hint) {
-			return fmt.Errorf("%w: %s %s", ErrContextOverflow, status, strings.TrimSpace(body))
+			overflow = true
+			break
 		}
 	}
-	return fmt.Errorf("provider %s: %s", status, strings.TrimSpace(body))
+	return &StatusError{
+		Code:     code,
+		Message:  fmt.Sprintf("provider %s: %s", status, strings.TrimSpace(body)),
+		Overflow: overflow,
+	}
 }

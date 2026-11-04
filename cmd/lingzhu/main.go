@@ -82,6 +82,9 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
+	if err := application.Recover(context.Background()); err != nil {
+		log.Printf("recover: %v", err)
+	}
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           application.Server.Handler(),

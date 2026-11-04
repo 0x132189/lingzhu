@@ -37,11 +37,14 @@ type Rule struct {
 
 type Rules []Rule
 
-// Default is the fallback ruleset: ask by default, allow reads.
+// Default matches opencode's primary-agent policy: allow ordinary tools while
+// still asking before reading environment files that often hold secrets.
 func Default() Rules {
 	return Rules{
-		{Action: "*", Resource: "*", Effect: Ask},
-		{Action: "read", Resource: "*", Effect: Allow},
+		{Action: "*", Resource: "*", Effect: Allow},
+		{Action: "read", Resource: "*.env", Effect: Ask},
+		{Action: "read", Resource: "*.env.*", Effect: Ask},
+		{Action: "read", Resource: "*.env.example", Effect: Allow},
 	}
 }
 

@@ -70,5 +70,6 @@ func (e *Edit) Run(ctx context.Context, call Call) (string, error) {
 	if err := os.WriteFile(path, []byte(updated), info.Mode().Perm()); err != nil {
 		return "", fmt.Errorf("edit: %w", err)
 	}
+	call.SetDiff(lineDiff(e.Dir, path, content, updated))
 	return fmt.Sprintf("edited %s (%d -> %d bytes)", path, len(content), len(updated)), nil
 }

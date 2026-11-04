@@ -50,6 +50,46 @@ func TestWriteThenRead(t *testing.T) {
 	}
 }
 
+func TestFileToolsReportDiff(t *testing.T) {
+	registry, _ := newRegistry(t, nil)
+	perm := permission.New(permission.Rules{{Action: "*", Resource: "*", Effect: permission.Allow}})
+	runDiff := func(name, input string) (string, string) {
+		t.Helper()
+		var diff string
+		output, err := registry.Run(context.Background(), Call{
+			Name:      name,
+			Input:     []byte(input),
+			Perm:      perm,
+			SessionID: "test",
+			OnDiff:    func(value string) { diff = value },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return output, diff
+	}
+
+	_, diff := runDiff("write_file", `{"path":"a.txt","content":"first\nsecond\n"}`)
+	if !strings.Contains(diff, "--- a/a.txt") || !strings.Contains(diff, "+first") {
+		t.Fatalf("write diff missing: %q", diff)
+	}
+
+	_, diff = runDiff("edit", `{"path":"a.txt","old_string":"first","new_string":"changed"}`)
+	if !strings.Contains(diff, "-first") || !strings.Contains(diff, "+changed") {
+		t.Fatalf("edit diff missing: %q", diff)
+	}
+}
+
+func TestLineDiffOmitsUnchangedEdges(t *testing.T) {
+	diff := lineDiff("/work", "/work/sub/a.txt", "one\ntwo\nthree\n", "one\nTWO\nthree\n")
+	if !strings.Contains(diff, "--- a/sub/a.txt") || !strings.Contains(diff, "-two") || !strings.Contains(diff, "+TWO") {
+		t.Fatalf("unexpected diff: %q", diff)
+	}
+	if strings.Contains(diff, "+one") || strings.Contains(diff, "-three") {
+		t.Fatalf("unchanged lines leaked into diff: %q", diff)
+	}
+}
+
 func TestDeniedToolDoesNotRun(t *testing.T) {
 	registry, dir := newRegistry(t, nil)
 	perm := permission.New(permission.Rules{{Action: "write", Resource: "*", Effect: permission.Deny}})

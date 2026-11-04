@@ -83,6 +83,30 @@ func TestStreamReportsHTTPError(t *testing.T) {
 	}
 }
 
+func TestStreamReportsFinishReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"truncated\"},\"finish_reason\":\"length\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := NewOpenAI(server.URL, "key")
+	stream, err := p.Stream(context.Background(), model.Request{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	chunk, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Text != "truncated" || chunk.FinishReason != "length" {
+		t.Fatalf("unexpected chunk: %+v", chunk)
+	}
+}
+
 func TestStreamNormalizesUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -117,6 +141,26 @@ func TestStreamNormalizesUsage(t *testing.T) {
 	}
 	if usage.Input != 60 || usage.CacheRead != 40 || usage.Output != 7 {
 		t.Fatalf("unexpected usage: %+v", usage)
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"rate limit", &StatusError{Code: 429}, true},
+		{"server error", &StatusError{Code: 503}, true},
+		{"bad key", &StatusError{Code: 401}, false},
+		{"bad request", &StatusError{Code: 400}, false},
+		{"truncated stream", io.ErrUnexpectedEOF, true},
+		{"plain error", errors.New("bad body"), false},
+	}
+	for _, tc := range cases {
+		if got := IsRetryable(tc.err); got != tc.want {
+			t.Fatalf("%s: IsRetryable = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

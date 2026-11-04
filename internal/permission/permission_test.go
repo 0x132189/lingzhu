@@ -42,12 +42,24 @@ func TestEvaluateAllDenyWins(t *testing.T) {
 	}
 }
 
-func TestDefaultAsksUnknownActions(t *testing.T) {
-	if got := Default().Evaluate("write", "a.txt"); got != Ask {
-		t.Fatalf("want ask, got %s", got)
+func TestDefaultMatchesOpencode(t *testing.T) {
+	if got := Default().Evaluate("write", "a.txt"); got != Allow {
+		t.Fatalf("want allow for write, got %s", got)
+	}
+	if got := Default().Evaluate("bash", "ls"); got != Allow {
+		t.Fatalf("want allow for bash, got %s", got)
 	}
 	if got := Default().Evaluate("read", "a.txt"); got != Allow {
-		t.Fatalf("want allow, got %s", got)
+		t.Fatalf("want allow for read, got %s", got)
+	}
+	if got := Default().Evaluate("read", "/work/.env"); got != Ask {
+		t.Fatalf("want ask for .env, got %s", got)
+	}
+	if got := Default().Evaluate("read", "/work/.env.local"); got != Ask {
+		t.Fatalf("want ask for .env.local, got %s", got)
+	}
+	if got := Default().Evaluate("read", "/work/.env.example"); got != Allow {
+		t.Fatalf("want allow for .env.example, got %s", got)
 	}
 }
 

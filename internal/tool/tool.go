@@ -22,6 +22,15 @@ type Call struct {
 	Input     json.RawMessage
 	Perm      *permission.Manager
 	OnAsk     func(permission.Request)
+	// OnDiff receives a unified diff for tools that change files.
+	OnDiff func(string)
+}
+
+// SetDiff reports the file change for the UI without making the model read it.
+func (c Call) SetDiff(diff string) {
+	if c.OnDiff != nil && diff != "" {
+		c.OnDiff(diff)
+	}
 }
 
 // Allow requests permission for action before the tool runs.
