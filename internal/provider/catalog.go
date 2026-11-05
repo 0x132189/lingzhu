@@ -160,27 +160,34 @@ func NewCatalog(specs []ProviderSpec, defaultProvider, defaultModel string) (*Ca
 			return nil, fmt.Errorf("provider %s has no model %q", defaultProvider, defaultModel)
 		}
 	}
+	catalog.defaultTarget = entry.target(defaultModel)
+	return catalog, nil
+}
+
+// target builds the resolved view of one model. An unknown id keeps the id as
+// the wire model with no window, which is how a legacy single-model config
+// behaves when the catalog did not describe it.
+func (e *catalogEntry) target(modelID string) Target {
 	window := 0
-	requestModel := defaultModel
+	requestModel := modelID
 	var options map[string]any
 	noTools := false
-	if model, ok := entry.models[defaultModel]; ok {
+	if model, ok := e.models[modelID]; ok {
 		window = model.ContextWindow
 		requestModel = model.WireModel
 		options = model.Options
 		noTools = model.NoTools
 	}
-	catalog.defaultTarget = Target{
-		ProviderID:   entry.spec.ID,
-		ProviderName: entry.spec.Name,
-		Model:        defaultModel,
+	return Target{
+		ProviderID:   e.spec.ID,
+		ProviderName: e.spec.Name,
+		Model:        modelID,
 		RequestModel: requestModel,
 		Options:      options,
 		NoTools:      noTools,
 		Window:       window,
-		Provider:     entry.provider,
+		Provider:     e.provider,
 	}
-	return catalog, nil
 }
 
 // Static builds a catalog around an existing provider implementation; tests
@@ -195,26 +202,7 @@ func Static(id, name string, p Provider, models []ModelSpec, defaultModel string
 			entry.modelOrder = append(entry.modelOrder, selectable.ID)
 		}
 	}
-	window := 0
-	requestModel := defaultModel
-	var options map[string]any
-	noTools := false
-	if model, ok := entry.models[defaultModel]; ok {
-		window = model.ContextWindow
-		requestModel = model.WireModel
-		options = model.Options
-		noTools = model.NoTools
-	}
-	catalog.defaultTarget = Target{
-		ProviderID:   id,
-		ProviderName: name,
-		Model:        defaultModel,
-		RequestModel: requestModel,
-		Options:      options,
-		NoTools:      noTools,
-		Window:       window,
-		Provider:     p,
-	}
+	catalog.defaultTarget = entry.target(defaultModel)
 	return catalog
 }
 
@@ -265,33 +253,15 @@ func (c *Catalog) Resolve(selection Selection) (Target, error) {
 	if modelID == "" && len(entry.modelOrder) > 0 {
 		modelID = entry.modelOrder[0]
 	}
-	window := 0
-	requestModel := modelID
-	var options map[string]any
-	noTools := false
 	if modelID != "" {
-		model, ok := entry.models[modelID]
-		if !ok {
+		if _, ok := entry.models[modelID]; !ok {
 			return Target{}, fmt.Errorf("provider %s has no model %q", providerID, modelID)
 		}
-		window = model.ContextWindow
-		requestModel = model.WireModel
-		options = model.Options
-		noTools = model.NoTools
 	}
 	if entry.spec.APIKey == "" {
 		return Target{}, fmt.Errorf("provider %s has no API key", providerID)
 	}
-	return Target{
-		ProviderID:   entry.spec.ID,
-		ProviderName: entry.spec.Name,
-		Model:        modelID,
-		RequestModel: requestModel,
-		Options:      options,
-		NoTools:      noTools,
-		Window:       window,
-		Provider:     entry.provider,
-	}, nil
+	return entry.target(modelID), nil
 }
 
 // Providers returns the catalog for clients, in configuration order.

@@ -78,17 +78,14 @@ func serve(args []string) {
 	workdir := fs.String("workdir", "", "agent working directory")
 	_ = fs.Parse(args)
 
-	cfg := mustConfig(*configPath, *addr, *data, *providerID, *model, *workdir)
-	lock, err := datadir.Lock(cfg.DataDir)
+	setup, err := newSetup(*configPath, *addr, *data, *providerID, *model, *workdir)
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
-	defer lock.Release()
+	defer setup.Lock.Release()
 
-	application, err := app.New(cfg)
-	if err != nil {
-		log.Fatalf("init: %v", err)
-	}
+	cfg := setup.Config
+	application := setup.App
 	if err := application.Recover(context.Background()); err != nil {
 		log.Printf("recover: %v", err)
 	}
@@ -157,17 +154,14 @@ func run(args []string) {
 		log.Fatal("run: prompt is empty")
 	}
 
-	cfg := mustConfig(*configPath, *addr, *data, *providerID, *model, *workdir)
-	lock, err := datadir.Lock(cfg.DataDir)
+	setup, err := newSetup(*configPath, *addr, *data, *providerID, *model, *workdir)
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
-	defer lock.Release()
+	defer setup.Lock.Release()
 
-	application, err := app.New(cfg)
-	if err != nil {
-		log.Fatalf("init: %v", err)
-	}
+	cfg := setup.Config
+	application := setup.App
 	defer application.Store.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -202,6 +196,30 @@ func run(args []string) {
 	if failed {
 		os.Exit(1)
 	}
+}
+
+// setup is the state both commands share: resolved config, an exclusive claim
+// on the data directory, and the assembled application.
+type setup struct {
+	Config config.Config
+	App    *app.App
+	Lock   *datadir.Guard
+}
+
+// newSetup loads configuration, locks the data directory and builds the
+// application. On failure it releases everything it acquired.
+func newSetup(configPath, addr, data, providerID, model, workdir string) (*setup, error) {
+	cfg := mustConfig(configPath, addr, data, providerID, model, workdir)
+	lock, err := datadir.Lock(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	application, err := app.New(cfg)
+	if err != nil {
+		_ = lock.Release()
+		return nil, err
+	}
+	return &setup{Config: cfg, App: application, Lock: lock}, nil
 }
 
 // askPermission asks the user about a pending permission request in the terminal.

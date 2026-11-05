@@ -119,11 +119,8 @@ func (r *ReadFile) Run(ctx context.Context, call Call) (string, error) {
 	if err := json.Unmarshal(call.Input, &args); err != nil {
 		return "", fmt.Errorf("read_file: %w", err)
 	}
-	path, err := resolvePath(r.Dir, args.Path)
+	path, err := call.Resolve(ctx, "read", r.Dir, args.Path)
 	if err != nil {
-		return "", err
-	}
-	if err := call.AllowFile(ctx, "read", path, external(r.Dir, path)); err != nil {
 		return "", err
 	}
 
@@ -178,11 +175,8 @@ func (w *WriteFile) Run(ctx context.Context, call Call) (string, error) {
 	if err := json.Unmarshal(call.Input, &args); err != nil {
 		return "", fmt.Errorf("write_file: %w", err)
 	}
-	path, err := resolvePath(w.Dir, args.Path)
+	path, err := call.Resolve(ctx, "write", w.Dir, args.Path)
 	if err != nil {
-		return "", err
-	}
-	if err := call.AllowFile(ctx, "write", path, external(w.Dir, path)); err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

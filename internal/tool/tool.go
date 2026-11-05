@@ -56,6 +56,20 @@ func (c Call) AllowFile(ctx context.Context, action, resource string, external b
 	return c.Allow(ctx, action, []string{resource}, "")
 }
 
+// Resolve turns a tool path into an absolute path and asks for permission.
+// A path outside root is checked against external_directory first, so every
+// file tool applies the same boundary policy.
+func (c Call) Resolve(ctx context.Context, action, root, path string) (string, error) {
+	abs, err := resolvePath(root, path)
+	if err != nil {
+		return "", err
+	}
+	if err := c.AllowFile(ctx, action, abs, external(root, abs)); err != nil {
+		return "", err
+	}
+	return abs, nil
+}
+
 type Tool interface {
 	Name() string
 	Description() string

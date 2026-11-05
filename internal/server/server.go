@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,7 +12,6 @@ import (
 	"sync"
 
 	"lingzhu/internal/agent"
-	"lingzhu/internal/event"
 	"lingzhu/internal/permission"
 	"lingzhu/internal/provider"
 	"lingzhu/internal/session"
@@ -208,25 +206,20 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, errText("streaming unsupported"))
+	stream, err := newSSEWriter(w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	header := w.Header()
-	header.Set("Content-Type", "text/event-stream")
-	header.Set("Cache-Control", "no-cache")
-	header.Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 
 	last := after
 	for _, ev := range replay {
-		if !writeEvent(w, ev) {
+		if !stream.write(string(ev.Type), ev) {
 			return
 		}
 		last = ev.Seq
 	}
-	flusher.Flush()
+	stream.flush()
 	if !follow {
 		return
 	}
@@ -247,10 +240,10 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			if ev.Seq > last {
 				last = ev.Seq
 			}
-			if !writeEvent(w, ev) {
+			if !stream.write(string(ev.Type), ev) {
 				return
 			}
-			flusher.Flush()
+			stream.flush()
 		}
 	}
 }
@@ -360,16 +353,11 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, errText("streaming unsupported"))
+	stream, err := newSSEWriter(w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	header := w.Header()
-	header.Set("Content-Type", "text/event-stream")
-	header.Set("Cache-Control", "no-cache")
-	header.Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 
 	for {
 		select {
@@ -379,10 +367,10 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if !writeEvent(w, ev) {
+			if !stream.write(string(ev.Type), ev) {
 				return
 			}
-			flusher.Flush()
+			stream.flush()
 		}
 	}
 }
@@ -419,17 +407,12 @@ func (s *Server) allEvents(w http.ResponseWriter, r *http.Request) {
 	sub := s.agent.SubscribeAll()
 	defer sub.Close()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, errText("streaming unsupported"))
+	stream, err := newSSEWriter(w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	header := w.Header()
-	header.Set("Content-Type", "text/event-stream")
-	header.Set("Cache-Control", "no-cache")
-	header.Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	stream.flush()
 
 	for {
 		select {
@@ -441,58 +424,19 @@ func (s *Server) allEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if !writeSessionEvent(w, item) {
+			payload := map[string]any{
+				"sessionId": item.SessionID,
+				"seq":       item.Event.Seq,
+				"type":      item.Event.Type,
+				"at":        item.Event.At,
+				"data":      item.Event.Data,
+			}
+			if !stream.write(string(item.Event.Type), payload) {
 				return
 			}
-			flusher.Flush()
+			stream.flush()
 		}
 	}
-}
-
-// writeSessionEvent emits one tagged SSE frame.
-func writeSessionEvent(w http.ResponseWriter, item event.SessionEvent) bool {
-	payload, err := json.Marshal(map[string]any{
-		"sessionId": item.SessionID,
-		"seq":       item.Event.Seq,
-		"type":      item.Event.Type,
-		"at":        item.Event.At,
-		"data":      item.Event.Data,
-	})
-	if err != nil {
-		log.Printf("marshal event: %v", err)
-		return true
-	}
-	if _, err := w.Write([]byte("event: " + string(item.Event.Type) + "\n")); err != nil {
-		return false
-	}
-	if _, err := w.Write([]byte("data: ")); err != nil {
-		return false
-	}
-	if _, err := w.Write(payload); err != nil {
-		return false
-	}
-	_, err = w.Write([]byte("\n\n"))
-	return err == nil
-}
-
-// writeEvent emits one SSE frame.
-func writeEvent(w http.ResponseWriter, ev event.Event) bool {
-	payload, err := json.Marshal(ev)
-	if err != nil {
-		log.Printf("marshal event: %v", err)
-		return true
-	}
-	if _, err := w.Write([]byte("event: " + string(ev.Type) + "\n")); err != nil {
-		return false
-	}
-	if _, err := w.Write([]byte("data: ")); err != nil {
-		return false
-	}
-	if _, err := w.Write(payload); err != nil {
-		return false
-	}
-	_, err = w.Write([]byte("\n\n"))
-	return err == nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

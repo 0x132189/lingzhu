@@ -116,6 +116,29 @@ type runHandle struct {
 	done      chan struct{}
 }
 
+// turnState is the retry and continuation budget of one user turn. Every new
+// user turn starts from zero, which keeps the loop's reset points explicit.
+type turnState struct {
+	recovered     bool
+	attempts      int
+	notice        string
+	outputLimits  int
+	streamResumes int
+}
+
+func (s *turnState) reset() { *s = turnState{} }
+
+// stepResult is one model call: the streamed text, any tool calls it asked for,
+// the reported usage and the finish reason. Err is set when the stream failed
+// after producing partial output.
+type stepResult struct {
+	Text   string
+	Calls  []model.ToolCall
+	Usage  *provider.Usage
+	Finish string
+	Err    error
+}
+
 func New(store *session.Store, catalog *provider.Catalog, tools *tool.Registry, perm *permission.Manager, opts Options) *Agent {
 	base := opts.Base
 	if base == nil {
@@ -432,8 +455,7 @@ func (a *Agent) SubscribeAll() *event.GlobalSubscription {
 	return a.hub.SubscribeAll()
 }
 
-// Window is the context window of a resolved target, zero when compaction is
-// disabled.
+// Resolve turns a selection into a provider target.
 func (a *Agent) Resolve(selection provider.Selection) (provider.Target, error) {
 	return a.catalog.Resolve(selection)
 }
@@ -463,11 +485,7 @@ func (a *Agent) Compact(ctx context.Context, sessionID string, selection provide
 }
 
 func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Target) {
-	recovered := false
-	attempts := 0
-	requestNotice := ""
-	outputLimits := 0
-	streamResumes := 0
+	var state turnState
 	for step := 0; ; {
 		if ctx.Err() != nil {
 			_ = a.emit(sessionID, event.End("interrupted"))
@@ -480,11 +498,7 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 				return
 			}
 			step = 0
-			recovered = false
-			attempts = 0
-			requestNotice = ""
-			outputLimits = 0
-			streamResumes = 0
+			state.reset()
 		}
 		if step >= a.maxSteps {
 			queued, done := a.takeOrFinish(sessionID)
@@ -493,11 +507,7 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 					return
 				}
 				step = 0
-				recovered = false
-				attempts = 0
-				requestNotice = ""
-				outputLimits = 0
-				streamResumes = 0
+				state.reset()
 				continue
 			}
 			a.wrapUp(ctx, sessionID, target)
@@ -521,28 +531,28 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 				a.fail(sessionID, err)
 				return
 			}
-			recovered = true
+			state.recovered = true
 		}
 
 		messages := current.Messages
-		if requestNotice != "" {
+		if state.notice != "" {
 			// Synthetic only for this request; persistence would surface it as a
 			// user turn in history.
 			messages = append(append([]model.Message{}, messages...), model.Message{
 				Role:    model.RoleUser,
-				Content: requestNotice,
+				Content: state.notice,
 			})
 		}
-		text, calls, usage, finish, err := a.stream(ctx, sessionID, messages, target, a.tools.Definitions())
-		if usage != nil {
-			if recordErr := a.emit(sessionID, event.UsageEvent(usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite)); recordErr != nil {
+		result := a.stream(ctx, sessionID, messages, target, a.tools.Definitions())
+		if result.Usage != nil {
+			if recordErr := a.emit(sessionID, event.UsageEvent(result.Usage.Input, result.Usage.Output, result.Usage.CacheRead, result.Usage.CacheWrite)); recordErr != nil {
 				a.fail(sessionID, recordErr)
 				return
 			}
 		}
-		if err != nil {
+		if result.Err != nil {
 			if ctx.Err() != nil {
-				if recordErr := a.recordAssistant(sessionID, text); recordErr != nil {
+				if recordErr := a.recordAssistant(sessionID, result.Text); recordErr != nil {
 					a.fail(sessionID, recordErr)
 					return
 				}
@@ -552,8 +562,8 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 			// The provider rejected the prompt as too long: summarize harder and
 			// retry the same step once. Anything already received means the
 			// prompt itself fit, so recovery no longer applies.
-			if provider.IsContextOverflow(err) && !recovered && strings.TrimSpace(text) == "" && len(calls) == 0 {
-				recovered = true
+			if provider.IsContextOverflow(result.Err) && !state.recovered && strings.TrimSpace(result.Text) == "" && len(result.Calls) == 0 {
+				state.recovered = true
 				if compactErr := a.compact(ctx, sessionID, target, current, a.keep/2); compactErr == nil {
 					continue
 				}
@@ -563,48 +573,48 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 			}
 			// Retry only failures that produced no output, so a repeated request
 			// cannot duplicate text in the transcript.
-			if attempts < a.retries && strings.TrimSpace(text) == "" && len(calls) == 0 && provider.IsRetryable(err) {
-				attempts++
-				if !sleep(ctx, a.backoff(attempts)) {
+			if state.attempts < a.retries && strings.TrimSpace(result.Text) == "" && len(result.Calls) == 0 && provider.IsRetryable(result.Err) {
+				state.attempts++
+				if !sleep(ctx, a.backoff(state.attempts)) {
 					_ = a.emit(sessionID, event.End("interrupted"))
 					return
 				}
 				continue
 			}
-			if strings.TrimSpace(text) != "" {
-				if recordErr := a.recordAssistant(sessionID, text); recordErr != nil {
+			if strings.TrimSpace(result.Text) != "" {
+				if recordErr := a.recordAssistant(sessionID, result.Text); recordErr != nil {
 					a.fail(sessionID, recordErr)
 					return
 				}
 				// Keep the work already streamed and ask for the remainder
 				// instead of dropping a partially delivered answer.
-				if streamResumes < maxStreamContinuations && provider.IsRetryable(err) {
-					streamResumes++
-					requestNotice = streamResumePrompt
+				if state.streamResumes < maxStreamContinuations && provider.IsRetryable(result.Err) {
+					state.streamResumes++
+					state.notice = streamResumePrompt
 					continue
 				}
 			}
-			a.fail(sessionID, err)
+			a.fail(sessionID, result.Err)
 			return
 		}
-		recovered = false
-		attempts = 0
-		requestNotice = ""
+		state.recovered = false
+		state.attempts = 0
+		state.notice = ""
 
-		if err := a.recordAssistant(sessionID, text); err != nil {
+		if err := a.recordAssistant(sessionID, result.Text); err != nil {
 			a.fail(sessionID, err)
 			return
 		}
-		if finish == "length" {
-			if outputLimits >= maxOutputContinuations {
+		if result.Finish == "length" {
+			if state.outputLimits >= maxOutputContinuations {
 				a.fail(sessionID, errors.New("response still truncated after two output limit continuations"))
 				return
 			}
-			outputLimits++
-			requestNotice = outputLimitPrompt
+			state.outputLimits++
+			state.notice = outputLimitPrompt
 			continue
 		}
-		if len(calls) == 0 {
+		if len(result.Calls) == 0 {
 			queued, done := a.takeOrFinish(sessionID)
 			if done {
 				_ = a.emit(sessionID, event.End("done"))
@@ -614,19 +624,15 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 				return
 			}
 			step = 0
-			recovered = false
-			attempts = 0
-			requestNotice = ""
-			outputLimits = 0
-			streamResumes = 0
+			state.reset()
 			continue
 		}
-		if !a.runTools(ctx, sessionID, calls) {
+		if !a.runTools(ctx, sessionID, result.Calls) {
 			return
 		}
 		step++
-		outputLimits = 0
-		streamResumes = 0
+		state.outputLimits = 0
+		state.streamResumes = 0
 	}
 }
 
@@ -657,15 +663,15 @@ func (a *Agent) wrapUp(ctx context.Context, sessionID string, target provider.Ta
 	messages = append(messages, current.Messages...)
 	messages = append(messages, model.Message{Role: model.RoleAssistant, Content: maxStepsPrompt})
 
-	text, _, usage, _, err := a.stream(ctx, sessionID, messages, target, nil)
-	if usage != nil {
-		if recordErr := a.emit(sessionID, event.UsageEvent(usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite)); recordErr != nil {
+	result := a.stream(ctx, sessionID, messages, target, nil)
+	if result.Usage != nil {
+		if recordErr := a.emit(sessionID, event.UsageEvent(result.Usage.Input, result.Usage.Output, result.Usage.CacheRead, result.Usage.CacheWrite)); recordErr != nil {
 			a.fail(sessionID, recordErr)
 			return
 		}
 	}
-	if err != nil {
-		if recordErr := a.recordAssistant(sessionID, text); recordErr != nil {
+	if result.Err != nil {
+		if recordErr := a.recordAssistant(sessionID, result.Text); recordErr != nil {
 			a.fail(sessionID, recordErr)
 			return
 		}
@@ -673,10 +679,10 @@ func (a *Agent) wrapUp(ctx context.Context, sessionID string, target provider.Ta
 			_ = a.emit(sessionID, event.End("interrupted"))
 			return
 		}
-		a.fail(sessionID, err)
+		a.fail(sessionID, result.Err)
 		return
 	}
-	if err := a.recordAssistant(sessionID, text); err != nil {
+	if err := a.recordAssistant(sessionID, result.Text); err != nil {
 		a.fail(sessionID, err)
 		return
 	}
@@ -712,7 +718,7 @@ func (a *Agent) due(tokens, window int) bool {
 
 // stream returns partial output even when the provider fails mid-response, so
 // the caller can record it and decide between resuming and failing.
-func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.Message, target provider.Target, tools []model.ToolDef) (string, []model.ToolCall, *provider.Usage, string, error) {
+func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.Message, target provider.Target, tools []model.ToolDef) stepResult {
 	wire := target.RequestModel
 	if wire == "" {
 		wire = target.Model
@@ -723,13 +729,12 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 	req := model.Request{Model: wire, Messages: a.withSystem(messages), Tools: tools, Options: target.Options}
 	stream, err := target.Provider.Stream(ctx, req)
 	if err != nil {
-		return "", nil, nil, "", err
+		return stepResult{Err: err}
 	}
 	defer stream.Close()
 
+	var result stepResult
 	var text strings.Builder
-	var usage *provider.Usage
-	finish := ""
 	calls := map[int]*model.ToolCall{}
 	for {
 		chunk, err := stream.Recv()
@@ -737,13 +742,19 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 			break
 		}
 		if err != nil {
-			return text.String(), ordered(calls), usage, finish, err
+			return stepResult{
+				Text:   text.String(),
+				Calls:  ordered(calls),
+				Usage:  result.Usage,
+				Finish: result.Finish,
+				Err:    err,
+			}
 		}
 		if chunk.Usage != nil {
-			usage = chunk.Usage
+			result.Usage = chunk.Usage
 		}
 		if chunk.FinishReason != "" {
-			finish = chunk.FinishReason
+			result.Finish = chunk.FinishReason
 		}
 		if chunk.Text != "" {
 			text.WriteString(chunk.Text)
@@ -762,7 +773,9 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 			call.Arguments += delta.Arguments
 		}
 	}
-	return text.String(), ordered(calls), usage, finish, nil
+	result.Text = text.String()
+	result.Calls = ordered(calls)
+	return result
 }
 
 // withSystem prepends the derived system prompt without touching stored history.

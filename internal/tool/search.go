@@ -146,11 +146,8 @@ func (g *Grep) Run(ctx context.Context, call Call) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("grep: %w", err)
 	}
-	root, err := resolvePath(g.Dir, defaultString(args.Path, "."))
+	root, err := call.Resolve(ctx, "read", g.Dir, defaultString(args.Path, "."))
 	if err != nil {
-		return "", err
-	}
-	if err := call.AllowFile(ctx, "read", root, external(g.Dir, root)); err != nil {
 		return "", err
 	}
 	limit := args.Limit

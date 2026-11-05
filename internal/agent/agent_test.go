@@ -140,8 +140,8 @@ func TestStreamSendsVariantRequestModelAndOptions(t *testing.T) {
 		Options:      map[string]any{"reasoning_effort": "high"},
 		Provider:     fake,
 	}
-	if _, _, _, _, err := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, nil); err != nil {
-		t.Fatal(err)
+	if result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, nil); result.Err != nil {
+		t.Fatal(result.Err)
 	}
 	if len(fake.requests) != 1 {
 		t.Fatalf("requests = %d", len(fake.requests))
@@ -157,8 +157,8 @@ func TestStreamOmitsToolsWhenModelSaysNone(t *testing.T) {
 	a, _ := newTestAgent(t, fake)
 	target := provider.Target{Model: "m", RequestModel: "m", NoTools: true, Provider: fake}
 	tools := []model.ToolDef{{Name: "echo", Description: "d", Schema: []byte(`{"type":"object"}`)}}
-	if _, _, _, _, err := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, tools); err != nil {
-		t.Fatal(err)
+	if result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, tools); result.Err != nil {
+		t.Fatal(result.Err)
 	}
 	if len(fake.requests) != 1 {
 		t.Fatalf("requests = %d", len(fake.requests))

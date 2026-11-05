@@ -43,11 +43,8 @@ func (e *Edit) Run(ctx context.Context, call Call) (string, error) {
 	if args.OldString == "" {
 		return "", fmt.Errorf("edit: old_string is empty")
 	}
-	path, err := resolvePath(e.Dir, args.Path)
+	path, err := call.Resolve(ctx, "edit", e.Dir, args.Path)
 	if err != nil {
-		return "", err
-	}
-	if err := call.AllowFile(ctx, "edit", path, external(e.Dir, path)); err != nil {
 		return "", err
 	}
 
