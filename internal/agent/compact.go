@@ -72,7 +72,11 @@ func (a *Agent) summarize(ctx context.Context, target provider.Target, history [
 	}
 
 	messages := []model.Message{{Role: model.RoleUser, Content: text + "\n\n" + compactionPrompt}}
-	stream, err := target.Provider.Stream(ctx, model.Request{Model: target.Model, Messages: a.withSystem(messages)})
+	wire := target.RequestModel
+	if wire == "" {
+		wire = target.Model
+	}
+	stream, err := target.Provider.Stream(ctx, model.Request{Model: wire, Messages: a.withSystem(messages), Options: target.Options})
 	if err != nil {
 		return "", nil, err
 	}

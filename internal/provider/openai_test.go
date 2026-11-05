@@ -71,6 +71,42 @@ func TestStreamParsesSSE(t *testing.T) {
 	}
 }
 
+func TestStreamMergesModelOptions(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := decodeJSON(r, &got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	p := NewOpenAI(server.URL, "key")
+	stream, err := p.Stream(context.Background(), model.Request{
+		Model:    "m",
+		Messages: []model.Message{{Role: model.RoleUser, Content: "hi"}},
+		Options:  map[string]any{"reasoningEffort": "high", "textVerbosity": "low", "thinking": map[string]any{"type": "enabled"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if got["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort = %v", got["reasoning_effort"])
+	}
+	if got["verbosity"] != "low" {
+		t.Fatalf("verbosity = %v", got["verbosity"])
+	}
+	thinking, _ := got["thinking"].(map[string]any)
+	if thinking["type"] != "enabled" {
+		t.Fatalf("thinking = %v", got["thinking"])
+	}
+	if got["model"] != "m" {
+		t.Fatalf("model = %v", got["model"])
+	}
+}
+
 func TestStreamReportsHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad key", http.StatusUnauthorized)

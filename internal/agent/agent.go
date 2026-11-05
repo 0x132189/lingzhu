@@ -713,7 +713,14 @@ func (a *Agent) due(tokens, window int) bool {
 // stream returns partial output even when the provider fails mid-response, so
 // the caller can record it and decide between resuming and failing.
 func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.Message, target provider.Target, tools []model.ToolDef) (string, []model.ToolCall, *provider.Usage, string, error) {
-	req := model.Request{Model: target.Model, Messages: a.withSystem(messages), Tools: tools}
+	wire := target.RequestModel
+	if wire == "" {
+		wire = target.Model
+	}
+	if target.NoTools {
+		tools = nil
+	}
+	req := model.Request{Model: wire, Messages: a.withSystem(messages), Tools: tools, Options: target.Options}
 	stream, err := target.Provider.Stream(ctx, req)
 	if err != nil {
 		return "", nil, nil, "", err

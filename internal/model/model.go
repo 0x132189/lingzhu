@@ -40,4 +40,7 @@ type Request struct {
 	Model    string
 	Messages []Message
 	Tools    []ToolDef
+	// Options are extra request-body fields for this model, such as
+	// reasoning_effort or thinking.
+	Options map[string]any
 }

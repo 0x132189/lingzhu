@@ -33,6 +33,18 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request) (Stream, error) 
 	if err != nil {
 		return nil, err
 	}
+	if options := normalizeOptions(req.Options); len(options) > 0 {
+		body := map[string]any{}
+		if err := json.Unmarshal(payload, &body); err != nil {
+			return nil, err
+		}
+		for key, value := range options {
+			body[key] = value
+		}
+		if payload, err = json.Marshal(body); err != nil {
+			return nil, err
+		}
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.BaseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -83,6 +95,36 @@ func (s *openAIStream) Recv() (Chunk, error) {
 }
 
 func (s *openAIStream) Close() error { return s.body.Close() }
+
+// optionAliases accept the option spelling agents use in their configs and
+// send the chat-completions field of the same meaning. Unknown keys pass
+// through untouched for vendor-specific fields.
+var optionAliases = map[string]string{
+	"reasoningEffort":   "reasoning_effort",
+	"reasoningSummary":  "reasoning_summary",
+	"textVerbosity":     "verbosity",
+	"maxOutputTokens":   "max_tokens",
+	"topP":              "top_p",
+	"topK":              "top_k",
+	"presencePenalty":   "presence_penalty",
+	"frequencyPenalty":  "frequency_penalty",
+	"stopSequences":     "stop",
+	"parallelToolCalls": "parallel_tool_calls",
+}
+
+func normalizeOptions(options map[string]any) map[string]any {
+	if len(options) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(options))
+	for key, value := range options {
+		if alias, ok := optionAliases[key]; ok {
+			key = alias
+		}
+		out[key] = value
+	}
+	return out
+}
 
 type chatRequest struct {
 	Model         string             `json:"model"`

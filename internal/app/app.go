@@ -145,18 +145,31 @@ func buildCatalog(cfg config.Config) (*provider.Catalog, error) {
 			if model.ContextWindow != nil {
 				window = *model.ContextWindow
 			}
-			models = append(models, provider.ModelSpec{ID: model.ID, Name: model.Name, ContextWindow: window})
+			noTools := model.ToolCall != nil && !*model.ToolCall
+			models = append(models, provider.ModelSpec{
+				ID:            model.ID,
+				Name:          model.Name,
+				ContextWindow: window,
+				Options:       model.Options,
+				Variants:      model.Variants,
+				NoTools:       noTools,
+				Reasoning:     model.Reasoning,
+				Attachment:    model.Attachment,
+				MaxOutput:     model.MaxOutputTokens,
+			})
 		}
 		specs = append(specs, provider.ProviderSpec{
-			ID:      id,
-			Name:    p.Name,
-			BaseURL: p.BaseURL,
-			APIKey:  key,
-			Models:  models,
+			ID:        id,
+			Name:      p.Name,
+			BaseURL:   p.BaseURL,
+			APIKey:    key,
+			Models:    models,
+			Blacklist: p.Blacklist,
+			Whitelist: p.Whitelist,
 		})
 	}
 
-	legacy := len(cfg.Providers) == 0
+	legacy := !cfg.ProvidersSet && len(cfg.Providers) == 0
 	if legacy {
 		models := []provider.ModelSpec{}
 		if cfg.Model != "" {

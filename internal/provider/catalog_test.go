@@ -27,6 +27,57 @@ func TestCatalogResolvesDefaultAndExplicitTargets(t *testing.T) {
 	}
 }
 
+func TestCatalogExpandsVariantsAndFiltersModels(t *testing.T) {
+	catalog, err := NewCatalog([]ProviderSpec{{
+		ID:        "a",
+		BaseURL:   "https://a.test/v1",
+		APIKey:    "key",
+		Blacklist: []string{"hidden"},
+		Models: []ModelSpec{
+			{
+				ID:            "m1",
+				Name:          "M1",
+				ContextWindow: 1000,
+				Options:       map[string]any{"reasoning_effort": "low"},
+				Variants:      map[string]map[string]any{"high": {"reasoning_effort": "high", "text_verbosity": "low"}},
+			},
+			{ID: "hidden"},
+		},
+	}}, "a", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := catalog.Resolve(Selection{Provider: "a", Model: VariantID("m1", "high")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Model != "m1::high" || target.RequestModel != "m1" {
+		t.Fatalf("unexpected variant target: %+v", target)
+	}
+	if target.Options["reasoning_effort"] != "high" || target.Options["text_verbosity"] != "low" {
+		t.Fatalf("unexpected variant options: %+v", target.Options)
+	}
+	if _, err := catalog.Resolve(Selection{Provider: "a", Model: "hidden"}); err == nil {
+		t.Fatal("blacklisted model resolved")
+	}
+}
+
+func TestCatalogWhitelistKeepsOnlyNamedModels(t *testing.T) {
+	catalog, err := NewCatalog([]ProviderSpec{{
+		ID:        "a",
+		BaseURL:   "https://a.test/v1",
+		APIKey:    "key",
+		Whitelist: []string{"m2"},
+		Models:    []ModelSpec{{ID: "m1"}, {ID: "m2"}},
+	}}, "a", "m2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.Resolve(Selection{Provider: "a", Model: "m1"}); err == nil {
+		t.Fatal("model outside the whitelist resolved")
+	}
+}
+
 func TestCatalogGuessesProviderByUniqueModel(t *testing.T) {
 	catalog, err := NewCatalog([]ProviderSpec{
 		{ID: "a", BaseURL: "https://a.test/v1", APIKey: "key-a", Models: []ModelSpec{{ID: "m1"}}},

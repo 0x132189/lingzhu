@@ -12,6 +12,17 @@ import (
 	"lingzhu/internal/provider"
 )
 
+func TestBuildCatalogWithNoProviders(t *testing.T) {
+	cfg := config.Config{ProvidersSet: true, Providers: map[string]config.Provider{}}
+	catalog, err := buildCatalog(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.Resolve(provider.Selection{}); err == nil {
+		t.Fatal("want an error when no provider is configured")
+	}
+}
+
 func TestRecoverResumesClaimAndQueuedInput(t *testing.T) {
 	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

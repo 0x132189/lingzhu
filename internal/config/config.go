@@ -16,12 +16,15 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	DataDir       string
-	Workdir       string
-	Model         string
-	Provider      string
-	Providers     map[string]Provider
+	Addr      string
+	DataDir   string
+	Workdir   string
+	Model     string
+	Provider  string
+	Providers map[string]Provider
+	// ProvidersSet distinguishes an explicit empty providers block from an
+	// old config that never had one.
+	ProvidersSet  bool
 	BaseURL       string
 	APIKey        string
 	MaxSteps      int
@@ -40,6 +43,38 @@ type Model struct {
 	ID            string `json:"id"`
 	Name          string `json:"name,omitempty"`
 	ContextWindow *int   `json:"context_window,omitempty"`
+	// MaxOutputTokens is the reply limit the catalog reports.
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+	// Options are request-body fields for this model, such as
+	// reasoning_effort or thinking.
+	Options map[string]any `json:"options,omitempty"`
+	// Variants are named option overrides selectable for this model.
+	Variants map[string]map[string]any `json:"variants,omitempty"`
+	// ToolCall is whether the model accepts tool definitions; nil means the
+	// catalog did not say, which keeps tools on.
+	ToolCall *bool `json:"tool_call,omitempty"`
+	// Reasoning reports whether the model exposes reasoning output.
+	Reasoning bool `json:"reasoning,omitempty"`
+	// Attachment reports whether the model takes image input.
+	Attachment bool `json:"attachment,omitempty"`
+	// Cost is the catalog's price per million tokens.
+	Cost *ModelCost `json:"cost,omitempty"`
+	// Modalities are the input and output kinds the model takes.
+	Modalities *ModelModalities `json:"modalities,omitempty"`
+}
+
+// ModelCost is one model's price per million tokens.
+type ModelCost struct {
+	Input      float64 `json:"input,omitempty"`
+	Output     float64 `json:"output,omitempty"`
+	CacheRead  float64 `json:"cache_read,omitempty"`
+	CacheWrite float64 `json:"cache_write,omitempty"`
+}
+
+// ModelModalities are the media kinds a model takes and returns.
+type ModelModalities struct {
+	Input  []string `json:"input,omitempty"`
+	Output []string `json:"output,omitempty"`
 }
 
 // Provider is one OpenAI-compatible endpoint and its model catalog.
@@ -49,6 +84,10 @@ type Provider struct {
 	APIKey    string  `json:"api_key,omitempty"`
 	APIKeyEnv string  `json:"api_key_env,omitempty"`
 	Models    []Model `json:"models"`
+	// Blacklist hides model ids from the picker; a non-empty whitelist
+	// keeps only the ids it names. Both apply before variants expand.
+	Blacklist []string `json:"blacklist,omitempty"`
+	Whitelist []string `json:"whitelist,omitempty"`
 }
 
 // Rule is a permission rule; action and resource support wildcards.
@@ -66,6 +105,7 @@ type File struct {
 	Model         string              `json:"model"`
 	Provider      string              `json:"provider"`
 	Providers     map[string]Provider `json:"providers"`
+	ProvidersSet  bool                `json:"-"`
 	BaseURL       string              `json:"base_url"`
 	APIKey        string              `json:"api_key"`
 	MaxSteps      int                 `json:"max_steps"`
@@ -133,10 +173,15 @@ func read(path string) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return File{}, err
+	}
 	var file File
 	if err := json.Unmarshal(data, &file); err != nil {
 		return File{}, err
 	}
+	_, file.ProvidersSet = raw["providers"]
 	return file, nil
 }
 
@@ -156,7 +201,8 @@ func applyFile(cfg *Config, file File, dir string) {
 	if file.Provider != "" {
 		cfg.Provider = strings.TrimSpace(file.Provider)
 	}
-	if len(file.Providers) > 0 {
+	if file.ProvidersSet {
+		cfg.ProvidersSet = true
 		cfg.Providers = make(map[string]Provider, len(file.Providers))
 		for id, provider := range file.Providers {
 			provider.BaseURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")

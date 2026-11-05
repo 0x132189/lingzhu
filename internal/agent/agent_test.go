@@ -131,6 +131,43 @@ func testCatalog(p provider.Provider, model string, window int) *provider.Catalo
 	return provider.Static("test", "Test", p, models, model)
 }
 
+func TestStreamSendsVariantRequestModelAndOptions(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "ok"}}}}
+	a, _ := newTestAgent(t, fake)
+	target := provider.Target{
+		Model:        "m::high",
+		RequestModel: "m",
+		Options:      map[string]any{"reasoning_effort": "high"},
+		Provider:     fake,
+	}
+	if _, _, _, _, err := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests = %d", len(fake.requests))
+	}
+	req := fake.requests[0]
+	if req.Model != "m" || req.Options["reasoning_effort"] != "high" {
+		t.Fatalf("request = %+v", req)
+	}
+}
+
+func TestStreamOmitsToolsWhenModelSaysNone(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "ok"}}}}
+	a, _ := newTestAgent(t, fake)
+	target := provider.Target{Model: "m", RequestModel: "m", NoTools: true, Provider: fake}
+	tools := []model.ToolDef{{Name: "echo", Description: "d", Schema: []byte(`{"type":"object"}`)}}
+	if _, _, _, _, err := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, tools); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests = %d", len(fake.requests))
+	}
+	if len(fake.requests[0].Tools) != 0 {
+		t.Fatalf("tools = %+v", fake.requests[0].Tools)
+	}
+}
+
 func TestRunExecutesToolThenFinishes(t *testing.T) {
 	fake := &fakeProvider{chunks: [][]provider.Chunk{
 		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
