@@ -18,12 +18,12 @@ import (
 
 	"lingzhu/internal/app"
 	"lingzhu/internal/config"
+	"lingzhu/internal/datadir"
 	"lingzhu/internal/event"
 	"lingzhu/internal/permission"
 	"lingzhu/internal/provider"
+	"lingzhu/internal/version"
 )
-
-const version = "0.1.0-dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -36,7 +36,7 @@ func main() {
 	case "run":
 		run(os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Println("lingzhu", version)
+		fmt.Println("lingzhu", version.Version)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -55,9 +55,10 @@ Usage:
   lingzhu version            print the version
 
 Environment:
-  LINGZHU_CONFIG      config file path
+  LINGZHU_CONFIG      config file path, default the user config file
+  LINGZHU_HOME        redirect data, state, cache and tmp under one directory
   LINGZHU_ADDR        listen address, default 127.0.0.1:8787
-  LINGZHU_DATA_DIR    data directory, default "data" next to config.json
+  LINGZHU_DATA_DIR    data directory, default under the user data directory
   LINGZHU_WORKDIR     agent working directory, default the process directory
   LINGZHU_MODEL       model name
   LINGZHU_CONTEXT_WINDOW  model context size, 0 disables auto compaction
@@ -78,6 +79,12 @@ func serve(args []string) {
 	_ = fs.Parse(args)
 
 	cfg := mustConfig(*configPath, *addr, *data, *providerID, *model, *workdir)
+	lock, err := datadir.Lock(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("init: %v", err)
+	}
+	defer lock.Release()
+
 	application, err := app.New(cfg)
 	if err != nil {
 		log.Fatalf("init: %v", err)
@@ -92,7 +99,7 @@ func serve(args []string) {
 	}
 
 	go func() {
-		log.Printf("lingzhu %s listening on http://%s", version, cfg.Addr)
+		log.Printf("lingzhu %s listening on http://%s", version.Version, cfg.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("serve: %v", err)
 		}
@@ -151,6 +158,12 @@ func run(args []string) {
 	}
 
 	cfg := mustConfig(*configPath, *addr, *data, *providerID, *model, *workdir)
+	lock, err := datadir.Lock(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("init: %v", err)
+	}
+	defer lock.Release()
+
 	application, err := app.New(cfg)
 	if err != nil {
 		log.Fatalf("init: %v", err)

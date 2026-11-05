@@ -1,0 +1,42 @@
+version: '3'
+
+vars:
+  BIN_DIR: bin
+  APP_NAME: lingzhu
+  VERSION:
+    sh: read v < VERSION; echo ${v:-0.1.0-dev}
+
+tasks:
+  build:
+    summary: Builds the core into bin/
+    cmds:
+      - go build -trimpath -buildvcs=false -ldflags="-w -s -X lingzhu/internal/version.Version={{.VERSION}}" -o "{{.BIN_DIR}}/{{.APP_NAME}}{{exeExt}}" ./cmd/lingzhu
+
+  build:dev:
+    summary: Builds an unoptimized core for local debugging
+    cmds:
+      - go build -buildvcs=false -o "{{.BIN_DIR}}/{{.APP_NAME}}{{exeExt}}" ./cmd/lingzhu
+
+  test:
+    summary: Runs the unit tests
+    cmds:
+      - go vet ./...
+      - go test ./...
+
+  fmt:
+    summary: Formats the source
+    cmds:
+      - go fmt ./...
+
+  clean:
+    summary: Removes build output
+    cmds:
+      - cmd: powershell -NoProfile -Command "Remove-Item -Recurse -Force '{{.BIN_DIR}}' -ErrorAction SilentlyContinue"
+        platforms: [windows]
+      - cmd: rm -rf {{.BIN_DIR}}
+        platforms: [linux, darwin]
+
+  run:
+    summary: Runs the core from source
+    cmds:
+      - go run ./cmd/lingzhu {{.CLI_ARGS}}

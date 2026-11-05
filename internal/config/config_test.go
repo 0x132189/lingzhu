@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"lingzhu/internal/global"
 )
 
 func TestLoadFromFile(t *testing.T) {
@@ -110,6 +112,49 @@ func TestMissingFileUsesDefaults(t *testing.T) {
 	}
 	if cfg.Addr != "127.0.0.1:8787" || cfg.MaxSteps != 16 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+	if cfg.DataDir != global.Data() {
+		t.Fatalf("data dir should default to the user data directory: %q", cfg.DataDir)
+	}
+}
+
+func TestDefaultPathPrefersProjectFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("LINGZHU_CONFIG", "")
+	t.Setenv("LINGZHU_CONFIG_DIR", filepath.Join(dir, "user"))
+
+	if got, want := DefaultPath(), filepath.Join(dir, "user", "config.json"); got != want {
+		t.Fatalf("without a project file the user config wins: got %q, want %q", got, want)
+	}
+
+	project := filepath.Join(dir, "lingzhu.json")
+	if err := os.WriteFile(project, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultPath(); got != project {
+		t.Fatalf("a project file should win: got %q, want %q", got, project)
+	}
+	if got, want := UserPath(), filepath.Join(dir, "user", "config.json"); got != want {
+		t.Fatalf("user path must ignore the project file: got %q, want %q", got, want)
+	}
+}
+
+func TestDefaultPathNeverReadsBuildDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("LINGZHU_CONFIG", "")
+	t.Setenv("LINGZHU_CONFIG_DIR", filepath.Join(dir, "user"))
+
+	legacy := filepath.Join(dir, "build")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "config.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := DefaultPath(), filepath.Join(dir, "user", "config.json"); got != want {
+		t.Fatalf("build/config.json must not be discovered: got %q, want %q", got, want)
 	}
 }
 

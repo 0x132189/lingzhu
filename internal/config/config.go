@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"lingzhu/internal/global"
 )
 
 type Config struct {
@@ -74,24 +76,35 @@ type File struct {
 	CompactKeep   int                 `json:"compact_keep"`
 }
 
-// DefaultPath returns the config file path: an explicit path wins, otherwise
-// config.json, build/config.json and ../build/config.json are tried in order.
+// DefaultPath returns the config file to load: an explicit LINGZHU_CONFIG wins,
+// then a project lingzhu.json beside the working directory, then the user
+// config file. The project file replaces the user file for that project; the
+// returned path may not exist yet, so settings can be written to it.
 func DefaultPath() string {
 	if p := os.Getenv("LINGZHU_CONFIG"); p != "" {
 		return p
 	}
-	for _, candidate := range []string{"config.json", "build/config.json", filepath.Join("..", "build", "config.json")} {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
+	if wd, err := os.Getwd(); err == nil {
+		path := filepath.Join(wd, "lingzhu.json")
+		if _, err := os.Stat(path); err == nil {
+			return path
 		}
 	}
-	return ""
+	return filepath.Join(global.Config(), "config.json")
+}
+
+// UserPath is the user-level config file, independent of the working directory.
+func UserPath() string {
+	if p := os.Getenv("LINGZHU_CONFIG"); p != "" {
+		return p
+	}
+	return filepath.Join(global.Config(), "config.json")
 }
 
 func Load(path string) (Config, error) {
 	cfg := Config{
 		Addr:          "127.0.0.1:8787",
-		DataDir:       "data",
+		DataDir:       global.Data(),
 		Workdir:       "",
 		BaseURL:       "https://api.openai.com/v1",
 		MaxSteps:      16,

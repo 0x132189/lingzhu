@@ -1,4 +1,9 @@
-# 本地数据与产物（统一放在 ../build）
+# Build output of the core and local runtime data. Nothing here is committed.
+
+# Core binaries
+/bin/
 /data/
+
+# Test binaries
 *.exe
 *.test

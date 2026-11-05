@@ -1,0 +1,177 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, for example 0.2.0
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Authenticode certificate for the Windows binaries. Without it the release
+  # still publishes, but the Windows artifacts stay unsigned.
+  WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+  WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+  TIMESTAMP_SERVER: http://timestamp.digicert.com
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go test ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          go build -trimpath -buildvcs=false \
+            -ldflags="-w -s -X lingzhu/internal/version.Version=${{ needs.plan.outputs.version }}" \
+            -o "dist/lingzhu${ext}" ./cmd/lingzhu
+
+      - name: Package
+        run: |
+          cd dist
+          if [ -f lingzhu.exe ]; then
+            mv lingzhu.exe "lingzhu_${{ needs.plan.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.exe"
+          else
+            mv lingzhu "lingzhu_${{ needs.plan.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lingzhu-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  sign:windows:
+    name: sign (windows binaries)
+    needs: [plan, build]
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lingzhu-windows-${{ matrix.goarch }}
+          path: dist
+
+      - name: Stage the signing certificate
+        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        shell: bash
+        run: |
+          echo "$WINDOWS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.pfx"
+
+      - name: Sign
+        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        shell: bash
+        env:
+          SIGN_CERTIFICATE: ${{ runner.temp }}/signing.pfx
+          SIGN_CERTIFICATE_PASSWORD: ${{ env.WINDOWS_CERTIFICATE_PASSWORD }}
+          TIMESTAMP_SERVER: ${{ env.TIMESTAMP_SERVER }}
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0
+          for file in dist/*.exe; do
+            wails3 tool sign --input "$file" \
+              --certificate "$SIGN_CERTIFICATE" \
+              --password "$SIGN_CERTIFICATE_PASSWORD" \
+              --timestamp "$TIMESTAMP_SERVER"
+          done
+
+      - name: Skip signing without a certificate
+        if: env.WINDOWS_CERTIFICATE_BASE64 == ''
+        run: echo "WINDOWS_CERTIFICATE_BASE64 is not set; publishing unsigned binaries."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lingzhu-windows-${{ matrix.goarch }}
+          path: dist/*
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [plan, build, sign:windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
