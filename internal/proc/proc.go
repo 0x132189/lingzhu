@@ -12,6 +12,14 @@ import (
 // forced. It matches the reference harness.
 const Grace = 3 * time.Second
 
+// Launch starts a command that must outlive this process, such as a self-update
+// installer or a relaunch helper. The command leaves the caller's job object
+// and is never tracked, so shutting the core down cannot kill it. It returns as
+// soon as the process exists; the caller gets no exit status.
+func Launch(cmd *exec.Cmd) error {
+	return launchDetached(cmd)
+}
+
 // Stop terminates a running command and its whole process tree. It sends the
 // graceful signal first, waits up to grace, then forces the remainder. It is
 // safe on a command that never started or already exited.

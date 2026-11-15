@@ -3,6 +3,7 @@
 package proc
 
 import (
+	"errors"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -14,6 +15,16 @@ import (
 // createNewProcessGroup keeps the command from receiving the console's
 // Ctrl+C, so the agent decides when it stops.
 const createNewProcessGroup = 0x00000200
+
+// createBreakawayFromJob lets a child leave the job object that owns this
+// process. Without it a self-update installer would be killed the moment the
+// core exits, which is exactly when it has to keep running.
+const createBreakawayFromJob = 0x01000000
+
+// createNoWindow starts a console program without allocating a console.
+// DETACHED_PROCESS is not used: a console host such as PowerShell fails to run
+// at all without one, so the update relay would silently never start.
+const createNoWindow = 0x08000000
 
 // jobs maps a running command to the job object that owns its tree. A job is
 // the only Windows mechanism that ends a whole tree synchronously: taskkill
@@ -27,6 +38,25 @@ func Configure(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.CreationFlags |= createNewProcessGroup
+}
+
+// launchDetached starts a command that must outlive this process. It leaves the
+// job object and gets its own console-less group, so stopping the core never
+// reaches it. A job that does not allow breakaway rejects the flag with access
+// denied, so the launch falls back to a plain detached start: the update still
+// runs, even though an enclosing job could end it.
+func launchDetached(cmd *exec.Cmd) error {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= createNewProcessGroup | createBreakawayFromJob | createNoWindow
+	cmd.SysProcAttr.HideWindow = true
+	err := cmd.Start()
+	if err == nil || !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return err
+	}
+	cmd.SysProcAttr.CreationFlags &^= createBreakawayFromJob
+	return cmd.Start()
 }
 
 // Track places a started command in its own job object. It must run right
@@ -45,6 +75,10 @@ func Track(cmd *exec.Cmd) {
 			LimitFlags: windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 		},
 	}
+	// A command that asks to detach (a self-update installer, a relaunch
+	// helper) must be allowed to leave, otherwise the core's exit kills the
+	// update halfway through.
+	info.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
 	if _, err := windows.SetInformationJobObject(
 		job,
 		windows.JobObjectExtendedLimitInformation,
@@ -69,6 +103,16 @@ func Track(cmd *exec.Cmd) {
 		return
 	}
 	jobs.Store(cmd, job)
+}
+
+// ConfigureDetached is kept for callers that build their own detached command;
+// Launch is the supported entry point.
+func ConfigureDetached(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= createNewProcessGroup | createBreakawayFromJob | createNoWindow
+	cmd.SysProcAttr.HideWindow = true
 }
 
 // terminate has no graceful signal on Windows, so it reports false and the

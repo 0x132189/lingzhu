@@ -24,6 +24,7 @@ func Tools(store *session.Store, worktrees *worktree.Manager, catalog *provider.
 		&worktreeListTool{manager: worktrees},
 		&worktreeRemoveTool{manager: worktrees},
 		&modelsTool{catalog: catalog},
+		&selfUpdateTool{},
 	}
 }
 
