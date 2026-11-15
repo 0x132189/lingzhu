@@ -30,6 +30,10 @@ jobs:
           cache: true
 
       - name: Verify formatting
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
         run: go vet ./...
 
       - name: Test
@@ -37,6 +41,22 @@ jobs:
 
       - name: Build
         run: go build ./...
+
+  race:
+    name: race (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The agent, tool batch, event hub and session store are concurrent by
+      # design, so the race detector is a required gate rather than an extra.
+      - name: Test with the race detector
+        run: CGO_ENABLED=1 go test -race ./...
 
   tidy:
     name: modules are tidy

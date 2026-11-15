@@ -19,6 +19,15 @@ func (s *Store) firstUserTitle(id string) string {
 	if err != nil {
 		return ""
 	}
+	return titleFromUserData(data)
+}
+
+// titleFromUserData builds the automatic label from the stored first user
+// message JSON. It lets List resolve missing titles without one query per row.
+func titleFromUserData(data string) string {
+	if data == "" || data == "null" {
+		return ""
+	}
 	var payload map[string]any
 	if json.Unmarshal([]byte(data), &payload) != nil {
 		return ""

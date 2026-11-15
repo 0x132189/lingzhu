@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"lingzhu/internal/policy"
 )
 
 type Effect string
@@ -38,7 +40,7 @@ type Rule struct {
 
 type Rules []Rule
 
-// Default matches opencode's primary-agent policy: allow ordinary tools while
+// Default matches the primary-agent policy: allow ordinary tools while
 // still asking before reading environment files that often hold secrets.
 func Default() Rules {
 	return Rules{
@@ -60,6 +62,27 @@ func (r Rules) Evaluate(action, resource string) Effect {
 	return effect
 }
 
+// WhollyDenies reports whether an action is removed for every resource: the
+// last action-wide rule on "*" denies it, and no later rule opens a narrower
+// resource again. A narrowed allow keeps the action available so Plan can
+// write inside its own directory.
+func (r Rules) WhollyDenies(action string) bool {
+	denied := false
+	for _, rule := range r {
+		if !match(action, rule.Action) {
+			continue
+		}
+		if rule.Effect == Allow {
+			denied = false
+			continue
+		}
+		if rule.Resource == "*" {
+			denied = rule.Effect == Deny
+		}
+	}
+	return denied
+}
+
 // EvaluateAll merges resources: any deny wins, otherwise any ask wins.
 func (r Rules) EvaluateAll(action string, resources []string) Effect {
 	if len(resources) == 0 {
@@ -77,12 +100,30 @@ func (r Rules) EvaluateAll(action string, resources []string) Effect {
 	return effect
 }
 
+// DeniesAll reports whether every resource is denied. It is the hard-deny check
+// used before an "always" approval is consulted, so a saved allow can never
+// lift a rule that was set on purpose.
+func (r Rules) DeniesAll(action string, resources []string) bool {
+	if len(resources) == 0 {
+		return r.Evaluate(action, "*") == Deny
+	}
+	for _, resource := range resources {
+		if r.Evaluate(action, resource) != Deny {
+			return false
+		}
+	}
+	return true
+}
+
 type Request struct {
 	ID        string   `json:"id"`
 	SessionID string   `json:"sessionId"`
 	Action    string   `json:"action"`
 	Resources []string `json:"resources"`
 	Message   string   `json:"message,omitempty"`
+	// Unattended marks a request from a turn nobody is watching, such as a
+	// scheduled wake-up. An ask becomes a deny instead of blocking forever.
+	Unattended bool `json:"unattended,omitempty"`
 }
 
 type DeniedError struct {
@@ -97,6 +138,37 @@ func (e *DeniedError) Error() string {
 	return fmt.Sprintf("permission denied: %s %s", e.Request.Action, strings.Join(e.Request.Resources, ", "))
 }
 
+// DeclinedError is a user rejection, distinct from a configured deny. The
+// reference harness interrupts the current step on a decline, while a deny is
+// an ordinary tool failure.
+type DeclinedError struct {
+	Request Request
+	Reason  string
+}
+
+func (e *DeclinedError) Error() string {
+	if e.Reason != "" {
+		return fmt.Sprintf("permission declined by user: %s (%s)", e.Request.Action, e.Reason)
+	}
+	return fmt.Sprintf("permission declined by user: %s %s", e.Request.Action, strings.Join(e.Request.Resources, ", "))
+}
+
+// CorrectedError is a rejection that carries instructions. The tool call fails
+// with this text as its output and the turn keeps running, so a user who wants
+// a different approach can say so in one step instead of stopping the turn and
+// writing a new prompt.
+type CorrectedError struct {
+	Request  Request
+	Feedback string
+}
+
+func (e *CorrectedError) Error() string {
+	if strings.TrimSpace(e.Feedback) == "" {
+		return "permission declined by user"
+	}
+	return "permission declined by user: " + e.Feedback
+}
+
 type ErrNotFound struct{ ID string }
 
 func (e ErrNotFound) Error() string { return "permission request not found: " + e.ID }
@@ -106,16 +178,28 @@ type answer struct {
 	message  string
 }
 
+// Evaluator extends permission rules with decisions from an external source,
+// such as plugins. An empty effect defers to the configured rules; the message
+// explains a deny or ask.
+type Evaluator func(ctx context.Context, action string, resources []string) (Effect, string)
+
 // Manager holds rules and pending requests. Check blocks until Reply or ctx ends.
 type Manager struct {
 	mu      sync.Mutex
 	rules   Rules
 	pending map[string]pendingRequest
 	seq     atomic.Int64
-	// saver persists the full rule set after an "always" answer. It runs
-	// outside mu but under saveMu so file writes stay ordered.
-	saver  func(Rules) error
-	saveMu sync.Mutex
+	// sessionRules are agent-specific overlays applied after the base rules.
+	sessionRules map[string]Rules
+	// saved holds the allows learned from "always" answers. They are kept apart
+	// from the configured rules so an approval can never lift a configured deny.
+	saved Rules
+	// saver persists the saved rules after an "always" answer. It runs outside
+	// mu but under saveMu so file writes stay ordered.
+	saver     func(Rules) error
+	saveMu    sync.Mutex
+	evaluator Evaluator
+	policies  policy.Rules
 }
 
 type pendingRequest struct {
@@ -127,7 +211,38 @@ func New(rules Rules) *Manager {
 	if len(rules) == 0 {
 		rules = Default()
 	}
-	return &Manager{rules: rules, pending: map[string]pendingRequest{}}
+	return &Manager{
+		rules:        rules,
+		pending:      map[string]pendingRequest{},
+		sessionRules: map[string]Rules{},
+	}
+}
+
+// SetSessionRules installs an agent-specific overlay for one session. Its rules
+// are appended after the base rules, so later matches win and a base deny still
+// requires an explicit agent allow to be overridden.
+func (m *Manager) SetSessionRules(sessionID string, rules Rules) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	m.mu.Lock()
+	if m.sessionRules == nil {
+		m.sessionRules = map[string]Rules{}
+	}
+	if len(rules) == 0 {
+		delete(m.sessionRules, sessionID)
+	} else {
+		m.sessionRules[sessionID] = append(Rules(nil), rules...)
+	}
+	m.mu.Unlock()
+}
+
+// ClearSessionRules removes the agent overlay when a run ends.
+func (m *Manager) ClearSessionRules(sessionID string) {
+	m.mu.Lock()
+	delete(m.sessionRules, sessionID)
+	m.mu.Unlock()
 }
 
 // SetSaver registers how "always" answers are persisted. The callback receives
@@ -138,20 +253,118 @@ func (m *Manager) SetSaver(save func(Rules) error) {
 	m.mu.Unlock()
 }
 
+// SetEvaluator registers an external permission source. It is consulted after
+// the configured rules; a configured deny is final, while an evaluator deny or
+// ask takes precedence over a rule allow.
+func (m *Manager) SetEvaluator(eval Evaluator) {
+	m.mu.Lock()
+	m.evaluator = eval
+	m.mu.Unlock()
+}
+
+// SetPolicies installs hard configuration policies. They are checked before
+// permission rules and can never be lifted by an "always allow" answer.
+func (m *Manager) SetPolicies(rules policy.Rules) {
+	m.mu.Lock()
+	m.policies = append(policy.Rules(nil), rules...)
+	m.mu.Unlock()
+}
+
+// SetSaved installs the allows learned from earlier "always" answers. They are
+// kept apart from the configured rules so an approval can never lift a deny.
+func (m *Manager) SetSaved(rules Rules) {
+	m.mu.Lock()
+	m.saved = append(Rules(nil), rules...)
+	m.mu.Unlock()
+}
+
+// Rules returns the configured rules followed by the learned allow rules.
 func (m *Manager) Rules() Rules {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append(Rules(nil), m.rules...)
+	out := make(Rules, 0, len(m.rules)+len(m.saved))
+	out = append(out, m.rules...)
+	out = append(out, m.saved...)
+	return out
 }
 
 // Check evaluates the rules; on ask it announces the request and waits for a reply.
+//
+// The order matters and matches the reference harness:
+//  1. hard configuration policies, which no approval can lift;
+//  2. a deny from the configured rules (global + agent + session), which an
+//     "always" answer saved earlier can never override;
+//  3. saved allows, which only ever turn an ask into an allow;
+//  4. an external evaluator, then the ask path.
 func (m *Manager) Check(ctx context.Context, req Request, announce func(Request)) error {
-	effect := m.rules.EvaluateAll(req.Action, req.Resources)
+	m.mu.Lock()
+	configured := m.rules
+	if overlay := m.sessionRules[req.SessionID]; len(overlay) > 0 {
+		merged := make(Rules, 0, len(configured)+len(overlay))
+		merged = append(merged, configured...)
+		merged = append(merged, overlay...)
+		configured = merged
+	}
+	saved := m.saved
+	evaluator := m.evaluator
+	policies := m.policies
+	m.mu.Unlock()
+
+	resources := req.Resources
+	if len(resources) == 0 {
+		resources = []string{"*"}
+	}
+	for _, resource := range resources {
+		if policies.Denied("tool.use", req.Action+":"+resource) {
+			return &DeniedError{Request: req, Reason: "blocked by configuration policy"}
+		}
+	}
+
+	// A configured deny is final. Saved allows are deliberately not consulted
+	// here, so approving once cannot re-open a tool that was turned off.
+	if configured.DeniesAll(req.Action, req.Resources) {
+		return &DeniedError{Request: req}
+	}
+	effect := configured.EvaluateAll(req.Action, req.Resources)
+	if effect == Ask && len(saved) > 0 {
+		switch saved.EvaluateAll(req.Action, req.Resources) {
+		case Allow:
+			effect = Allow
+		}
+	}
+	if evaluator != nil {
+		evaluated, reason := evaluator(ctx, req.Action, req.Resources)
+		switch evaluated {
+		case Deny:
+			reason = strings.TrimSpace(reason)
+			if reason == "" {
+				reason = "denied by plugin"
+			} else {
+				reason = "denied by plugin: " + reason
+			}
+			return &DeniedError{Request: req, Reason: reason}
+		case Ask:
+			if strings.TrimSpace(reason) != "" {
+				req.Message = reason
+			}
+			effect = Ask
+		case Allow:
+			if effect == Ask {
+				effect = Allow
+			}
+		}
+	}
 	switch effect {
 	case Allow:
 		return nil
 	case Deny:
 		return &DeniedError{Request: req}
+	}
+
+	// Nobody is watching a scheduled or background turn, so an ask can never be
+	// answered. Denying is the only outcome that keeps the turn moving.
+	if req.Unattended {
+		return &DeniedError{Request: req, Reason: "permission needs approval, and nobody is present to give it"}
 	}
 
 	if req.ID == "" {
@@ -170,7 +383,13 @@ func (m *Manager) Check(ctx context.Context, req Request, announce func(Request)
 	select {
 	case a := <-ch:
 		if a.decision == Reject {
-			return &DeniedError{Request: req, Reason: a.message}
+			// A rejection with feedback keeps the turn alive: the tool fails
+			// with the text and the model can act on it. A bare rejection
+			// stops the turn, which is what "deny" has always meant.
+			if strings.TrimSpace(a.message) != "" {
+				return &CorrectedError{Request: req, Feedback: strings.TrimSpace(a.message)}
+			}
+			return &DeclinedError{Request: req, Reason: a.message}
 		}
 		if a.decision == Always {
 			m.save(req)
@@ -217,9 +436,9 @@ func (m *Manager) save(req Request) {
 
 	m.mu.Lock()
 	for _, resource := range req.Resources {
-		m.rules = append(m.rules, Rule{Action: req.Action, Resource: resource, Effect: Allow})
+		m.saved = append(m.saved, Rule{Action: req.Action, Resource: resource, Effect: Allow})
 	}
-	snapshot := append(Rules(nil), m.rules...)
+	snapshot := append(Rules(nil), m.saved...)
 	saver := m.saver
 	m.mu.Unlock()
 

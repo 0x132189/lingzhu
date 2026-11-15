@@ -2,14 +2,17 @@ package session
 
 import (
 	"sort"
+	"time"
 
 	"lingzhu/internal/event"
 )
 
 // QueuedInput is one persisted steering item.
 type QueuedInput struct {
-	ID   string
-	Text string
+	ID       string
+	Text     string
+	Delivery string
+	Created  time.Time
 }
 
 // Recovery is durable work a previous process left behind. ClaimID is empty
@@ -17,13 +20,38 @@ type QueuedInput struct {
 type Recovery struct {
 	SessionID string
 	ClaimID   string
+	Compact   bool
 	Inputs    []QueuedInput
+	// Attempts counts resumes already recorded for ClaimID, so a crash that
+	// keeps hitting the same point is bounded instead of looping forever.
+	Attempts int
 }
+
+// MaxResumeAttempts bounds how many times one surviving claim is resumed. A
+// turn that dies in the same place every time must stop rather than restart
+// with each process launch.
+const MaxResumeAttempts = 10
 
 // QueueInput persists an input before it can be delivered. The id is written
 // into the delivered user message, so replay never delivers it twice.
 func (s *Store) QueueInput(id, inputID, text string) (int64, error) {
-	return s.Append(id, event.InputQueuedEvent(inputID, text))
+	return s.QueueInputDelivery(id, inputID, text, "steer")
+}
+
+// QueueInputDelivery persists an input with its delivery preference.
+func (s *Store) QueueInputDelivery(id, inputID, text, delivery string) (int64, error) {
+	return s.Append(id, event.InputQueuedDeliveryEvent(inputID, text, delivery))
+}
+
+// CancelInput removes one pending input before delivery.
+func (s *Store) CancelInput(id, inputID string) (int64, error) {
+	return s.Append(id, event.InputCancelledEvent(inputID))
+}
+
+// UpdateInputDelivery changes a pending input's delivery preference.
+func (s *Store) UpdateInputDelivery(id, inputID, delivery string) error {
+	_, err := s.Append(id, event.InputUpdatedEvent(inputID, delivery))
+	return err
 }
 
 // FinishTurn releases a completed or failed turn claim.
@@ -77,7 +105,7 @@ func (s *Store) Recoveries() ([]Recovery, error) {
 			return nil, err
 		}
 		recovery := analyze(events)
-		if recovery.ClaimID == "" && len(recovery.Inputs) == 0 {
+		if recovery.ClaimID == "" && len(recovery.Inputs) == 0 && !recovery.Compact {
 			continue
 		}
 		recovery.SessionID = id
@@ -92,8 +120,14 @@ func analyze(events []event.Event) Recovery {
 	var recovery Recovery
 	pending := map[string]QueuedInput{}
 	var order []string
+	compact := false
+	attempts := map[string]int{}
 	for _, ev := range events {
 		switch ev.Type {
+		case event.CompactionQueued:
+			compact = true
+		case event.Compaction, event.CompactionFailed:
+			compact = false
 		case event.InputQueued:
 			id := str(ev, "id")
 			if id == "" {
@@ -102,7 +136,19 @@ func analyze(events []event.Event) Recovery {
 			if _, exists := pending[id]; !exists {
 				order = append(order, id)
 			}
-			pending[id] = QueuedInput{ID: id, Text: str(ev, "text")}
+			delivery := str(ev, "delivery")
+			if delivery == "" {
+				delivery = "steer"
+			}
+			pending[id] = QueuedInput{ID: id, Text: str(ev, "text"), Delivery: delivery, Created: ev.At}
+		case event.InputUpdated:
+			id := str(ev, "id")
+			if item, ok := pending[id]; ok {
+				item.Delivery = str(ev, "delivery")
+				pending[id] = item
+			}
+		case event.InputCancelled:
+			delete(pending, str(ev, "id"))
 		case event.UserMessage:
 			if id := str(ev, "inputId"); id != "" {
 				delete(pending, id)
@@ -110,6 +156,10 @@ func analyze(events []event.Event) Recovery {
 		case event.TurnStarted:
 			if id := str(ev, "id"); id != "" {
 				recovery.ClaimID = id
+			}
+		case event.TurnResumed:
+			if id := str(ev, "id"); id != "" {
+				attempts[id]++
 			}
 		case event.TurnFinished:
 			if id := str(ev, "id"); id != "" && recovery.ClaimID == id {
@@ -120,9 +170,12 @@ func analyze(events []event.Event) Recovery {
 				recovery.ClaimID = ""
 				pending = map[string]QueuedInput{}
 				order = nil
+				compact = false
 			}
 		}
 	}
+	recovery.Compact = compact
+	recovery.Attempts = attempts[recovery.ClaimID]
 	for _, id := range order {
 		if input, ok := pending[id]; ok {
 			recovery.Inputs = append(recovery.Inputs, input)

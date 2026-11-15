@@ -3,6 +3,8 @@ module lingzhu
 go 1.27
 
 require (
+	github.com/google/jsonschema-go v0.4.3
+	golang.org/x/image v0.45.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.1
 )

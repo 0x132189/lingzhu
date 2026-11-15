@@ -65,6 +65,22 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("unexpected context: %+v", context)
 	}
 
+	var transcript struct {
+		Messages []struct {
+			Role    string    `json:"role"`
+			Created time.Time `json:"created"`
+		} `json:"messages"`
+	}
+	get(t, srv.URL+"/sessions/s1/messages", &transcript)
+	if len(transcript.Messages) != 2 {
+		t.Fatalf("unexpected messages: %+v", transcript)
+	}
+	for index, message := range transcript.Messages {
+		if message.Created.IsZero() {
+			t.Fatalf("message %d is missing its created time", index)
+		}
+	}
+
 	// Delete.
 	req, err = http.NewRequest(http.MethodDelete, srv.URL+"/sessions/s1", nil)
 	if err != nil {
@@ -217,6 +233,7 @@ func TestCompactEndpoint(t *testing.T) {
 
 func TestCloseEndsFollowStreams(t *testing.T) {
 	server := newTestServer(t)
+	seedSession(t, server.store, "s1")
 	srv := httptest.NewServer(server.Handler())
 	defer srv.Close()
 

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"lingzhu/internal/config"
 	"lingzhu/internal/datadir"
 	"lingzhu/internal/event"
+	"lingzhu/internal/logx"
 	"lingzhu/internal/permission"
 	"lingzhu/internal/provider"
 	"lingzhu/internal/version"
@@ -93,6 +95,11 @@ func serve(args []string) {
 		Addr:              cfg.Addr,
 		Handler:           application.Server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if application.Token != "" {
+		log.Printf("api token: %s", filepath.Join(cfg.DataDir, "api-token"))
+	} else {
+		log.Print("api token: unavailable, the API accepts unauthenticated requests")
 	}
 
 	go func() {
@@ -254,8 +261,9 @@ func mustConfig(path, addr, data, providerID, model, workdir string) config.Conf
 	if err != nil {
 		log.Fatalf("config %s: %v", path, err)
 	}
+	logx.SetLevel(logx.ParseLevel(cfg.LogLevel))
 	if path != "" {
-		log.Printf("config: %s", path)
+		logx.Info("configuration loaded", logx.F("path", path), logx.F("level", cfg.LogLevel))
 	}
 	if addr != "" {
 		cfg.Addr = addr

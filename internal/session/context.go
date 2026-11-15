@@ -16,11 +16,23 @@ const (
 	reserveShare = 0.15
 )
 
-// Estimate approximates the token count of text without a tokenizer. It reads
-// bytes rather than runes, which undercounts CJK text by design: the measured
-// usage from the provider corrects the estimate after every call.
+// Estimate approximates the token count of text without a tokenizer. ASCII
+// stays on the four-characters-per-token rule; CJK and other wide scripts are
+// counted closer to one token per character so Chinese sessions compact at the
+// same point as the reference instead of much later.
 func Estimate(text string) int {
-	return (len(text) + charsPerToken - 1) / charsPerToken
+	if text == "" {
+		return 0
+	}
+	ascii, wide := 0, 0
+	for _, r := range text {
+		if r >= 0x2E80 {
+			wide++
+		} else {
+			ascii++
+		}
+	}
+	return (ascii+charsPerToken-1)/charsPerToken + wide
 }
 
 // Context is the conversation rebuilt from the log plus its estimated size.
@@ -59,6 +71,15 @@ func messageTokens(m model.Message) int {
 	total := Estimate(m.Content) + Estimate(m.Name)
 	for _, call := range m.ToolCalls {
 		total += Estimate(call.Name) + Estimate(call.Arguments)
+	}
+	for _, attachment := range m.Attachments {
+		mime := strings.ToLower(attachment.Mime)
+		switch {
+		case strings.HasPrefix(mime, "image/"):
+			total += 1500
+		case mime == "application/pdf":
+			total += 2000
+		}
 	}
 	return total
 }

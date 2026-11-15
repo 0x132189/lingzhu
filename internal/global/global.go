@@ -73,9 +73,6 @@ func Cache() string {
 	return filepath.Join(homeDir(), ".cache", app)
 }
 
-// Log is the directory holding process logs.
-func Log() string { return filepath.Join(Cache(), "log") }
-
 // Tmp is the directory holding scratch files that may be deleted at any time.
 func Tmp() string {
 	if p := Override(); p != "" {

@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"lingzhu/internal/model"
 )
@@ -17,14 +20,18 @@ import (
 type OpenAI struct {
 	BaseURL string
 	APIKey  string
-	Client  *http.Client
+	// TokenSource, when set, supplies a fresh bearer token per request.
+	TokenSource func(ctx context.Context) (string, error)
+	Client      *http.Client
+	// Idle bounds the wait for the next stream chunk. Zero uses the default.
+	Idle time.Duration
 }
 
 func NewOpenAI(baseURL, apiKey string) *OpenAI {
 	return &OpenAI{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
-		Client:  &http.Client{Timeout: 0},
+		Client:  NewClient(DefaultTimeouts()),
 	}
 }
 
@@ -51,7 +58,16 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request) (Stream, error) 
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
-	if o.APIKey != "" {
+	for key, value := range req.Headers {
+		httpReq.Header.Set(key, value)
+	}
+	if o.TokenSource != nil {
+		token, err := o.TokenSource(ctx)
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+	} else if o.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+o.APIKey)
 	}
 
@@ -62,9 +78,18 @@ func (o *OpenAI) Stream(ctx context.Context, req model.Request) (Stream, error) 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, classifyError(resp.StatusCode, resp.Status, string(body))
+		return nil, classifyErrorAfter(resp.StatusCode, resp.Status, string(body), ParseRetryAfter(resp.Header.Get("Retry-After")))
 	}
-	return &openAIStream{body: resp.Body, reader: bufio.NewReaderSize(resp.Body, 64*1024)}, nil
+	body := WatchIdle(resp.Body, o.idleTimeout())
+	return &openAIStream{body: body, reader: bufio.NewReaderSize(body, 64*1024)}, nil
+}
+
+// idleTimeout resolves the configured idle limit.
+func (o *OpenAI) idleTimeout() time.Duration {
+	if o.Idle > 0 {
+		return o.Idle
+	}
+	return DefaultIdleTimeout
 }
 
 type openAIStream struct {
@@ -84,7 +109,7 @@ func (s *openAIStream) Recv() (Chunk, error) {
 			if parseErr != nil {
 				return Chunk{}, parseErr
 			}
-			if chunk.Text != "" || len(chunk.ToolCalls) > 0 || chunk.FinishReason != "" || chunk.Usage != nil {
+			if chunk.Text != "" || chunk.Reasoning != "" || len(chunk.ToolCalls) > 0 || chunk.FinishReason != "" || chunk.Usage != nil {
 				return chunk, nil
 			}
 		}
@@ -130,6 +155,7 @@ type chatRequest struct {
 	Model         string             `json:"model"`
 	Messages      []chatMessage      `json:"messages"`
 	Tools         []chatTool         `json:"tools,omitempty"`
+	ToolChoice    string             `json:"tool_choice,omitempty"`
 	Stream        bool               `json:"stream"`
 	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
 }
@@ -140,9 +166,25 @@ type chatStreamOptions struct {
 
 type chatMessage struct {
 	Role       string         `json:"role"`
-	Content    string         `json:"content,omitempty"`
+	Content    any            `json:"content,omitempty"`
 	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type chatContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *chatImageURL `json:"image_url,omitempty"`
+	File     *chatFile     `json:"file,omitempty"`
+}
+
+type chatImageURL struct {
+	URL string `json:"url"`
+}
+
+type chatFile struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 type chatToolCall struct {
@@ -175,7 +217,10 @@ func toChatRequest(req model.Request) chatRequest {
 		Messages:      make([]chatMessage, 0, len(req.Messages)),
 	}
 	for _, m := range req.Messages {
-		msg := chatMessage{Role: string(m.Role), Content: m.Content, ToolCallID: m.ToolCallID}
+		msg := chatMessage{Role: string(m.Role), ToolCallID: m.ToolCallID}
+		if m.Content != "" {
+			msg.Content = m.Content
+		}
 		for _, call := range m.ToolCalls {
 			msg.ToolCalls = append(msg.ToolCalls, chatToolCall{
 				ID:       call.ID,
@@ -183,7 +228,15 @@ func toChatRequest(req model.Request) chatRequest {
 				Function: chatFunction{Name: call.Name, Arguments: call.Arguments},
 			})
 		}
-		out.Messages = append(out.Messages, msg)
+		// A prompt carrying only attachments has no text body. Emitting the
+		// empty message alongside the media parts makes providers reject the
+		// whole request ("content must be a string or text-part array").
+		if msg.Content != nil || len(msg.ToolCalls) > 0 || msg.ToolCallID != "" {
+			out.Messages = append(out.Messages, msg)
+		}
+		if parts := mediaParts(m.Attachments); len(parts) > 0 {
+			out.Messages = append(out.Messages, chatMessage{Role: "user", Content: parts})
+		}
 	}
 	for _, t := range req.Tools {
 		out.Tools = append(out.Tools, chatTool{
@@ -195,14 +248,70 @@ func toChatRequest(req model.Request) chatRequest {
 			},
 		})
 	}
+	out.ToolChoice = req.ToolChoice
 	return out
+}
+
+func mediaParts(attachments []model.Attachment) []chatContentPart {
+	parts := make([]chatContentPart, 0, len(attachments))
+	for _, attachment := range attachments {
+		mime := strings.ToLower(strings.TrimSpace(attachment.Mime))
+		name := attachment.Name
+		if name == "" {
+			if mime == "application/pdf" {
+				name = "document.pdf"
+			} else {
+				name = "attachment"
+			}
+		}
+		dataURL := "data:" + mime + ";base64," + attachment.Data
+		switch {
+		case mime == "application/pdf":
+			parts = append(parts, chatContentPart{
+				Type: "file",
+				File: &chatFile{Filename: name, FileData: dataURL},
+			})
+		case strings.HasPrefix(mime, "image/"):
+			parts = append(parts, chatContentPart{
+				Type:     "image_url",
+				ImageURL: &chatImageURL{URL: dataURL},
+			})
+		case model.IsTextMime(mime):
+			decoded, err := base64.StdEncoding.DecodeString(attachment.Data)
+			if err != nil || !utf8.Valid(decoded) || bytes.IndexByte(decoded, 0) >= 0 {
+				parts = append(parts, chatContentPart{
+					Type: "text",
+					Text: fmt.Sprintf("[attachment %s (%s) omitted: unreadable text]", name, mime),
+				})
+				continue
+			}
+			label := name
+			if attachment.Kind == "directory" {
+				label = "directory " + name
+			} else if attachment.Start > 0 {
+				label = fmt.Sprintf("%s L%d-L%d", name, attachment.Start, attachment.End)
+			}
+			parts = append(parts, chatContentPart{
+				Type: "text",
+				Text: fmt.Sprintf("[attachment %s]\n%s\n[/attachment]", label, string(decoded)),
+			})
+		default:
+			parts = append(parts, chatContentPart{
+				Type: "text",
+				Text: fmt.Sprintf("[attachment %s (%s) omitted: unsupported media type]", name, mime),
+			})
+		}
+	}
+	return parts
 }
 
 type streamResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content          string `json:"content"`
+			Reasoning        string `json:"reasoning"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Function struct {
@@ -239,6 +348,11 @@ func parseChunk(payload string) (Chunk, error) {
 	var chunk Chunk
 	for _, choice := range resp.Choices {
 		chunk.Text += choice.Delta.Content
+		if choice.Delta.ReasoningContent != "" {
+			chunk.Reasoning += choice.Delta.ReasoningContent
+		} else {
+			chunk.Reasoning += choice.Delta.Reasoning
+		}
 		if choice.FinishReason != "" {
 			chunk.FinishReason = choice.FinishReason
 		}

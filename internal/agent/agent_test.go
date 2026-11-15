@@ -7,15 +7,20 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"lingzhu/internal/agents"
 	"lingzhu/internal/event"
 	"lingzhu/internal/model"
 	"lingzhu/internal/permission"
+	"lingzhu/internal/prompt"
 	"lingzhu/internal/provider"
+	"lingzhu/internal/question"
 	"lingzhu/internal/session"
 	"lingzhu/internal/tool"
+	"lingzhu/internal/warming"
 )
 
 type fakeProvider struct {
@@ -140,7 +145,7 @@ func TestStreamSendsVariantRequestModelAndOptions(t *testing.T) {
 		Options:      map[string]any{"reasoning_effort": "high"},
 		Provider:     fake,
 	}
-	if result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, nil); result.Err != nil {
+	if result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, nil, "", 0, nil); result.Err != nil {
 		t.Fatal(result.Err)
 	}
 	if len(fake.requests) != 1 {
@@ -152,12 +157,44 @@ func TestStreamSendsVariantRequestModelAndOptions(t *testing.T) {
 	}
 }
 
+func TestStreamRecordsOrderedReasoningAndTextParts(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{
+		{Reasoning: "think "},
+		{Reasoning: "again"},
+		{Text: "answer"},
+		{Reasoning: "later"},
+	}}}
+	a, _ := newTestAgent(t, fake)
+	target := provider.Target{Model: "m", RequestModel: "m", Provider: fake}
+
+	result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, nil, "", 0, nil)
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	parts := result.Parts
+	if len(parts) != 3 {
+		t.Fatalf("parts = %+v", parts)
+	}
+	if parts[0].Type != "reasoning" || parts[0].Text != "think again" {
+		t.Fatalf("first part = %+v", parts[0])
+	}
+	if parts[1].Type != "text" || parts[1].Text != "answer" {
+		t.Fatalf("second part = %+v", parts[1])
+	}
+	if parts[2].Type != "reasoning" || parts[2].Text != "later" {
+		t.Fatalf("third part = %+v", parts[2])
+	}
+	if parts[0].Created == "" || parts[0].Completed == "" || parts[0].Created > parts[0].Completed {
+		t.Fatalf("part timestamps = %+v", parts[0])
+	}
+}
+
 func TestStreamOmitsToolsWhenModelSaysNone(t *testing.T) {
 	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "ok"}}}}
 	a, _ := newTestAgent(t, fake)
 	target := provider.Target{Model: "m", RequestModel: "m", NoTools: true, Provider: fake}
 	tools := []model.ToolDef{{Name: "echo", Description: "d", Schema: []byte(`{"type":"object"}`)}}
-	if result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, tools); result.Err != nil {
+	if result := a.stream(context.Background(), "s1", []model.Message{{Role: model.RoleUser, Content: "hi"}}, target, tools, "", 0, nil); result.Err != nil {
 		t.Fatal(result.Err)
 	}
 	if len(fake.requests) != 1 {
@@ -318,8 +355,11 @@ func TestMaxStepsWrapUpDisablesTools(t *testing.T) {
 		t.Fatalf("want two tool steps and one wrap-up, got %d calls", len(fake.requests))
 	}
 	final := fake.requests[len(fake.requests)-1]
-	if len(final.Tools) != 0 {
-		t.Fatalf("wrap-up must not offer tools: %+v", final.Tools)
+	if len(final.Tools) == 0 {
+		t.Fatalf("wrap-up keeps tool definitions for the cached prefix: %+v", final.Tools)
+	}
+	if final.ToolChoice != "none" {
+		t.Fatalf("wrap-up must disable tools with tool_choice none: %q", final.ToolChoice)
 	}
 	lastMessage := final.Messages[len(final.Messages)-1]
 	if lastMessage.Role != model.RoleAssistant || !strings.Contains(lastMessage.Content, "MAXIMUM STEPS") {
@@ -345,12 +385,22 @@ func TestRunRetriesRetryableFailureBeforeOutput(t *testing.T) {
 	a.retryDelay = time.Millisecond
 
 	var last event.Event
+	sawRetry := false
 	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for ev := range stream {
 		last = ev
+		if ev.Type == event.RunRetry {
+			sawRetry = true
+			if ev.Data["attempt"] != 1 || ev.Data["message"] == "" {
+				t.Fatalf("unexpected retry event: %+v", ev)
+			}
+		}
+	}
+	if !sawRetry {
+		t.Fatal("want a run.retry event before the second attempt")
 	}
 	if last.Type != event.RunEnd || last.Data["reason"] != "done" {
 		t.Fatalf("want successful run after retry, got %+v", last)
@@ -422,11 +472,14 @@ func TestOutputLimitContinuesWithoutRepeating(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 3 {
-		t.Fatalf("synthetic notice must not be stored: %+v", messages)
+	if len(messages) != 4 {
+		t.Fatalf("continuation notice should be stored as synthetic: %+v", messages)
 	}
-	if messages[1].Content != "first half " || messages[2].Content != "second half" {
+	if messages[1].Content != "first half " || messages[3].Content != "second half" {
 		t.Fatalf("continuation text was not recorded: %+v", messages)
+	}
+	if !messages[2].Synthetic || !strings.Contains(messages[2].Content, "output token limit") {
+		t.Fatalf("synthetic continuation notice missing: %+v", messages[2])
 	}
 }
 
@@ -477,7 +530,7 @@ func TestInterruptedStreamContinuesFromPartialOutput(t *testing.T) {
 	}
 	second := fake.requests[1]
 	notice := second.Messages[len(second.Messages)-1]
-	if notice.Role != model.RoleUser || !strings.Contains(notice.Content, "interrupted mid-stream") {
+	if notice.Role != model.RoleUser || !strings.Contains(notice.Content, "interrupted. Continue") {
 		t.Fatalf("resume instruction missing: %+v", notice)
 	}
 
@@ -485,8 +538,11 @@ func TestInterruptedStreamContinuesFromPartialOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 3 || messages[1].Content != "partial " || messages[2].Content != "rest" {
+	if len(messages) != 4 || messages[1].Content != "partial " || messages[3].Content != "rest" {
 		t.Fatalf("partial output was not preserved: %+v", messages)
+	}
+	if !messages[2].Synthetic || !strings.Contains(messages[2].Content, "interrupted. Continue") {
+		t.Fatalf("synthetic resume notice missing: %+v", messages[2])
 	}
 }
 
@@ -501,7 +557,7 @@ func TestSystemPromptIsRebuiltForEachRequest(t *testing.T) {
 	built := 0
 	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{
 		MaxSteps: 4,
-		SystemFunc: func() string {
+		SystemFunc: func(string, provider.Target) string {
 			built++
 			return fmt.Sprintf("prompt-%d", built)
 		},
@@ -522,6 +578,90 @@ func TestSystemPromptIsRebuiltForEachRequest(t *testing.T) {
 		if request.Messages[0].Role != model.RoleSystem || request.Messages[0].Content != want {
 			t.Fatalf("request %d system prompt = %+v, want %q", index, request.Messages[0], want)
 		}
+	}
+}
+
+func TestInstructionStateFreezesPrefixAndSendsUpdates(t *testing.T) {
+	call := provider.Chunk{ToolCalls: []provider.ToolCallDelta{
+		{Index: 0, ID: "call_1", Name: "echo", Arguments: `{}`},
+	}}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{call}, {{Text: "done"}}}}
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+
+	date := "Mon Jan 2 2006"
+	agents := "project rules v1"
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{
+		MaxSteps: 4,
+		SystemPartsFunc: func(string, provider.Target) prompt.Parts {
+			return prompt.Parts{
+				Base: "base prompt",
+				Sections: []prompt.Section{
+					{Key: "agents", Text: agents},
+					{Key: "date", Text: "Today's date: " + date},
+				},
+			}
+		},
+	})
+
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("want two model requests, got %d", len(fake.requests))
+	}
+	first := fake.requests[0].Messages[0]
+	if first.Role != model.RoleSystem || !strings.Contains(first.Content, "project rules v1") {
+		t.Fatalf("baseline system prompt missing instructions: %+v", first)
+	}
+
+	// The next turn changes the project instructions and the date. The frozen
+	// system prefix must stay byte-identical; the change arrives as a
+	// synthetic message instead.
+	agents = "project rules v2"
+	date = "Tue Jan 3 2006"
+	fake.chunks = append(fake.chunks, []provider.Chunk{{Text: "second"}})
+	stream, err = a.Run(context.Background(), "s1", "continue", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(fake.requests) != 3 {
+		t.Fatalf("want a third request, got %d", len(fake.requests))
+	}
+	second := fake.requests[2]
+	if second.Messages[0].Content != first.Content {
+		t.Fatalf("system prefix was rewritten:\nfirst:  %q\nsecond: %q", first.Content, second.Messages[0].Content)
+	}
+	var update string
+	for _, message := range second.Messages {
+		if message.Synthetic && strings.Contains(message.Content, "project rules v2") {
+			update = message.Content
+		}
+	}
+	if update == "" {
+		t.Fatalf("instruction update message missing: %+v", second.Messages)
+	}
+	if !strings.Contains(update, "Tue Jan 3 2006") || strings.Contains(update, "project rules v1") {
+		t.Fatalf("update should carry the new sections only: %q", update)
+	}
+
+	// The baseline is durable, so a fresh agent on the same store keeps it.
+	reloaded := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 2})
+	snapshot := reloaded.loadInstructionState("s1")
+	if snapshot == nil {
+		t.Fatal("instruction state was not persisted")
+	}
+	if !strings.Contains(snapshot.initial["agents"], "project rules v1") {
+		t.Fatalf("baseline should stay frozen: %+v", snapshot.initial)
+	}
+	if !strings.Contains(snapshot.current["agents"], "project rules v2") {
+		t.Fatalf("current values should track the latest sections: %+v", snapshot.current)
 	}
 }
 
@@ -594,6 +734,205 @@ func TestEnqueueRequiresRunningTurn(t *testing.T) {
 	}
 }
 
+// A queued prompt must never join a running turn, even when a steer arrives
+// before it: the caller asked for a separate turn.
+func TestQueuePromptWaitsWhenSteerArrivesFirst(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "steered"}},
+		{{Text: "queued turn"}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if _, err := a.Enqueue("s1", "join now"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.EnqueueDelivery("s1", "own turn", "queue"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	closed = true
+	for range stream {
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var messages []model.Message
+	for {
+		messages, err = store.Messages("s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) >= 6 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The steer joins this turn; the queued prompt becomes a later one.
+	var contents []string
+	for _, message := range messages {
+		if message.Role == model.RoleUser {
+			contents = append(contents, message.Content)
+		}
+	}
+	if len(contents) != 3 || contents[1] != "join now" || contents[2] != "own turn" {
+		t.Fatalf("promotion order wrong: %+v", contents)
+	}
+}
+
+// A manual compaction is a control item: prompts queued behind it must not be
+// delivered before it, so the checkpoint cannot fold them into its summary.
+func TestCompactionControlKeepsLaterPromptsParked(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "after compact"}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if err := a.Compact(context.Background(), "s1", provider.Selection{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Enqueue("s1", "behind the control"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	closed = true
+	for range stream {
+	}
+
+	// The prompt must still be delivered, and the compaction event must come
+	// before it in the transcript.
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactionAt, promptAt := -1, -1
+	for index, ev := range events {
+		switch ev.Type {
+		case event.Compaction:
+			if compactionAt < 0 {
+				compactionAt = index
+			}
+		case event.UserMessage:
+			if text, _ := ev.Data["text"].(string); text == "behind the control" {
+				promptAt = index
+			}
+		}
+	}
+	if compactionAt < 0 || promptAt < 0 {
+		t.Fatalf("missing events: compaction=%d prompt=%d", compactionAt, promptAt)
+	}
+	if promptAt < compactionAt {
+		t.Fatalf("prompt was delivered before the control: prompt=%d compaction=%d", promptAt, compactionAt)
+	}
+}
+
+func TestQueueDeliveryStartsTurnAfterFinish(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "first done"}},
+		{{Text: "queued done"}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if _, err := a.EnqueueDelivery("s1", "later", "queue"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	for range stream {
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var messages []model.Message
+	for {
+		messages, err = store.Messages("s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) >= 6 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	want := []model.Role{model.RoleUser, model.RoleAssistant, model.RoleTool, model.RoleAssistant, model.RoleUser, model.RoleAssistant}
+	if len(messages) != len(want) {
+		t.Fatalf("want %d messages, got %+v", len(want), messages)
+	}
+	if messages[3].Content != "first done" || messages[4].Content != "later" || messages[5].Content != "queued done" {
+		t.Fatalf("queued turn did not start after finish: %+v", messages)
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.Inputs) != 0 || recovery.ClaimID != "" {
+		t.Fatalf("queued input should be delivered exactly once: %+v", recovery)
+	}
+	if len(fake.requests) != 3 {
+		t.Fatalf("want three model calls, got %d", len(fake.requests))
+	}
+}
+
+func TestEnqueueDeliveryRejectsUnknownMode(t *testing.T) {
+	a, _ := newTestAgent(t, &fakeProvider{})
+	if _, err := a.EnqueueDelivery("s1", "x", "bogus"); err == nil {
+		t.Fatal("want an error for an unknown delivery mode")
+	}
+}
+
 func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 	started := make(chan string, 1)
 	release := make(chan struct{})
@@ -633,8 +972,51 @@ func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The claim is closed, but the steer input survives: it was work the user
+	// asked to join the turn, and the turn is resuming under a new claim.
+	if len(recoveries) != 1 || recoveries[0].ClaimID != "" {
+		t.Fatalf("interrupt should close the claim: %+v", recoveries)
+	}
+	if len(recoveries[0].Inputs) != 1 || recoveries[0].Inputs[0].Text != "queued" {
+		t.Fatalf("steer input should survive an interrupt: %+v", recoveries[0])
+	}
+}
+
+// Queue-delivery input is not resumed by an interrupt: it was told to wait for
+// its own turn, and that turn never started.
+func TestInterruptDropsQueuedPrompt(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	defer close(release)
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if _, err := a.EnqueueDelivery("s1", "later", "queue"); err != nil {
+		t.Fatal(err)
+	}
+	a.Interrupt("s1")
+	for range stream {
+	}
+	recoveries, err := store.Recoveries()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(recoveries) != 0 {
-		t.Fatalf("interrupt should close the claim and queue: %+v", recoveries)
+		t.Fatalf("queued prompt should not survive an interrupt: %+v", recoveries)
 	}
 }
 
@@ -745,7 +1127,7 @@ func TestRunRequiresModel(t *testing.T) {
 	}
 }
 
-func TestPermissionRejectContinuesRun(t *testing.T) {
+func TestPermissionRejectInterruptsRun(t *testing.T) {
 	rules := permission.Rules{{Action: "echo", Resource: "*", Effect: permission.Ask}}
 	perm := permission.New(rules)
 	store := testStore(t)
@@ -762,18 +1144,28 @@ func TestPermissionRejectContinuesRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	asked := 0
+	reason := ""
 	for ev := range stream {
+		if ev.Type == event.RunEnd {
+			reason, _ = ev.Data["reason"].(string)
+		}
 		if ev.Type != event.PermissionAsked {
 			continue
 		}
 		asked++
 		id, _ := ev.Data["id"].(string)
-		if err := a.Reply(id, permission.Reject, "not allowed"); err != nil {
+		if err := a.Reply(id, permission.Reject, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if asked != 1 {
 		t.Fatalf("want 1 permission request, got %d", asked)
+	}
+	if reason != "interrupted" {
+		t.Fatalf("a bare rejection should interrupt the turn, got %q", reason)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("a rejection must not request a follow-up step, got %d requests", len(fake.requests))
 	}
 
 	messages, err := store.Messages("s1")
@@ -786,10 +1178,726 @@ func TestPermissionRejectContinuesRun(t *testing.T) {
 			toolResult = m.Content
 		}
 	}
-	if !strings.Contains(toolResult, "permission denied") || !strings.Contains(toolResult, "not allowed") {
-		t.Fatalf("model should see the denial and feedback, got %q", toolResult)
+	if !strings.Contains(toolResult, "permission declined by user") {
+		t.Fatalf("model should see the decline, got %q", toolResult)
 	}
-	if messages[len(messages)-1].Content != "understood" {
-		t.Fatalf("run should continue after denial, got %+v", messages[len(messages)-1])
+	for _, m := range messages {
+		if m.Content == "understood" {
+			t.Fatal("the model must not continue after a bare user rejection")
+		}
 	}
+}
+
+// A rejection that carries instructions must not end the turn: the model reads
+// the feedback as the tool result and continues, so one message redirects the
+// work instead of stopping it.
+func TestPermissionRejectWithFeedbackContinuesTurn(t *testing.T) {
+	rules := permission.Rules{{Action: "echo", Resource: "*", Effect: permission.Ask}}
+	perm := permission.New(rules)
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
+		{{Text: "understood"}},
+	}}
+	a := New(store, testCatalog(fake, "test-model", 0), registry, perm, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := 0
+	reason := ""
+	for ev := range stream {
+		if ev.Type == event.RunEnd {
+			reason, _ = ev.Data["reason"].(string)
+		}
+		if ev.Type != event.PermissionAsked {
+			continue
+		}
+		asked++
+		id, _ := ev.Data["id"].(string)
+		if err := a.Reply(id, permission.Reject, "use read instead"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if asked != 1 {
+		t.Fatalf("want 1 permission request, got %d", asked)
+	}
+	if reason != "done" {
+		t.Fatalf("feedback should keep the turn running, got %q", reason)
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("feedback should request a follow-up step, got %d requests", len(fake.requests))
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolResult string
+	for _, m := range messages {
+		if m.Role == model.RoleTool {
+			toolResult = m.Content
+		}
+	}
+	if !strings.Contains(toolResult, "use read instead") {
+		t.Fatalf("model should see the feedback, got %q", toolResult)
+	}
+}
+
+func TestUnattendedAskIsDeniedInsteadOfBlocking(t *testing.T) {
+	// A scheduled wake-up has no client to answer a permission prompt, so an ask
+	// must settle as a denial instead of stalling the turn.
+	rules := permission.Rules{
+		{Action: "*", Resource: "*", Effect: permission.Allow},
+		{Action: "echo", Resource: "*", Effect: permission.Ask},
+	}
+	perm := permission.New(rules)
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
+		{{Text: "done"}},
+	}}
+	a := New(store, testCatalog(fake, "test-model", 0), registry, perm, Options{MaxSteps: 4})
+
+	stream, err := a.RunUnattended(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev := range stream {
+			if ev.Type == event.PermissionAsked {
+				asked++
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unattended turn must not block on a permission ask")
+	}
+	if asked != 0 {
+		t.Fatalf("an unattended ask must not reach a client, got %d", asked)
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolResult string
+	for _, m := range messages {
+		if m.Role == model.RoleTool {
+			toolResult = m.Content
+		}
+	}
+	if !strings.Contains(toolResult, "nobody is present") {
+		t.Fatalf("model should see why the tool was denied, got %q", toolResult)
+	}
+	if len(perm.Pending("")) != 0 {
+		t.Fatal("an unattended ask must not stay pending")
+	}
+}
+
+func TestScheduledNotifyRunsUnattended(t *testing.T) {
+	rules := permission.Rules{
+		{Action: "*", Resource: "*", Effect: permission.Allow},
+		{Action: "echo", Resource: "*", Effect: permission.Ask},
+	}
+	perm := permission.New(rules)
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
+		{{Text: "done"}},
+	}}
+	a := New(store, testCatalog(fake, "test-model", 0), registry, perm, Options{MaxSteps: 4})
+
+	if err := a.Notify("s1", event.ScheduleFiredEvent("sch_1", "tick", "scheduled work")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.Wait(ctx); err != nil {
+		t.Fatalf("a scheduled turn must finish without a client: %v", err)
+	}
+	if len(perm.Pending("")) != 0 {
+		t.Fatal("a scheduled turn must not leave a pending ask")
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolResult string
+	for _, m := range messages {
+		if m.Role == model.RoleTool {
+			toolResult = m.Content
+		}
+	}
+	if !strings.Contains(toolResult, "nobody is present") {
+		t.Fatalf("scheduled work should be denied unattended asks, got %q", toolResult)
+	}
+}
+
+type blockTool struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockTool) Name() string            { return "block" }
+func (b *blockTool) Description() string     { return "block" }
+func (b *blockTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+
+func (b *blockTool) Run(ctx context.Context, _ tool.Call) (string, error) {
+	close(b.started)
+	select {
+	case <-b.release:
+		return "blocked done", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func TestNotifyStartsTurnWithoutUserMessage(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "notified"}}}}
+	a, store := newTestAgent(t, fake)
+
+	notification := event.JobCompletedEvent("job_1", "echo", "completed", "out.log", "[job] done", 0)
+	if err := a.Notify("s1", notification); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("want 2 messages, got %+v", messages)
+	}
+	if messages[0].Role != model.RoleUser || messages[0].Content != "[job] done" {
+		t.Fatalf("notification not visible to the model: %+v", messages[0])
+	}
+	if messages[1].Role != model.RoleAssistant || messages[1].Content != "notified" {
+		t.Fatalf("unexpected assistant message: %+v", messages[1])
+	}
+}
+
+func TestNotifyContinuesRunningTurn(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "block", Arguments: `{}`}}}},
+		{{Text: "after notice"}},
+	}}
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	block := &blockTool{started: make(chan struct{}), release: make(chan struct{})}
+	registry.Add(block)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "hello", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-block.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool did not start")
+	}
+
+	notification := event.JobCompletedEvent("job_1", "echo", "completed", "out.log", "[job] done", 0)
+	if err := a.Notify("s1", notification); err != nil {
+		t.Fatal(err)
+	}
+	close(block.release)
+	for range stream {
+	}
+
+	if len(fake.requests) < 2 {
+		t.Fatalf("expected a follow-up model call, got %d", len(fake.requests))
+	}
+	found := false
+	for _, message := range fake.requests[1].Messages {
+		if message.Content == "[job] done" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("follow-up request missing notification: %+v", fake.requests[1].Messages)
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := messages[len(messages)-1]; last.Role != model.RoleAssistant || last.Content != "after notice" {
+		t.Fatalf("unexpected final message: %+v", last)
+	}
+}
+
+type editTool struct{}
+
+func (editTool) Name() string            { return "edit" }
+func (editTool) Description() string     { return "edit text" }
+func (editTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+
+func (editTool) Run(ctx context.Context, call tool.Call) (string, error) {
+	if err := call.Allow(ctx, "edit", []string{"a.txt"}, ""); err != nil {
+		return "", err
+	}
+	return "written", nil
+}
+
+func TestAgentProfileAppliesSystemAndPermissions(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "edit", Arguments: `{}`}}}},
+		{{Text: "understood"}},
+	}}
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(editTool{})
+	perm := permission.New(permission.Rules{{Action: "*", Resource: "*", Effect: permission.Allow}})
+	profiles := agents.New(agents.Config{}, "")
+	if err := store.SetAgent("s1", "plan"); err != nil {
+		t.Fatal(err)
+	}
+	a := New(store, testCatalog(fake, "test-model", 0), registry, perm, Options{MaxSteps: 4, Agents: profiles})
+
+	stream, err := a.Run(context.Background(), "s1", "edit it", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolResult string
+	for _, message := range messages {
+		if message.Role == model.RoleTool {
+			toolResult = message.Content
+		}
+	}
+	if !strings.Contains(toolResult, "permission denied") {
+		t.Fatalf("plan agent should deny edit, got %q", toolResult)
+	}
+	if len(fake.requests) == 0 || len(fake.requests[0].Messages) == 0 {
+		t.Fatal("no request captured")
+	}
+	for _, message := range fake.requests[0].Messages {
+		if message.Role == model.RoleSystem && strings.Contains(message.Content, "Plan mode") {
+			t.Fatalf("plan mode must not be in the system prompt: %+v", message)
+		}
+	}
+	reminder := fake.requests[0].Messages[len(fake.requests[0].Messages)-2]
+	if reminder.Role != model.RoleUser || !strings.Contains(reminder.Content, "Plan mode") {
+		t.Fatalf("plan reminder missing before the prompt: %+v", fake.requests[0].Messages)
+	}
+	if last := fake.requests[0].Messages[len(fake.requests[0].Messages)-1]; last.Role != model.RoleUser || last.Content != "edit it" {
+		t.Fatalf("plan reminder must precede the prompt: %+v", fake.requests[0].Messages)
+	}
+}
+
+type fixedSnapshotter struct{ id string }
+
+func (f fixedSnapshotter) Capture(context.Context) (string, error) { return f.id, nil }
+
+func TestRunRecordsTurnSnapshot(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "ok"}}}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{
+		MaxSteps:  4,
+		Snapshots: fixedSnapshotter{id: "commit123"},
+	})
+	stream, err := a.Run(context.Background(), "s1", "hello", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var userSeq int64
+	for _, ev := range events {
+		if ev.Type == event.UserMessage {
+			userSeq = ev.Seq
+		}
+	}
+	for _, ev := range events {
+		if ev.Type != event.TurnSnapshot {
+			continue
+		}
+		if ev.Data["snapshot"] != "commit123" {
+			t.Fatalf("unexpected snapshot data: %+v", ev.Data)
+		}
+		if ev.Data["turnSeq"] != float64(userSeq) && ev.Data["turnSeq"] != userSeq {
+			t.Fatalf("snapshot not keyed to the user turn: %+v", ev.Data)
+		}
+		return
+	}
+	t.Fatal("turn snapshot event missing")
+}
+
+type fakeHooks struct {
+	created bool
+	idle    bool
+	after   []string
+	rewrite bool
+}
+
+func (f *fakeHooks) BeforeTool(_ context.Context, _, tool, _ string, arguments json.RawMessage) (json.RawMessage, string, error) {
+	if tool == "echo" {
+		return arguments, "blocked by test", nil
+	}
+	return arguments, "", nil
+}
+
+func (f *fakeHooks) AfterTool(_ context.Context, _, tool, _ string, _ string, _ bool) {
+	f.after = append(f.after, tool)
+}
+
+func (f *fakeHooks) ApplyContext(_ context.Context, event ContextEvent) (ContextEvent, error) {
+	if !f.rewrite {
+		return event, nil
+	}
+	for i := range event.Messages {
+		if event.Messages[i].Content == "context in" {
+			event.Messages[i].Content = "context out"
+		}
+	}
+	if event.Options == nil {
+		event.Options = map[string]any{}
+	}
+	event.Options["temperature"] = 0.2
+	return event, nil
+}
+
+func (f *fakeHooks) SessionEvent(_ context.Context, event, _ string) {
+	if event == "session.created" {
+		f.created = true
+	}
+	if event == "session.idle" {
+		f.idle = true
+	}
+}
+
+func TestPluginHooksBlockToolsAndReceiveLifecycle(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}}}},
+		{{Text: "done"}},
+	}}
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	hooks := &fakeHooks{}
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4, Hooks: hooks})
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result string
+	for _, message := range messages {
+		if message.Role == model.RoleTool {
+			result = message.Content
+		}
+	}
+	if !strings.Contains(result, "blocked by plugin") {
+		t.Fatalf("tool should be blocked, got %q", result)
+	}
+	if !hooks.created || !hooks.idle {
+		t.Fatalf("session lifecycle missing: %+v", hooks)
+	}
+	if len(hooks.after) != 1 || hooks.after[0] != "echo" {
+		t.Fatalf("after hook missing: %+v", hooks.after)
+	}
+}
+
+func TestAgentProfileFiltersAndBlocksDisabledTools(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_echo", Name: "echo", Arguments: `{"text":"hi"}`}}}},
+		{{Text: "done"}},
+	}}
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	registry.Add(editTool{})
+	profiles := agents.New(agents.Config{Agents: map[string]agents.Definition{
+		"limited": {
+			Description: "Only edit is available",
+			Mode:        agents.ModePrimary,
+			Tools:       map[string]bool{"echo": false},
+		},
+	}}, "limited")
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4, Agents: profiles})
+
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(fake.requests) == 0 {
+		t.Fatal("no request captured")
+	}
+	names := map[string]bool{}
+	for _, def := range fake.requests[0].Tools {
+		names[def.Name] = true
+	}
+	if names["echo"] {
+		t.Fatalf("disabled tool was advertised: %v", names)
+	}
+	if !names["edit"] {
+		t.Fatalf("allowed tool missing: %v", names)
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result string
+	for _, message := range messages {
+		if message.Role == model.RoleTool {
+			result = message.Content
+		}
+	}
+	if !strings.Contains(result, "disabled for this agent") {
+		t.Fatalf("disabled tool should be blocked, got %q", result)
+	}
+}
+
+func TestPluginContextHookRewritesRequest(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "done"}}}}
+	store := testStore(t)
+	hooks := &fakeHooks{rewrite: true}
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2, Hooks: hooks, System: "base system"})
+
+	stream, err := a.Run(context.Background(), "s1", "context in", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(fake.requests) == 0 {
+		t.Fatal("no request captured")
+	}
+	request := fake.requests[0]
+	last := request.Messages[len(request.Messages)-1]
+	if last.Content != "context out" {
+		t.Fatalf("context hook did not rewrite the user message: %+v", request.Messages)
+	}
+	if request.Messages[0].Role != model.RoleSystem {
+		t.Fatalf("system prompt missing after hook: %+v", request.Messages)
+	}
+	if value, ok := request.Options["temperature"].(float64); !ok || value != 0.2 {
+		t.Fatalf("context hook options missing: %+v", request.Options)
+	}
+}
+
+type warmingProvider struct {
+	mu       sync.Mutex
+	requests []model.Request
+}
+
+func (p *warmingProvider) Stream(_ context.Context, req model.Request) (provider.Stream, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+	return &fakeStream{chunks: []provider.Chunk{{Text: "ok"}}}, nil
+}
+
+func (p *warmingProvider) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.requests)
+}
+
+func (p *warmingProvider) lastPrompt() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.requests) == 0 || len(p.requests[len(p.requests)-1].Messages) == 0 {
+		return ""
+	}
+	messages := p.requests[len(p.requests)-1].Messages
+	return messages[len(messages)-1].Content
+}
+
+func TestWarmingSendsIdleKeepAlive(t *testing.T) {
+	store := testStore(t)
+	fake := &warmingProvider{}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{
+		MaxSteps: 1,
+		Base:     base,
+		Warming:  warming.Config{Enabled: true, Prompt: "keep warm", Interval: "10ms", Duration: "300ms"},
+	})
+	stream, err := a.Run(context.Background(), "s1", "hello", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for fake.count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fake.count() < 2 {
+		t.Fatalf("warming request did not run: %d calls", fake.count())
+	}
+	if prompt := fake.lastPrompt(); prompt != "keep warm" {
+		t.Fatalf("unexpected warming prompt: %q", prompt)
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range messages {
+		if message.Content == "keep warm" {
+			t.Fatal("warming prompt should not be persisted")
+		}
+	}
+}
+
+func TestMaxOutputTokensFitsWindow(t *testing.T) {
+	if got := maxOutputTokens(provider.Target{MaxOutput: 384000, Window: 1000000}, 0); got != 256000 {
+		t.Fatalf("catalog limit should cap at 256k, got %d", got)
+	}
+	if got := maxOutputTokens(provider.Target{MaxOutput: 128000, Window: 200000}, 100000); got != 98000 {
+		t.Fatalf("reply should leave room for the prompt, got %d", got)
+	}
+	if got := maxOutputTokens(provider.Target{}, 0); got != 0 {
+		t.Fatalf("unknown limit should stay unset, got %d", got)
+	}
+}
+
+func TestMergeOptionsKeepsModelDefaults(t *testing.T) {
+	base := map[string]any{"temperature": 0.2, "reasoning_effort": "high"}
+	got := mergeOptions(base, map[string]any{"reasoning_effort": "low"})
+	if got["temperature"] != 0.2 || got["reasoning_effort"] != "low" {
+		t.Fatalf("unexpected merged options: %+v", got)
+	}
+	if base["reasoning_effort"] != "high" {
+		t.Fatalf("base options were mutated: %+v", base)
+	}
+}
+
+func TestRetryDelayHonorsRetryAfter(t *testing.T) {
+	if got := retryDelayAfter(&provider.StatusError{RetryAfter: 5 * time.Second}, time.Second); got != 5*time.Second {
+		t.Fatalf("header should win when longer: %v", got)
+	}
+	if got := retryDelayAfter(&provider.StatusError{RetryAfter: 20 * time.Minute}, time.Second); got != retryAfterMax {
+		t.Fatalf("header should be capped: %v", got)
+	}
+	if got := retryDelayAfter(nil, 2*time.Second); got != 2*time.Second {
+		t.Fatalf("fallback should stay: %v", got)
+	}
+}
+
+func TestCodemodeOnlyExposesOnlyExecute(t *testing.T) {
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+	registry.Add(question.NewTool(question.New()))
+	registry.Add(tool.NewExecute(registry, "."))
+	a := New(testStore(t), testCatalog(&fakeProvider{}, "test-model", 0), registry, nil, Options{CodemodeOnly: true})
+	defs := a.definitions("s1")
+	if len(defs) != 1 || defs[0].Name != "execute" {
+		t.Fatalf("execute-only switch should hide direct tools: %+v", defs)
+	}
+}
+
+func TestDefaultExposesDirectTools(t *testing.T) {
+	registry := tool.NewRegistry()
+	registry.Add(tool.Direct(echoTool{}))
+	registry.Add(tool.NewExecute(registry, "."))
+	a := New(testStore(t), testCatalog(&fakeProvider{}, "test-model", 0), registry, nil, Options{})
+	defs := a.definitions("s1")
+	if len(defs) != 2 {
+		t.Fatalf("default should keep direct tools: %+v", defs)
+	}
+}
+
+func TestMergeHeadersKeepsDefaults(t *testing.T) {
+	got := mergeHeaders(map[string]string{"X-Base": "1"}, map[string]string{"X-Agent": "2"})
+	if got["X-Base"] != "1" || got["X-Agent"] != "2" {
+		t.Fatalf("unexpected merged headers: %+v", got)
+	}
+}
+
+func TestCustomAgentSystemIsNotAddedTwice(t *testing.T) {
+	store := testStore(t)
+	if err := store.SetAgent("s1", "explore"); err != nil {
+		t.Fatal(err)
+	}
+	profiles := agents.New(agents.Config{}, "")
+	a := New(store, testCatalog(&fakeProvider{}, "test-model", 0), tool.NewRegistry(), nil, Options{
+		Agents: profiles,
+		SystemFunc: func(string, provider.Target) string {
+			return "custom base prompt"
+		},
+	})
+	messages := a.withSystem("s1", provider.Target{}, nil)
+	if len(messages) != 1 || messages[0].Content != "custom base prompt" {
+		t.Fatalf("agent system should arrive from SystemFunc once: %+v", messages)
+	}
+	if strings.Contains(messages[0].Content, "file search specialist") {
+		t.Fatalf("agent system was appended twice: %q", messages[0].Content)
+	}
+}
+
+func TestFixedSystemStillAppendsCustomAgentSystem(t *testing.T) {
+	store := testStore(t)
+	if err := store.SetAgent("s1", "explore"); err != nil {
+		t.Fatal(err)
+	}
+	a := New(store, testCatalog(&fakeProvider{}, "test-model", 0), tool.NewRegistry(), nil, Options{
+		Agents: agents.New(agents.Config{}, ""),
+		System: "fixed base prompt",
+	})
+	messages := a.withSystem("s1", provider.Target{}, nil)
+	if len(messages) != 1 || !strings.Contains(messages[0].Content, "fixed base prompt") || !strings.Contains(messages[0].Content, "file search specialist") {
+		t.Fatalf("fixed prompt should append the agent system: %+v", messages)
+	}
+}
+
+func TestAssistantMessageCarriesModelMetadata(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "reply"}}}}
+	a, store := newTestAgent(t, fake)
+	a.profiles = agents.New(agents.Config{}, "")
+	stream, err := a.Run(context.Background(), "s1", "hello", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if ev.Type != event.AssistantMessage {
+			continue
+		}
+		if ev.Data["model"] != "test-model" || ev.Data["provider"] != "test" || ev.Data["agent"] != "build" {
+			t.Fatalf("assistant metadata missing: %+v", ev.Data)
+		}
+		return
+	}
+	t.Fatal("assistant message missing")
 }

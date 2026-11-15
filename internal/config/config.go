@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,22 @@ import (
 	"strconv"
 	"strings"
 
+	"lingzhu/internal/agents"
+	"lingzhu/internal/artifact"
+	"lingzhu/internal/commands"
+	"lingzhu/internal/format"
 	"lingzhu/internal/global"
+	"lingzhu/internal/imagegen"
+	"lingzhu/internal/mcp"
+	"lingzhu/internal/media"
+	"lingzhu/internal/oauth"
+	"lingzhu/internal/plugin"
+	"lingzhu/internal/policy"
+	"lingzhu/internal/schedule"
+	"lingzhu/internal/share"
+	"lingzhu/internal/skill"
+	"lingzhu/internal/warming"
+	"lingzhu/internal/websearch"
 )
 
 type Config struct {
@@ -24,18 +40,54 @@ type Config struct {
 	Providers map[string]Provider
 	// ProvidersSet distinguishes an explicit empty providers block from an
 	// old config that never had one.
-	ProvidersSet  bool
-	BaseURL       string
-	APIKey        string
-	MaxSteps      int
-	Shell         []string
-	Permission    []Rule
-	SystemPrompt  string
+	ProvidersSet bool
+	BaseURL      string
+	APIKey       string
+	MaxSteps     int
+	// SubagentDepth is how many nested subagent levels are allowed. The
+	// reference default is one, so a subagent cannot spawn another subagent.
+	SubagentDepth int
+	// CodemodeOnly exposes only the execute tool directly and keeps every other
+	// tool behind Code Mode, matching the reference harness.
+	CodemodeOnly bool
+	Shell        []string
+	Permission   []Rule
+	// PermissionAlways holds the allows learned from "always" answers. They are
+	// separate from Permission so an approval can never lift a configured deny.
+	PermissionAlways []Rule
+	Policies         policy.Rules
+	SystemPrompt     string
+	Instructions     []string
+	// References list extra directories the model may consult when relevant.
+	References []Reference
+	// ModelPrompts selects per-family prompt presets instead of the unified
+	// harness prompt. It is off by default for v2 parity.
+	ModelPrompts  bool
 	ContextWindow int
 	CompactKeep   int
+	// Titles enables model-generated session titles.
+	Titles       bool
+	MCP          mcp.Config
+	OAuth        oauth.Config
+	Formatter    format.Config
+	WebSearch    websearch.Config
+	Image        imagegen.Config
+	Media        media.Config
+	Warming      warming.Config
+	Artifact     artifact.Config
+	Schedule     schedule.Config
+	Share        share.Config
+	Agents       agents.Config
+	DefaultAgent string
+	Commands     commands.Config
+	Plugins      plugin.Config
+	Skills       skill.Config
 	// Path is the file the configuration was loaded from, empty when no file was
 	// used. It is not part of the file format.
 	Path string
+	// LogLevel is the minimum level written to the log: debug, info, warn or
+	// error. An empty value keeps the default of info.
+	LogLevel string
 }
 
 // Model is one selectable model inside a provider.
@@ -45,6 +97,9 @@ type Model struct {
 	ContextWindow *int   `json:"context_window,omitempty"`
 	// MaxOutputTokens is the reply limit the catalog reports.
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+	// CacheTTL is the provider prompt-cache lifetime, such as "5m". Warming
+	// with interval "auto" uses 90% of this value.
+	CacheTTL string `json:"cache_ttl,omitempty"`
 	// Options are request-body fields for this model, such as
 	// reasoning_effort or thinking.
 	Options map[string]any `json:"options,omitempty"`
@@ -53,6 +108,9 @@ type Model struct {
 	// ToolCall is whether the model accepts tool definitions; nil means the
 	// catalog did not say, which keeps tools on.
 	ToolCall *bool `json:"tool_call,omitempty"`
+	// Compaction selects the provider's in-band context compaction. "native"
+	// asks the provider to compact the window instead of writing a summary.
+	Compaction *ModelCompaction `json:"compaction,omitempty"`
 	// Reasoning reports whether the model exposes reasoning output.
 	Reasoning bool `json:"reasoning,omitempty"`
 	// Attachment reports whether the model takes image input.
@@ -61,6 +119,23 @@ type Model struct {
 	Cost *ModelCost `json:"cost,omitempty"`
 	// Modalities are the input and output kinds the model takes.
 	Modalities *ModelModalities `json:"modalities,omitempty"`
+	// Type distinguishes chat models from image models; empty means chat.
+	Type string `json:"type,omitempty"`
+	// API overrides the provider's wire protocol for this model.
+	API string `json:"api,omitempty"`
+	// Family groups versions of one model; only the newest stays listed
+	// unless a caller asks for all of them.
+	Family string `json:"family,omitempty"`
+	// Released is the release date as Unix milliseconds; zero means unknown.
+	Released int64 `json:"released,omitempty"`
+}
+
+// ModelCompaction selects how a model compacts its context. Type "native"
+// asks the provider for an in-band window replacement instead of a summary.
+type ModelCompaction struct {
+	Type string `json:"type,omitempty"`
+	// TriggerTokens is the token count that makes the provider compact.
+	TriggerTokens int `json:"trigger_tokens,omitempty"`
 }
 
 // ModelCost is one model's price per million tokens.
@@ -79,15 +154,30 @@ type ModelModalities struct {
 
 // Provider is one OpenAI-compatible endpoint and its model catalog.
 type Provider struct {
-	Name      string  `json:"name,omitempty"`
-	BaseURL   string  `json:"base_url"`
-	APIKey    string  `json:"api_key,omitempty"`
-	APIKeyEnv string  `json:"api_key_env,omitempty"`
-	Models    []Model `json:"models"`
+	Name      string `json:"name,omitempty"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key,omitempty"`
+	APIKeyEnv string `json:"api_key_env,omitempty"`
+	// API selects the wire protocol: "chat" (default), "responses" or
+	// "messages".
+	API    string  `json:"api,omitempty"`
+	OAuth  string  `json:"oauth,omitempty"`
+	Models []Model `json:"models"`
 	// Blacklist hides model ids from the picker; a non-empty whitelist
 	// keeps only the ids it names. Both apply before variants expand.
 	Blacklist []string `json:"blacklist,omitempty"`
 	Whitelist []string `json:"whitelist,omitempty"`
+}
+
+// Reference is one extra directory the model may consult when relevant. A
+// local reference is a path; a remote one names a git repository and branch.
+type Reference struct {
+	Name        string `json:"name"`
+	Path        string `json:"path,omitempty"`
+	Repository  string `json:"repository,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	Description string `json:"description,omitempty"`
+	Hidden      bool   `json:"hidden,omitempty"`
 }
 
 // Rule is a permission rule; action and resource support wildcards.
@@ -109,11 +199,37 @@ type File struct {
 	BaseURL       string              `json:"base_url"`
 	APIKey        string              `json:"api_key"`
 	MaxSteps      int                 `json:"max_steps"`
+	SubagentDepth int                 `json:"subagent_depth"`
+	CodemodeOnly  *bool               `json:"codemode_only"`
 	Shell         []string            `json:"shell"`
 	Permission    []Rule              `json:"permission"`
-	SystemPrompt  string              `json:"system_prompt"`
-	ContextWindow *int                `json:"context_window"`
-	CompactKeep   int                 `json:"compact_keep"`
+	// PermissionAlways keeps approvals separate from configured rules, so a
+	// saved allow can never override a deny set on purpose.
+	PermissionAlways []Rule             `json:"permission_always"`
+	Policies         []policy.Statement `json:"policies"`
+	SystemPrompt     string             `json:"system_prompt"`
+	Instructions     []string           `json:"instructions"`
+	References       []Reference        `json:"references"`
+	ModelPrompts     *bool              `json:"model_prompts"`
+	ContextWindow    *int               `json:"context_window"`
+	CompactKeep      int                `json:"compact_keep"`
+	Titles           *bool              `json:"titles"`
+	MCP              mcp.Config         `json:"mcp"`
+	OAuth            oauth.Config       `json:"oauth"`
+	Formatter        format.Config      `json:"formatter"`
+	WebSearch        websearch.Config   `json:"websearch"`
+	Image            imagegen.Config    `json:"image"`
+	Media            *media.Config      `json:"media,omitempty"`
+	Warming          *warming.Config    `json:"warming,omitempty"`
+	Artifact         artifact.Config    `json:"artifact"`
+	Schedule         schedule.Config    `json:"schedule"`
+	Share            share.Config       `json:"share"`
+	Agents           agents.Config      `json:"agents"`
+	DefaultAgent     string             `json:"default_agent"`
+	Commands         commands.Config    `json:"commands"`
+	Plugins          plugin.Config      `json:"plugins"`
+	Skills           skill.Config       `json:"skills"`
+	LogLevel         string             `json:"log_level,omitempty"`
 }
 
 // DefaultPath returns the config file to load: an explicit LINGZHU_CONFIG wins,
@@ -121,11 +237,23 @@ type File struct {
 // config file. The project file replaces the user file for that project; the
 // returned path may not exist yet, so settings can be written to it.
 func DefaultPath() string {
+	return DefaultPathFor("")
+}
+
+// DefaultPathFor is DefaultPath for one workspace: an explicit LINGZHU_CONFIG
+// wins, then that directory's own lingzhu.json, then the user config file.
+func DefaultPathFor(directory string) string {
 	if p := os.Getenv("LINGZHU_CONFIG"); p != "" {
 		return p
 	}
-	if wd, err := os.Getwd(); err == nil {
-		path := filepath.Join(wd, "lingzhu.json")
+	dir := directory
+	if dir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			dir = wd
+		}
+	}
+	if dir != "" {
+		path := filepath.Join(dir, "lingzhu.json")
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
@@ -133,24 +261,37 @@ func DefaultPath() string {
 	return filepath.Join(global.Config(), "config.json")
 }
 
-// UserPath is the user-level config file, independent of the working directory.
-func UserPath() string {
-	if p := os.Getenv("LINGZHU_CONFIG"); p != "" {
-		return p
+// ForDir loads the configuration that applies to one workspace. A project file
+// inside that directory replaces the shared config for the workspace, so two
+// projects in one process keep their own providers, agents and tools.
+func ForDir(directory, fallbackPath string) (Config, error) {
+	path := filepath.Join(directory, "lingzhu.json")
+	if _, err := os.Stat(path); err != nil {
+		path = fallbackPath
 	}
-	return filepath.Join(global.Config(), "config.json")
+	cfg, err := Load(path)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Workdir = directory
+	return cfg, nil
 }
 
+// Load reads a config document and fills in defaults for missing fields.
 func Load(path string) (Config, error) {
 	cfg := Config{
 		Addr:          "127.0.0.1:8787",
 		DataDir:       global.Data(),
 		Workdir:       "",
 		BaseURL:       "https://api.openai.com/v1",
-		MaxSteps:      16,
+		MaxSteps:      0,
+		SubagentDepth: 1,
 		Shell:         DefaultShell(),
 		ContextWindow: 128000,
 		CompactKeep:   15000,
+		Titles:        true,
+		Media:         media.Default(),
+		Warming:       warming.Default(),
 	}
 
 	if path != "" {
@@ -173,6 +314,7 @@ func read(path string) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
+	data = trimBOM(data)
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return File{}, err
@@ -185,15 +327,30 @@ func read(path string) (File, error) {
 	return file, nil
 }
 
+// trimBOM drops a UTF-8 byte-order mark so a hand-edited config still decodes.
+func trimBOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+}
+
+// resolvePath joins a relative config path with the config directory but keeps
+// absolute paths untouched, including Windows drive-letter paths.
+func resolvePath(dir, value string) string {
+	value = strings.TrimSpace(value)
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value)
+	}
+	return filepath.Join(dir, value)
+}
+
 func applyFile(cfg *Config, file File, dir string) {
 	if file.Addr != "" {
 		cfg.Addr = file.Addr
 	}
 	if file.DataDir != "" {
-		cfg.DataDir = filepath.Join(dir, file.DataDir)
+		cfg.DataDir = resolvePath(dir, file.DataDir)
 	}
 	if file.Workdir != "" {
-		cfg.Workdir = filepath.Join(dir, file.Workdir)
+		cfg.Workdir = resolvePath(dir, file.Workdir)
 	}
 	if file.Model != "" {
 		cfg.Model = file.Model
@@ -224,20 +381,78 @@ func applyFile(cfg *Config, file File, dir string) {
 	if file.MaxSteps > 0 {
 		cfg.MaxSteps = file.MaxSteps
 	}
+	if value := strings.TrimSpace(file.LogLevel); value != "" {
+		cfg.LogLevel = value
+	}
+	if file.SubagentDepth > 0 {
+		cfg.SubagentDepth = file.SubagentDepth
+	}
 	if len(file.Shell) > 0 {
 		cfg.Shell = file.Shell
 	}
 	if len(file.Permission) > 0 {
 		cfg.Permission = file.Permission
 	}
+	if len(file.PermissionAlways) > 0 {
+		cfg.PermissionAlways = file.PermissionAlways
+	}
+	if len(file.Policies) > 0 {
+		cfg.Policies = policy.Normalize(file.Policies)
+	}
 	if file.SystemPrompt != "" {
 		cfg.SystemPrompt = file.SystemPrompt
+	}
+	if file.CodemodeOnly != nil {
+		cfg.CodemodeOnly = *file.CodemodeOnly
+	}
+	if file.ModelPrompts != nil {
+		cfg.ModelPrompts = *file.ModelPrompts
+	}
+	if len(file.Instructions) > 0 {
+		cfg.Instructions = append([]string(nil), file.Instructions...)
+	}
+	if len(file.References) > 0 {
+		cfg.References = append([]Reference(nil), file.References...)
 	}
 	if file.ContextWindow != nil && *file.ContextWindow >= 0 {
 		cfg.ContextWindow = *file.ContextWindow
 	}
 	if file.CompactKeep > 0 {
 		cfg.CompactKeep = file.CompactKeep
+	}
+	if file.Titles != nil {
+		cfg.Titles = *file.Titles
+	}
+	if len(file.MCP.Servers) > 0 {
+		cfg.MCP = file.MCP
+	}
+	if len(file.Agents.Agents) > 0 {
+		cfg.Agents = file.Agents
+	}
+	cfg.OAuth = file.OAuth
+	cfg.Formatter = file.Formatter
+	cfg.WebSearch = file.WebSearch
+	cfg.Image = file.Image
+	cfg.Artifact = file.Artifact
+	cfg.Schedule = file.Schedule
+	cfg.Share = file.Share
+	if file.Media != nil {
+		cfg.Media = media.Normalize(*file.Media)
+	}
+	if file.Warming != nil {
+		cfg.Warming = warming.Normalize(*file.Warming)
+	}
+	if file.DefaultAgent != "" {
+		cfg.DefaultAgent = file.DefaultAgent
+	}
+	if len(file.Commands) > 0 {
+		cfg.Commands = file.Commands
+	}
+	if len(file.Plugins.Plugins) > 0 {
+		cfg.Plugins = file.Plugins
+	}
+	if len(file.Skills.Paths) > 0 || len(file.Skills.URLs) > 0 {
+		cfg.Skills = file.Skills
 	}
 }
 
@@ -260,6 +475,12 @@ func applyEnv(cfg *Config) {
 	if n, err := strconv.Atoi(os.Getenv("LINGZHU_MAX_STEPS")); err == nil && n > 0 {
 		cfg.MaxSteps = n
 	}
+	if value := strings.TrimSpace(os.Getenv("LINGZHU_LOG_LEVEL")); value != "" {
+		cfg.LogLevel = value
+	}
+	if value, err := strconv.ParseBool(os.Getenv("LINGZHU_MODEL_PROMPTS")); err == nil {
+		cfg.ModelPrompts = value
+	}
 	if n, err := strconv.Atoi(os.Getenv("LINGZHU_CONTEXT_WINDOW")); err == nil && n >= 0 {
 		cfg.ContextWindow = n
 	}
@@ -268,9 +489,10 @@ func applyEnv(cfg *Config) {
 	}
 }
 
-// SavePermission replaces the permission list in the config file and keeps
-// every other field, so an "always allow" answer survives a restart. The write
-// goes through a temp file in the same directory.
+// SavePermission replaces the learned-approval list in the config file and
+// keeps every other field, so an "always allow" answer survives a restart
+// without touching the configured permission rules. The write goes through a
+// temp file in the same directory.
 func SavePermission(path string, rules []Rule) error {
 	if path == "" {
 		return errors.New("config path is unknown")
@@ -281,11 +503,11 @@ func SavePermission(path string, rules []Rule) error {
 		return err
 	}
 	if len(data) > 0 {
-		if err := json.Unmarshal(data, &file); err != nil {
+		if err := json.Unmarshal(trimBOM(data), &file); err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
 	}
-	file["permission"] = rules
+	file["permission_always"] = rules
 	out, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return err
@@ -317,10 +539,56 @@ func SavePermission(path string, rules []Rule) error {
 	return nil
 }
 
-// DefaultShell returns the command prefix used by the built-in bash tool.
+// DefaultShell returns the command prefix used by the built-in shell tool.
 func DefaultShell() []string {
 	if runtime.GOOS == "windows" {
 		return []string{"powershell", "-NoProfile", "-NonInteractive", "-Command"}
 	}
 	return []string{"bash", "-lc"}
+}
+
+// Update merges top-level fields into the config file, creating it if needed.
+// A nil value removes the field; other values are stored as JSON. Existing
+// unrelated fields and credentials are preserved.
+func Update(path string, fields map[string]any) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("config path is unknown")
+	}
+	file := map[string]any{}
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(trimBOM(data), &file); err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		if file == nil {
+			file = map[string]any{}
+		}
+	}
+	for key, value := range fields {
+		if value == nil {
+			delete(file, key)
+			continue
+		}
+		file[key] = value
+	}
+	out, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	temp := path + ".tmp"
+	if err := os.WriteFile(temp, out, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(temp, path); err != nil {
+		_ = os.Remove(temp)
+		return err
+	}
+	return nil
 }

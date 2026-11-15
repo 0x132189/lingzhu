@@ -38,15 +38,17 @@ type Glob struct {
 func (g *Glob) Name() string { return "glob" }
 
 func (g *Glob) Description() string {
-	return "Find files by glob pattern relative to the working directory: ** matches any number of directories, * and ? match within one segment. Results are newest first."
+	return "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\")."
 }
 
 func (g *Glob) Schema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"pattern": {"type": "string", "description": "Glob such as **/*.go"},
-			"limit": {"type": "integer", "description": "Maximum results, default 100"}
+			"pattern": {"type": "string", "description": "Glob pattern to match files against"},
+			"path": {"type": "string", "description": "Directory to search. Defaults to the current working directory."},
+			"hidden": {"type": "boolean", "description": "Include hidden files and directories (default: false)."},
+			"limit": {"type": "integer", "description": "Maximum number of matching files to return (default: 100)"}
 		},
 		"required": ["pattern"]
 	}`)
@@ -55,6 +57,8 @@ func (g *Glob) Schema() json.RawMessage {
 func (g *Glob) Run(ctx context.Context, call Call) (string, error) {
 	var args struct {
 		Pattern string `json:"pattern"`
+		Path    string `json:"path"`
+		Hidden  bool   `json:"hidden"`
 		Limit   int    `json:"limit"`
 	}
 	if err := json.Unmarshal(call.Input, &args); err != nil {
@@ -64,13 +68,11 @@ func (g *Glob) Run(ctx context.Context, call Call) (string, error) {
 	if pattern == "" {
 		return "", fmt.Errorf("glob: pattern is empty")
 	}
-	if err := call.Allow(ctx, "read", []string{pattern}, ""); err != nil {
+	root, err := call.Resolve(ctx, "glob", g.Dir, defaultString(args.Path, "."))
+	if err != nil {
 		return "", err
 	}
-	limit := args.Limit
-	if limit <= 0 {
-		limit = 100
-	}
+	limit := clampLimit(args.Limit, 100)
 	if limit > maxMatches {
 		limit = maxMatches
 	}
@@ -80,9 +82,9 @@ func (g *Glob) Run(ctx context.Context, call Call) (string, error) {
 		mtime time.Time
 	}
 	var hits []hit
-	err := walk(g.Dir, func(path, rel string, info os.FileInfo) error {
+	err = walk(root, args.Hidden, func(path, rel string, info os.FileInfo) error {
 		if matchPattern(pattern, rel) {
-			hits = append(hits, hit{rel: rel, mtime: info.ModTime()})
+			hits = append(hits, hit{rel: relPath(g.Dir, path), mtime: info.ModTime()})
 		}
 		return nil
 	})
@@ -90,8 +92,10 @@ func (g *Glob) Run(ctx context.Context, call Call) (string, error) {
 		return "", fmt.Errorf("glob: %w", err)
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].mtime.After(hits[j].mtime) })
+	total := len(hits)
+	call.SetMetadata("count", total)
 	if len(hits) == 0 {
-		return "no files match " + pattern, nil
+		return "No files found", nil
 	}
 	truncated := len(hits) > limit
 	if truncated {
@@ -103,12 +107,12 @@ func (g *Glob) Run(ctx context.Context, call Call) (string, error) {
 		b.WriteString(h.rel + "\n")
 	}
 	if truncated {
-		fmt.Fprintf(&b, "(showing %d of %d+ matches)", limit, limit)
+		fmt.Fprintf(&b, "\n(Results are truncated: showing first %d results. Consider using a more specific path or pattern.)", limit)
 	}
 	return truncate(strings.TrimRight(b.String(), "\n")), nil
 }
 
-// Grep searches file contents with a regular expression.
+// Grep searches file contents with a regular expression or literal text.
 type Grep struct {
 	Dir string
 }
@@ -116,17 +120,19 @@ type Grep struct {
 func (g *Grep) Name() string { return "grep" }
 
 func (g *Grep) Description() string {
-	return "Search file contents with a Go regular expression and print file:line:text. Narrow the search with include (glob) and path (directory)."
+	return "Search file contents using ripgrep's regular expression syntax or literal text matching. Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. Returns matching file paths, line numbers, and line previews."
 }
 
 func (g *Grep) Schema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"pattern": {"type": "string", "description": "Go regular expression"},
-			"include": {"type": "string", "description": "Only search files matching this glob, e.g. *.go"},
-			"path": {"type": "string", "description": "Directory to search, default the working directory"},
-			"limit": {"type": "integer", "description": "Maximum matches, default 100"}
+			"pattern": {"type": "string", "description": "Regular expression or literal text to match in file contents."},
+			"path": {"type": "string", "description": "File or directory to search. Defaults to the current working directory."},
+			"include": {"type": "string", "description": "Glob pattern to filter files (for example, \"*.js\" or \"*.{ts,tsx}\")"},
+			"literal": {"type": "boolean", "description": "Treat pattern as exact text instead of a regular expression (default: false)."},
+			"caseSensitive": {"type": "boolean", "description": "Use case-sensitive matching (default: true)."},
+			"limit": {"type": "integer", "description": "Maximum number of matching lines to return (default: 100)"}
 		},
 		"required": ["pattern"]
 	}`)
@@ -134,91 +140,137 @@ func (g *Grep) Schema() json.RawMessage {
 
 func (g *Grep) Run(ctx context.Context, call Call) (string, error) {
 	var args struct {
-		Pattern string `json:"pattern"`
-		Include string `json:"include"`
-		Path    string `json:"path"`
-		Limit   int    `json:"limit"`
+		Pattern       string `json:"pattern"`
+		Path          string `json:"path"`
+		Include       string `json:"include"`
+		Literal       bool   `json:"literal"`
+		CaseSensitive *bool  `json:"caseSensitive"`
+		Limit         int    `json:"limit"`
 	}
 	if err := json.Unmarshal(call.Input, &args); err != nil {
 		return "", fmt.Errorf("grep: %w", err)
 	}
-	expr, err := regexp.Compile(args.Pattern)
+	if strings.TrimSpace(args.Pattern) == "" {
+		return "", fmt.Errorf("grep: pattern must not be empty")
+	}
+	pattern := args.Pattern
+	if args.Literal {
+		pattern = regexp.QuoteMeta(pattern)
+	}
+	if args.CaseSensitive != nil && !*args.CaseSensitive {
+		pattern = "(?i)" + pattern
+	}
+	expr, err := regexp.Compile(pattern)
 	if err != nil {
 		return "", fmt.Errorf("grep: %w", err)
 	}
-	root, err := call.Resolve(ctx, "read", g.Dir, defaultString(args.Path, "."))
+	root, err := call.Resolve(ctx, "grep", g.Dir, defaultString(args.Path, "."))
 	if err != nil {
 		return "", err
 	}
-	limit := args.Limit
-	if limit <= 0 {
-		limit = 100
-	}
+	limit := clampLimit(args.Limit, 100)
 	if limit > maxMatches {
 		limit = maxMatches
 	}
 
-	var b strings.Builder
-	matches := 0
+	var matches []struct {
+		path string
+		line int
+		text string
+	}
 	stopped := false
-	err = walk(root, func(path, rel string, info os.FileInfo) error {
-		if stopped || info.Size() > maxFileBytes {
-			return nil
+	scan := func(path string) {
+		if stopped {
+			return
 		}
-		if args.Include != "" && !matchPattern(args.Include, rel) {
-			return nil
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() || info.Size() > maxFileBytes {
+			return
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = path
+		}
+		if args.Include != "" && !matchPattern(args.Include, filepath.ToSlash(rel)) {
+			return
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			return nil
+			return
 		}
 		defer file.Close()
 
-		label := rel
-		if root != g.Dir {
-			label = filepath.ToSlash(path)
-		}
-		scan := bufio.NewScanner(file)
-		scan.Buffer(make([]byte, 0, 64*1024), maxFileBytes)
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), maxFileBytes)
 		line := 0
-		binary := false
-		for scan.Scan() {
+		for scanner.Scan() {
 			line++
-			text := scan.Text()
+			text := scanner.Text()
 			if line == 1 && strings.ContainsRune(text, 0) {
-				binary = true
-				break
+				return
 			}
 			if !expr.MatchString(text) {
 				continue
 			}
-			fmt.Fprintf(&b, "%s:%d: %s\n", label, line, clipLine(text))
-			matches++
-			if matches >= limit {
+			matches = append(matches, struct {
+				path string
+				line int
+				text string
+			}{path: relPath(g.Dir, path), line: line, text: clipLine(text)})
+			if len(matches) >= limit {
 				stopped = true
-				return nil
+				return
 			}
 		}
-		if binary {
-			return nil
-		}
-		return nil
-	})
+	}
+
+	info, err := os.Stat(root)
 	if err != nil {
 		return "", fmt.Errorf("grep: %w", err)
 	}
-	if matches == 0 {
-		return "no matches for " + args.Pattern, nil
+	if info.IsDir() {
+		err = walk(root, false, func(path, rel string, info os.FileInfo) error {
+			if stopped {
+				return nil
+			}
+			scan(path)
+			return nil
+		})
+		if err != nil {
+			return "", fmt.Errorf("grep: %w", err)
+		}
+	} else {
+		scan(root)
+	}
+
+	call.SetMetadata("matches", len(matches))
+	if len(matches) == 0 {
+		return "No matches found", nil
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Found %d matches", len(matches)))
+	current := ""
+	for _, match := range matches {
+		if current != match.path {
+			if current != "" {
+				lines = append(lines, "")
+			}
+			current = match.path
+			lines = append(lines, match.path+":")
+		}
+		lines = append(lines, fmt.Sprintf("  Line %d: %s", match.line, match.text))
 	}
 	if stopped {
-		fmt.Fprintf(&b, "(stopped at %d matches)\n", limit)
+		lines = append(lines, "", fmt.Sprintf("(Results are truncated: showing first %d results. Consider using a more specific path or pattern.)", len(matches)))
 	}
-	return truncate(strings.TrimRight(b.String(), "\n")), nil
+	return truncate(strings.Join(lines, "\n")), nil
 }
 
-// walk visits regular files under root, skipping VCS and dependency trees.
-// rel is slash-separated and relative to the walked root.
-func walk(root string, visit func(path, rel string, info os.FileInfo) error) error {
+// walk visits regular files under root, skipping VCS and dependency trees. When
+// hidden is false, dot entries are skipped as well. rel is slash-separated and
+// relative to the walked root.
+func walk(root string, hidden bool, visit func(path, rel string, info os.FileInfo) error) error {
 	info, err := os.Stat(root)
 	if err != nil {
 		return err
@@ -230,8 +282,15 @@ func walk(root string, visit func(path, rel string, info os.FileInfo) error) err
 		if err != nil {
 			return nil
 		}
+		name := info.Name()
+		if path != root && !hidden && strings.HasPrefix(name, ".") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if info.IsDir() {
-			if skipDirs[info.Name()] && path != root {
+			if skipDirs[name] && path != root {
 				return filepath.SkipDir
 			}
 			return nil

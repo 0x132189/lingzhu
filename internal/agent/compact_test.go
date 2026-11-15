@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"lingzhu/internal/agents"
 	"lingzhu/internal/event"
 	"lingzhu/internal/model"
 	"lingzhu/internal/provider"
@@ -52,13 +53,58 @@ func find(events []event.Event, kind event.Type) (event.Event, bool) {
 	return event.Event{}, false
 }
 
+func TestNativeCompactionUsesProviderCheckpoint(t *testing.T) {
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(bigTool{})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "big", Arguments: `{}`}}}},
+		{{Compaction: "provider checkpoint"}},
+		{{Text: "done"}},
+	}}
+	models := []provider.ModelSpec{{
+		ID:                "test-model",
+		Name:              "test-model",
+		ContextWindow:     1000,
+		NativeCompaction:  true,
+		CompactionTrigger: 900,
+	}}
+	catalog := provider.Static("test", "Test", fake, models, "test-model")
+	a := New(store, catalog, registry, nil, Options{MaxSteps: 4, CompactKeep: 100})
+
+	collect(t, a, "s1", "go")
+	if len(fake.requests) < 3 {
+		t.Fatalf("want a compaction request, got %d requests", len(fake.requests))
+	}
+	compactionRequest := fake.requests[1]
+	if !compactionRequest.NativeCompaction {
+		t.Fatal("the compaction request should be marked native")
+	}
+	management, ok := compactionRequest.Options["context_management"].(map[string]any)
+	if !ok {
+		t.Fatalf("context_management missing: %+v", compactionRequest.Options)
+	}
+	edits, _ := management["edits"].([]map[string]any)
+	if len(edits) != 1 || edits[0]["type"] != "compact_20260112" {
+		t.Fatalf("unexpected edits: %+v", management["edits"])
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) == 0 || !strings.Contains(messages[0].Content, "provider checkpoint") {
+		t.Fatalf("native checkpoint was not stored: %+v", messages)
+	}
+}
+
 func TestCompactsWhenOverBudget(t *testing.T) {
 	store := testStore(t)
 	registry := tool.NewRegistry()
 	registry.Add(bigTool{})
 	fake := &fakeProvider{chunks: [][]provider.Chunk{
 		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "big", Arguments: `{}`}}}},
-		{{Text: "## Objective\n- resume the task"}},
+		{{Text: "## Objective\n- resume the task\n\n## Work State\n### Active\n- resume\n\n## Next Move\n1. resume"}},
 		{{Text: "done"}},
 	}}
 	a := New(store, testCatalog(fake, "test-model", 2000), registry, nil, Options{
@@ -80,7 +126,7 @@ func TestCompactsWhenOverBudget(t *testing.T) {
 	if len(summaryCall.Tools) != 0 {
 		t.Fatalf("summary call should not offer tools: %+v", summaryCall.Tools)
 	}
-	if !strings.Contains(summaryCall.Messages[len(summaryCall.Messages)-1].Content, "Summarize the conversation above") {
+	if !strings.Contains(summaryCall.Messages[len(summaryCall.Messages)-1].Content, "summarize the conversation above") {
 		t.Fatalf("summary prompt missing: %+v", summaryCall.Messages)
 	}
 
@@ -106,7 +152,7 @@ func TestOverflowCompactsAndRetries(t *testing.T) {
 		errs: []error{fmt.Errorf("%w: maximum context length", provider.ErrContextOverflow)},
 		chunks: [][]provider.Chunk{
 			nil,
-			{{Text: "## Objective\n- continue"}},
+			{{Text: "## Objective\n- continue\n\n## Work State\n### Active\n- continue\n\n## Next Move\n1. continue"}},
 			{{Text: "recovered"}},
 		},
 	}
@@ -122,7 +168,7 @@ func TestOverflowCompactsAndRetries(t *testing.T) {
 	if len(fake.requests) != 3 {
 		t.Fatalf("want overflow, summary and retry calls, got %d", len(fake.requests))
 	}
-	if !strings.Contains(fake.requests[1].Messages[len(fake.requests[1].Messages)-1].Content, "Summarize the conversation above") {
+	if !strings.Contains(fake.requests[1].Messages[len(fake.requests[1].Messages)-1].Content, "summarize the conversation above") {
 		t.Fatalf("second call should be the summary: %+v", fake.requests[1].Messages)
 	}
 }
@@ -288,5 +334,171 @@ func TestSystemPromptIsSentWithoutPersisting(t *testing.T) {
 		if m.Role == model.RoleSystem {
 			t.Fatalf("system prompt must not be persisted: %+v", messages)
 		}
+	}
+}
+
+func TestUsePrecomputedAppliesWaitingSummary(t *testing.T) {
+	a, store := newTestAgent(t, &fakeProvider{})
+	if _, err := store.Append("s1", event.User("first")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.User("second")); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Context("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.keep = 1
+	split := keepTail(current.Messages, a.keep)
+	if split <= 0 || split >= len(current.Messages) {
+		t.Fatalf("unexpected split: %d", split)
+	}
+	a.precomps["s1"] = &precompaction{
+		split:       split,
+		fingerprint: messageFingerprint(current.Messages[:split]),
+		summary:     "## Objective\n- test",
+	}
+	if !a.usePrecomputed("s1", provider.Target{Window: 0}, current) {
+		t.Fatal("waiting summary was not applied")
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 || events[len(events)-1].Type != event.Compaction {
+		t.Fatalf("compaction event missing: %+v", events)
+	}
+}
+
+func TestUsePrecomputedRejectsChangedHistory(t *testing.T) {
+	a, store := newTestAgent(t, &fakeProvider{})
+	if _, err := store.Append("s1", event.User("first")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.User("second")); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Context("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.keep = 1
+	split := keepTail(current.Messages, a.keep)
+	a.precomps["s1"] = &precompaction{split: split, fingerprint: "changed", summary: "## Objective\n- test"}
+	if a.usePrecomputed("s1", provider.Target{Window: 0}, current) {
+		t.Fatal("stale summary must not be applied")
+	}
+}
+
+func TestPrecomputeAllowedHonorsCacheAndFailures(t *testing.T) {
+	a, _ := newTestAgent(t, &fakeProvider{})
+	a.keep = 1
+	target := provider.Target{Window: 100_000, CacheTTL: 5 * time.Minute}
+	if a.precomputeAllowed("s1", target, time.Now()) {
+		t.Fatal("no previous response should skip precompute")
+	}
+	a.markResponse("s1")
+	if !a.precomputeAllowed("s1", target, time.Now()) {
+		t.Fatal("a warm cache should allow precompute")
+	}
+	a.preMu.Lock()
+	a.lastResponse["s1"] = time.Now().Add(-5 * time.Minute)
+	a.preMu.Unlock()
+	if a.precomputeAllowed("s1", target, time.Now()) {
+		t.Fatal("an expired cache should skip precompute")
+	}
+	a.preMu.Lock()
+	a.lastResponse["s1"] = time.Now()
+	a.preFails["s1"] = 2
+	a.preMu.Unlock()
+	if a.precomputeAllowed("s1", target, time.Now()) {
+		t.Fatal("the failure cap should skip precompute")
+	}
+}
+
+func TestUsePrecomputedRejectsLongTail(t *testing.T) {
+	a, store := newTestAgent(t, &fakeProvider{})
+	if _, err := store.Append("s1", event.User("first")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.User(strings.Repeat("x", 4000))); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Context("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.keep = 10
+	split := keepTail(current.Messages, a.keep)
+	a.precomps["s1"] = &precompaction{
+		split:       split,
+		fingerprint: messageFingerprint(current.Messages[:split]),
+		summary:     "## Objective\n- test",
+	}
+	if a.usePrecomputed("s1", provider.Target{Window: 1000}, current) {
+		t.Fatal("a tail over 40% of the ceiling must force a fresh summary")
+	}
+}
+
+func TestCompactionUsesCompactionAgentModel(t *testing.T) {
+	store := testStore(t)
+	if _, err := store.Append("s1", event.User("first message")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.Assistant("answer")); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{Text: "## Objective\n- keep going\n\n## Work State\n### Active\n- keep going\n\n## Next Move\n1. keep going"}},
+	}}
+	catalog := provider.Static("test", "Test", fake, []provider.ModelSpec{
+		{ID: "session-model", ContextWindow: 100000},
+		{ID: "compact-model", ContextWindow: 100000},
+	}, "session-model")
+	profiles := agents.New(agents.Config{Agents: map[string]agents.Definition{
+		"compaction": {Model: "test/compact-model"},
+	}}, "")
+	a := New(store, catalog, tool.NewRegistry(), nil, Options{Agents: profiles, CompactKeep: 10})
+
+	current, err := store.Context("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.compact(context.Background(), "s1", catalog.Default(), current, 0, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("want one summary call, got %d", len(fake.requests))
+	}
+	if got := fake.requests[0].Model; got != "compact-model" {
+		t.Fatalf("compaction should use the compaction agent model, got %q", got)
+	}
+}
+
+func TestCompactionFallsBackToSessionModel(t *testing.T) {
+	store := testStore(t)
+	if _, err := store.Append("s1", event.User("first message")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.Assistant("answer")); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{Text: "## Objective\n- keep going\n\n## Work State\n### Active\n- keep going\n\n## Next Move\n1. keep going"}},
+	}}
+	catalog := testCatalog(fake, "session-model", 100000)
+	profiles := agents.New(agents.Config{}, "")
+	a := New(store, catalog, tool.NewRegistry(), nil, Options{Agents: profiles, CompactKeep: 10})
+
+	current, err := store.Context("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.compact(context.Background(), "s1", catalog.Default(), current, 0, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.requests[0].Model; got != "session-model" {
+		t.Fatalf("compaction should fall back to the session model, got %q", got)
 	}
 }

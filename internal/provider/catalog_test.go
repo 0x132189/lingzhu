@@ -1,6 +1,10 @@
 package provider
 
-import "testing"
+import (
+	"testing"
+
+	"lingzhu/internal/policy"
+)
 
 func TestCatalogResolvesDefaultAndExplicitTargets(t *testing.T) {
 	catalog, err := NewCatalog([]ProviderSpec{
@@ -62,6 +66,38 @@ func TestCatalogExpandsVariantsAndFiltersModels(t *testing.T) {
 	}
 }
 
+func TestCatalogDerivesReasoningAliases(t *testing.T) {
+	catalog, err := NewCatalog([]ProviderSpec{{
+		ID:      "a",
+		BaseURL: "https://a.test/v1",
+		APIKey:  "key",
+		Models: []ModelSpec{{
+			ID:            "m1",
+			ContextWindow: 1000,
+			Reasoning:     true,
+			Options:       map[string]any{"reasoning_effort": "low"},
+		}},
+	}}, "a", "m1::high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target := catalog.Default(); target.Model != "m1::high" || target.RequestModel != "m1" ||
+		target.Options["reasoning_effort"] != "high" || target.Window != 1000 {
+		t.Fatalf("unexpected derived default: %+v", target)
+	}
+	target, err := catalog.Resolve(Selection{Provider: "a", Model: "m1::off"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinking, _ := target.Options["thinking"].(map[string]any)
+	if target.RequestModel != "m1" || thinking["type"] != "disabled" {
+		t.Fatalf("unexpected toggle target: %+v", target)
+	}
+	if _, err := catalog.Resolve(Selection{Provider: "a", Model: "missing::high"}); err == nil {
+		t.Fatal("alias of an unknown base model resolved")
+	}
+}
+
 func TestCatalogWhitelistKeepsOnlyNamedModels(t *testing.T) {
 	catalog, err := NewCatalog([]ProviderSpec{{
 		ID:        "a",
@@ -119,5 +155,28 @@ func TestCatalogValidatesSpecs(t *testing.T) {
 		{ID: "a", BaseURL: "https://a.test/v1", APIKey: "k", Models: []ModelSpec{{ID: "m"}}},
 	}, "a", "other"); err == nil {
 		t.Fatal("want unknown model error")
+	}
+}
+
+func TestCatalogPoliciesBlockProviders(t *testing.T) {
+	catalog, err := NewCatalog([]ProviderSpec{
+		{ID: "a", BaseURL: "https://a.test/v1", APIKey: "key-a", Models: []ModelSpec{{ID: "m1"}}},
+		{ID: "b", BaseURL: "https://b.test/v1", APIKey: "key-b", Models: []ModelSpec{{ID: "m2"}}},
+	}, "a", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.SetPolicies(policy.Normalize([]policy.Statement{{
+		Action: "provider.use", Resource: "a", Effect: policy.Deny,
+	}}))
+	if _, err := catalog.Resolve(Selection{Provider: "a", Model: "m1"}); err == nil {
+		t.Fatal("denied provider should not resolve")
+	}
+	if _, err := catalog.Resolve(Selection{Provider: "b", Model: "m2"}); err != nil {
+		t.Fatalf("allowed provider should resolve: %v", err)
+	}
+	providers := catalog.Providers()
+	if len(providers) != 1 || providers[0].ID != "b" {
+		t.Fatalf("denied provider should be hidden: %+v", providers)
 	}
 }

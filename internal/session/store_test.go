@@ -540,3 +540,206 @@ func TestSetModelBeforeLogExists(t *testing.T) {
 		t.Fatalf("a draft without events should not be listed: %+v", infos)
 	}
 }
+
+func TestSetParentRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store := openStore(t, dir)
+	if _, err := store.Append("parent", event.User("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("child", event.User("go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetParent("child", "parent"); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.Meta("child")
+	if err != nil || meta.Parent != "parent" {
+		t.Fatalf("unexpected meta: %+v %v", meta, err)
+	}
+	info, err := store.Info("child")
+	if err != nil || info.Parent != "parent" {
+		t.Fatalf("unexpected info: %+v %v", info, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openStore(t, dir)
+	meta, err = reopened.Meta("child")
+	if err != nil || meta.Parent != "parent" {
+		t.Fatalf("parent did not persist: %+v %v", meta, err)
+	}
+}
+
+func TestSetAgentRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store := openStore(t, dir)
+	if _, err := store.Append("s1", event.User("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAgent("s1", "plan"); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.Meta("s1")
+	if err != nil || meta.Agent != "plan" {
+		t.Fatalf("unexpected meta: %+v %v", meta, err)
+	}
+	info, err := store.Info("s1")
+	if err != nil || info.Agent != "plan" {
+		t.Fatalf("unexpected info: %+v %v", info, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openStore(t, dir)
+	meta, err = reopened.Meta("s1")
+	if err != nil || meta.Agent != "plan" {
+		t.Fatalf("agent did not survive reopen: %+v %v", meta, err)
+	}
+}
+
+func TestExportImportAndMove(t *testing.T) {
+	source := openStore(t, t.TempDir())
+	target := openStore(t, t.TempDir())
+	events := []event.Event{event.User("hello"), event.Assistant("world")}
+	for _, ev := range events {
+		if _, err := source.Append("s1", ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.SetTitle("s1", "Moved session"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SetModel("s1", "work", "fast"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SetAgent("s1", "plan"); err != nil {
+		t.Fatal(err)
+	}
+
+	bundle, err := source.Export("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bundle.Events) != 2 || bundle.Title != "Moved session" || bundle.Agent != "plan" {
+		t.Fatalf("unexpected bundle: %+v", bundle)
+	}
+	if _, err := target.Import(bundle); err != nil {
+		t.Fatal(err)
+	}
+	info, err := target.Info("s1")
+	if err != nil || info.Title != "Moved session" {
+		t.Fatalf("unexpected target info: %+v %v", info, err)
+	}
+	meta, _ := target.Meta("s1")
+	if meta.Provider != "work" || meta.Model != "fast" || meta.Agent != "plan" {
+		t.Fatalf("metadata not transferred: %+v", meta)
+	}
+	messages, err := target.Messages("s1")
+	if err != nil || len(messages) != 2 || messages[0].Content != "hello" || messages[1].Content != "world" {
+		t.Fatalf("history not transferred: %+v %v", messages, err)
+	}
+	if _, err := target.Import(bundle); err == nil {
+		t.Fatal("duplicate import should fail")
+	}
+
+	if _, err := source.Append("s2", event.User("move me")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Move("s2", target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Info("s2"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("moved session should leave the source: %v", err)
+	}
+	messages, err = target.Messages("s2")
+	if err != nil || len(messages) != 1 || messages[0].Content != "move me" {
+		t.Fatalf("move lost history: %+v %v", messages, err)
+	}
+	if _, err := source.Move("s1", source); err == nil {
+		t.Fatal("moving into the same store should fail")
+	}
+}
+
+func TestInputDeliveryAndCancellation(t *testing.T) {
+	store := openStore(t, t.TempDir())
+	if _, err := store.Append("s1", event.User("start")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueueInputDelivery("s1", "inp_1", "first", "queue"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueueInput("s1", "inp_2", "second"); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.Inputs) != 2 {
+		t.Fatalf("unexpected inputs: %+v", recovery.Inputs)
+	}
+	if recovery.Inputs[0].Delivery != "queue" || recovery.Inputs[0].Created.IsZero() {
+		t.Fatalf("unexpected first input: %+v", recovery.Inputs[0])
+	}
+	if recovery.Inputs[1].Delivery != "steer" {
+		t.Fatalf("default delivery should be steer: %+v", recovery.Inputs[1])
+	}
+
+	if err := store.UpdateInputDelivery("s1", "inp_1", "steer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CancelInput("s1", "inp_2"); err != nil {
+		t.Fatal(err)
+	}
+	recovery, _ = store.Recovery("s1")
+	if len(recovery.Inputs) != 1 || recovery.Inputs[0].ID != "inp_1" || recovery.Inputs[0].Delivery != "steer" {
+		t.Fatalf("unexpected pending inputs: %+v", recovery.Inputs)
+	}
+
+	// Delivery still clears the item from the pending set.
+	if _, err := store.Append("s1", event.UserInput("first", "inp_1")); err != nil {
+		t.Fatal(err)
+	}
+	recovery, _ = store.Recovery("s1")
+	if len(recovery.Inputs) != 0 {
+		t.Fatalf("delivered input should be cleared: %+v", recovery.Inputs)
+	}
+}
+func TestEventCacheStaysInSync(t *testing.T) {
+	store := openStore(t, t.TempDir())
+	if _, err := store.Append("s1", event.User("first")); err != nil {
+		t.Fatal(err)
+	}
+	// Populate the in-memory cache.
+	first, err := store.Events("s1")
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first read: %v %d", err, len(first))
+	}
+	if _, err := store.Append("s1", event.Assistant("second")); err != nil {
+		t.Fatal(err)
+	}
+	again, err := store.Events("s1")
+	if err != nil || len(again) != 2 {
+		t.Fatalf("cached read: %v %d", err, len(again))
+	}
+	if again[1].Seq <= again[0].Seq {
+		t.Fatalf("sequence order lost: %d then %d", again[0].Seq, again[1].Seq)
+	}
+	after, err := store.EventsAfter("s1", again[0].Seq)
+	if err != nil || len(after) != 1 || after[0].Seq != again[1].Seq {
+		t.Fatalf("events after: %v %d", err, len(after))
+	}
+	if context, err := store.Context("s1"); err != nil || len(context.Messages) != 2 {
+		t.Fatalf("context after cached appends: %v %d", err, len(context.Messages))
+	}
+	if err := store.Delete("s1"); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := store.Events("s1")
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("delete did not clear the cache: %v %d", err, len(empty))
+	}
+}

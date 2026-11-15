@@ -3,8 +3,11 @@ package permission
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"lingzhu/internal/policy"
 )
 
 func TestEvaluateLastMatchWins(t *testing.T) {
@@ -42,7 +45,7 @@ func TestEvaluateAllDenyWins(t *testing.T) {
 	}
 }
 
-func TestDefaultMatchesOpencode(t *testing.T) {
+func TestDefaultPolicy(t *testing.T) {
 	if got := Default().Evaluate("write", "a.txt"); got != Allow {
 		t.Fatalf("want allow for write, got %s", got)
 	}
@@ -94,7 +97,9 @@ func TestCheckWaitsForReply(t *testing.T) {
 	}
 }
 
-func TestRejectReturnsDeniedError(t *testing.T) {
+// A rejection with a message is guidance, so the turn continues and the model
+// reads the text as the tool result.
+func TestRejectWithFeedbackReturnsCorrectedError(t *testing.T) {
 	m := New(Rules{{Action: "bash", Resource: "*", Effect: Ask}})
 	asked := make(chan Request, 1)
 	done := make(chan error, 1)
@@ -106,12 +111,31 @@ func TestRejectReturnsDeniedError(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := <-done
-	var denied *DeniedError
-	if !errors.As(err, &denied) {
-		t.Fatalf("want DeniedError, got %v", err)
+	var corrected *CorrectedError
+	if !errors.As(err, &corrected) {
+		t.Fatalf("want CorrectedError, got %v", err)
 	}
-	if denied.Reason != "too dangerous" {
-		t.Fatalf("feedback lost: %q", denied.Reason)
+	if corrected.Feedback != "too dangerous" {
+		t.Fatalf("feedback lost: %q", corrected.Feedback)
+	}
+}
+
+// A rejection with no message is a plain stop, so the turn ends.
+func TestRejectWithoutFeedbackReturnsDeclinedError(t *testing.T) {
+	m := New(Rules{{Action: "bash", Resource: "*", Effect: Ask}})
+	asked := make(chan Request, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Check(context.Background(), Request{Action: "bash", Resources: []string{"rm -rf /"}}, func(r Request) { asked <- r })
+	}()
+	req := <-asked
+	if err := m.Reply(req.ID, Reject, ""); err != nil {
+		t.Fatal(err)
+	}
+	err := <-done
+	var declined *DeclinedError
+	if !errors.As(err, &declined) {
+		t.Fatalf("want DeclinedError, got %v", err)
 	}
 }
 
@@ -134,7 +158,7 @@ func TestAlwaysSavesRule(t *testing.T) {
 	}
 }
 
-func TestAlwaysPersistsFullRuleSet(t *testing.T) {
+func TestAlwaysPersistsLearnedRulesOnly(t *testing.T) {
 	m := New(Rules{
 		{Action: "*", Resource: "*", Effect: Allow},
 		{Action: "bash", Resource: "*", Effect: Ask},
@@ -156,12 +180,75 @@ func TestAlwaysPersistsFullRuleSet(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("want allowed, got %v", err)
 	}
-	if len(saved) != 3 {
-		t.Fatalf("saver should receive the full rule set, got %+v", saved)
+	// Only the learned allow is persisted; configured rules stay untouched so a
+	// saved approval can never be confused with a deliberate setting.
+	if len(saved) != 1 {
+		t.Fatalf("saver should receive only the learned rules, got %+v", saved)
 	}
-	last := saved[len(saved)-1]
-	if last.Action != "bash" || last.Resource != "git status" || last.Effect != Allow {
+	if last := saved[0]; last.Action != "bash" || last.Resource != "git status" || last.Effect != Allow {
 		t.Fatalf("unexpected saved rule: %+v", last)
+	}
+	if got := len(m.Rules()); got != 3 {
+		t.Fatalf("configured rules must stay in place, got %d rules", got)
+	}
+}
+
+func TestSavedAllowCannotLiftConfiguredDeny(t *testing.T) {
+	m := New(Rules{
+		{Action: "*", Resource: "*", Effect: Allow},
+		{Action: "shell", Resource: "*", Effect: Deny},
+	})
+	m.SetSaved(Rules{{Action: "shell", Resource: "*", Effect: Allow}})
+	err := m.Check(context.Background(), Request{Action: "shell", Resources: []string{"ls"}}, nil)
+	var denied *DeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("a saved allow must not lift a configured deny, got %v", err)
+	}
+}
+
+func TestSavedAllowAnswersAsk(t *testing.T) {
+	m := New(Rules{
+		{Action: "*", Resource: "*", Effect: Allow},
+		{Action: "shell", Resource: "*", Effect: Ask},
+	})
+	m.SetSaved(Rules{{Action: "shell", Resource: "git status", Effect: Allow}})
+	if err := m.Check(context.Background(), Request{Action: "shell", Resources: []string{"git status"}}, nil); err != nil {
+		t.Fatalf("a saved allow should answer the ask: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Check(ctx, Request{Action: "shell", Resources: []string{"rm -rf /"}}, nil)
+	}()
+	// The unmatched command still asks, so cancel proves it reached the ask path
+	// instead of returning a decision.
+	for len(m.Pending("")) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("an unrelated command must still ask, got %v", err)
+	}
+}
+
+func TestUnattendedAskIsDenied(t *testing.T) {
+	m := New(Rules{{Action: "shell", Resource: "*", Effect: Ask}})
+	announced := false
+	err := m.Check(context.Background(), Request{Action: "shell", Resources: []string{"ls"}, Unattended: true}, func(Request) {
+		announced = true
+	})
+	var denied *DeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("an unattended ask must be denied, got %v", err)
+	}
+	if announced {
+		t.Fatal("an unattended ask must not reach a client")
+	}
+	if !strings.Contains(err.Error(), "nobody is present") {
+		t.Fatalf("reason should explain the denial, got %v", err)
+	}
+	if len(m.Pending("")) != 0 {
+		t.Fatal("an unattended ask must not stay pending")
 	}
 }
 
@@ -191,5 +278,18 @@ func TestCancelUnblocks(t *testing.T) {
 	}()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
+
+func TestPoliciesBlockTools(t *testing.T) {
+	manager := New(Rules{{Action: "*", Resource: "*", Effect: Allow}})
+	manager.SetPolicies(policy.Normalize([]policy.Statement{
+		{Action: "tool.use", Resource: "shell:git push *", Effect: policy.Deny},
+	}))
+	if err := manager.Check(context.Background(), Request{Action: "shell", Resources: []string{"git push origin"}}, nil); err == nil || !strings.Contains(err.Error(), "configuration policy") {
+		t.Fatalf("policy should block shell push, got %v", err)
+	}
+	if err := manager.Check(context.Background(), Request{Action: "shell", Resources: []string{"git status"}}, nil); err != nil {
+		t.Fatalf("unrelated shell command should pass: %v", err)
 	}
 }

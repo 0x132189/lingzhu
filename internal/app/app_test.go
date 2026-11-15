@@ -9,7 +9,11 @@ import (
 
 	"lingzhu/internal/config"
 	"lingzhu/internal/event"
+	"lingzhu/internal/mcp"
+	"lingzhu/internal/plugin"
+	"lingzhu/internal/policy"
 	"lingzhu/internal/provider"
+	"lingzhu/internal/share"
 )
 
 func TestBuildCatalogWithNoProviders(t *testing.T) {
@@ -134,5 +138,115 @@ func TestShutdownInterruptsRunningTurn(t *testing.T) {
 	}
 	if application.Agent.Running("s1") {
 		t.Fatal("turn should be stopped after shutdown")
+	}
+}
+
+func TestAutoShareAfterTurn(t *testing.T) {
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"auto shared answer\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer model.Close()
+
+	application, err := New(config.Config{
+		DataDir:  t.TempDir(),
+		Workdir:  t.TempDir(),
+		Model:    "test-model",
+		BaseURL:  model.URL,
+		APIKey:   "test-key",
+		MaxSteps: 2,
+		Shell:    []string{"bash", "-lc"},
+		Share:    shareConfigForTest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = application.Shutdown(context.Background())
+		_ = application.Store.Close()
+	})
+	stream, err := application.Agent.Run(context.Background(), "s1", "hello", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		record, ok, err := application.Shares.BySession("s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			if record.Messages != 2 {
+				t.Fatalf("unexpected auto share: %+v", record)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("auto share was not created")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestManualShareDoesNotAutoCreate(t *testing.T) {
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"manual\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer model.Close()
+
+	application, err := New(config.Config{
+		DataDir:  t.TempDir(),
+		Workdir:  t.TempDir(),
+		Model:    "test-model",
+		BaseURL:  model.URL,
+		APIKey:   "test-key",
+		MaxSteps: 2,
+		Shell:    []string{"bash", "-lc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = application.Shutdown(context.Background())
+		_ = application.Store.Close()
+	})
+	stream, err := application.Agent.Run(context.Background(), "s1", "hello", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, ok, _ := application.Shares.BySession("s1"); ok {
+		t.Fatal("manual mode must not create a share automatically")
+	}
+}
+
+func shareConfigForTest() share.Config {
+	return share.Config{Mode: "auto"}
+}
+
+func TestPolicyFiltersMCPAndPlugins(t *testing.T) {
+	rules := policy.Normalize([]policy.Statement{
+		{Action: "mcp.use", Resource: "blocked", Effect: policy.Deny},
+		{Action: "plugin.use", Resource: "blocked", Effect: policy.Deny},
+	})
+	mcpConfig := filterMCPConfig(mcp.Config{Servers: map[string]mcp.Server{
+		"keep": {}, "blocked": {},
+	}}, rules, t.Logf)
+	if _, ok := mcpConfig.Servers["blocked"]; ok || len(mcpConfig.Servers) != 1 {
+		t.Fatalf("unexpected mcp config: %+v", mcpConfig.Servers)
+	}
+	pluginConfig := filterPluginConfig(plugin.Config{Plugins: map[string]plugin.Server{
+		"keep": {}, "blocked": {},
+	}}, rules, t.Logf)
+	if _, ok := pluginConfig.Plugins["blocked"]; ok || len(pluginConfig.Plugins) != 1 {
+		t.Fatalf("unexpected plugin config: %+v", pluginConfig.Plugins)
 	}
 }

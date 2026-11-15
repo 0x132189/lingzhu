@@ -1,9 +1,12 @@
 # Build output of the core and local runtime data. Nothing here is committed.
 
 # Core binaries
-/bin/
-/data/
+bin
+data
 
 # Test binaries
 *.exe
 *.test
+
+# Local command output
+*.log

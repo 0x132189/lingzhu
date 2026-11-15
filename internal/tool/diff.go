@@ -2,7 +2,6 @@ package tool
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 )
 
@@ -32,7 +31,7 @@ func lineDiff(dir, path, before, after string) string {
 		return ""
 	}
 
-	name := diffPath(dir, path)
+	name := relPath(dir, path)
 	var b strings.Builder
 	fmt.Fprintf(&b, "--- a/%s\n+++ b/%s\n", name, name)
 	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", diffStart(prefix, oldCount), oldCount, diffStart(prefix, newCount), newCount)
@@ -70,12 +69,4 @@ func splitDiffLines(text string) []string {
 		lines = lines[:len(lines)-1]
 	}
 	return lines
-}
-
-func diffPath(dir, path string) string {
-	rel, err := filepath.Rel(dir, path)
-	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return filepath.ToSlash(rel)
-	}
-	return filepath.ToSlash(path)
 }
