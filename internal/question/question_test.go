@@ -167,3 +167,32 @@ func TestToolRequiresEmitter(t *testing.T) {
 		t.Fatalf("pending request leaked: %+v", pending)
 	}
 }
+
+// A turn nobody is watching cannot answer, so the tool must fail at once
+// instead of waiting for a reply that never arrives.
+func TestToolFailsWhenUnattended(t *testing.T) {
+	manager := New()
+	call, emitted := testCall("s1", `[{"question":"Q","header":"H","options":[{"label":"A","description":"a"}]}]`)
+	call.Unattended = true
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewTool(manager).Run(context.Background(), call)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "nobody is present") {
+			t.Fatalf("want an unattended failure, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("an unattended question blocked instead of failing")
+	}
+	if pending := manager.Pending(""); len(pending) != 0 {
+		t.Fatalf("an unanswered request leaked: %+v", pending)
+	}
+	if len(*emitted) != 0 {
+		t.Fatalf("no question should be announced: %+v", *emitted)
+	}
+}

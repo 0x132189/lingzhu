@@ -2667,20 +2667,27 @@ func (b *toolBatch) announceAndFinish() bool {
 	return b.finish()
 }
 
+// abortGrace bounds how long a cancelled turn waits for a tool that ignores
+// cancellation before the call is settled as aborted.
+const abortGrace = 5 * time.Second
+
 // finish waits for every tool, then persists results in completion order.
-// A rejected permission cancels the batch; a tool that ignores cancellation is
-// bounded by a short grace period and settled as aborted.
+//
+// A tool runs for as long as it needs while the turn is live: a question waits
+// for the user's answer and a shell command carries its own timeout. Only a
+// cancelled turn bounds the wait, so a tool that ignores cancellation cannot
+// hold the session open forever; that call is settled as aborted.
 func (b *toolBatch) finish() bool {
 	b.mu.Lock()
 	runs := append([]*toolRun(nil), b.runs...)
 	b.mu.Unlock()
-	deadline := time.Now().Add(5 * time.Second)
 	for _, run := range runs {
-		wait := time.Until(deadline)
-		if wait < 0 {
-			wait = 0
+		select {
+		case <-run.done:
+			continue
+		case <-b.ctx.Done():
 		}
-		timer := time.NewTimer(wait)
+		timer := time.NewTimer(abortGrace)
 		select {
 		case <-run.done:
 			if !timer.Stop() {

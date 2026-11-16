@@ -223,6 +223,12 @@ func (t *Tool) Run(ctx context.Context, call tool.Call) (string, error) {
 	if err := call.Allow(ctx, "question", []string{"*"}, ""); err != nil {
 		return "", err
 	}
+	// Nobody is watching a scheduled wake-up or a subagent turn, so no answer
+	// can arrive. Failing immediately keeps the turn moving instead of holding
+	// the session open until it is cancelled.
+	if call.Unattended {
+		return "", errors.New("question: nobody is present to answer")
+	}
 
 	var request Request
 	response, err := t.manager.Ask(ctx, call.SessionID, args.Questions, func(req Request) error {
