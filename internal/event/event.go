@@ -77,6 +77,9 @@ const (
 	ShellEnded Type = "shell.ended"
 	// SessionRenamed announces a title change so clients refresh their lists.
 	SessionRenamed Type = "session.renamed"
+	// SessionDeleted announces a removed session so every client drops it from
+	// its lists and closes its tab, instead of keeping a row that opens empty.
+	SessionDeleted Type = "session.deleted"
 	// AgentSelected announces an agent switch so clients and plugins can react.
 	AgentSelected Type = "session.agent.selected"
 	// ModelSelected announces a provider/model switch so the transcript can
@@ -108,7 +111,7 @@ type Event struct {
 // Durable reports whether the event is written to the session store.
 func (e Event) Durable() bool {
 	switch e.Type {
-	case StepStart, TextDelta, RunEnd, RunRetry, Error, PermissionAsked, PermissionReplied, CompactionStart, SessionRenamed:
+	case StepStart, TextDelta, RunEnd, RunRetry, Error, PermissionAsked, PermissionReplied, CompactionStart, SessionRenamed, SessionDeleted:
 		return false
 	}
 	return true
@@ -471,6 +474,13 @@ func ReapplyStagedEvent(turnSeq int64) Event {
 // SessionRenamedEvent announces a generated or manual title change.
 func SessionRenamedEvent(sessionID, title string) Event {
 	return New(SessionRenamed, map[string]any{"sessionID": sessionID, "title": title})
+}
+
+// SessionDeletedEvent announces a session that no longer exists. It is live
+// only: the session's own event log is gone with it, so the notice travels on
+// the all-session stream instead.
+func SessionDeletedEvent(sessionID string) Event {
+	return New(SessionDeleted, map[string]any{"sessionID": sessionID})
 }
 
 // UsageEvent records what the provider reported for one model call. Input

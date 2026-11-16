@@ -247,7 +247,10 @@ func (s *Server) configFor(r *http.Request) config.Config {
 func (s *Server) sessionInWorkspace(r *http.Request, info session.Info) bool {
 	services := s.workspace(r)
 	if services == nil {
-		return true
+		// A core that serves locations answers only for the workspaces it has
+		// open. A directory it does not know must list nothing rather than
+		// every session in the store.
+		return s.locations == nil
 	}
 	root := services.Root()
 	if info.Directory == "" {
@@ -820,7 +823,11 @@ func (s *Server) renameSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if s.agentFor(id).Running(id) {
+	// The agent that owns the session is resolved before the delete, because
+	// afterwards the placement lookup no longer knows where it belonged.
+	loop := s.agentFor(id)
+	directory := s.sessionDirectory(id)
+	if loop.Running(id) {
 		writeError(w, http.StatusConflict, agent.ErrBusy)
 		return
 	}
@@ -830,6 +837,16 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.shares != nil {
 		_ = s.shares.Revoke(id)
+	}
+	// Announce the removal on the live stream. A client that still holds the
+	// row in a cached list drops it here instead of leaving a row that opens
+	// onto an empty transcript.
+	if loop != nil {
+		notice := event.SessionDeletedEvent(id)
+		// The placement is gone with the session, so the notice carries the
+		// workspace it belonged to.
+		notice.Data["directory"] = directory
+		loop.Publish(id, notice)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -865,7 +882,13 @@ func publicMessageRecords(records []session.MessageRecord) []apiMessage {
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
-	records, err := s.store.MessageRecords(r.PathValue("id"))
+	id := r.PathValue("id")
+	// A missing session must be a 404, never an empty transcript: a client that
+	// gets `200 []` cannot tell a deleted session from one that never spoke.
+	if !s.requireSession(w, r, id) {
+		return
+	}
+	records, err := s.store.MessageRecords(id)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -1515,6 +1538,11 @@ func (s *Server) writeGlobalEvent(stream *sseWriter, sessionID string, ev event.
 	if directory := s.sessionDirectory(sessionID); directory != "" {
 		payload["directory"] = directory
 	}
+	// A notice about a session that no longer exists carries its own workspace,
+	// because the placement is gone with the session.
+	if named, ok := ev.Data["directory"].(string); ok && named != "" {
+		payload["directory"] = named
+	}
 	return stream.write(string(ev.Type), payload)
 }
 
@@ -1526,6 +1554,12 @@ func (s *Server) sessionDirectory(sessionID string) string {
 	if err == nil && meta.Directory != "" {
 		return meta.Directory
 	}
+	return s.fallbackDirectory()
+}
+
+// fallbackDirectory is the workspace an event names when its session no longer
+// has a placement, such as the notice that the session was just deleted.
+func (s *Server) fallbackDirectory() string {
 	if s.locations != nil {
 		if def := s.locations.Default(); def != nil {
 			return def.Root()
