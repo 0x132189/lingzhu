@@ -48,3 +48,12 @@ internal/provider     OpenAI-compatible catalog
 internal/tool         built-in tools
 internal/permission   allow / ask / deny rules
 ```
+
+## License
+
+MIT. The full text is in [LICENSE](LICENSE); copyright is held by the Lingzhu contributors. The core is
+written by AI agents under human design, review and acceptance, so the copyright line names the
+contributors rather than a single account.
+
+The architecture and prompt templates follow [opencode](https://github.com/sst/opencode), also MIT.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the attribution and the full license text.

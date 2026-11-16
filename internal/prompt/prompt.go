@@ -42,7 +42,7 @@ var defaultPrompt = strings.Join([]string{
 	"- Responses are rendered as GitHub-flavored Markdown.",
 	"- `<system-reminder>` blocks are harness instructions, not user-authored content. Read and follow them.",
 	"- Prefer parallelizing independent tool calls.",
-	"${OPENCODE_TOOL_GUIDANCE}",
+	"${TOOL_GUIDANCE}",
 	"",
 	"# Communication",
 	"- Use clear file paths when referring to files.",
@@ -279,7 +279,7 @@ func basePrompt(c Context) string {
 }
 
 func renderPrompt(template string, tools []string) string {
-	return strings.ReplaceAll(template, "${OPENCODE_TOOL_GUIDANCE}", strings.Join(guidance(tools), "\n"))
+	return strings.ReplaceAll(template, "${TOOL_GUIDANCE}", strings.Join(guidance(tools), "\n"))
 }
 
 // environment renders the same block the reference harness adds to every

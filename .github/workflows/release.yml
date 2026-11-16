@@ -157,6 +157,7 @@ jobs:
 
       - name: Checksums
         run: |
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
           cd dist
           sha256sum * > checksums.txt
           cat checksums.txt

@@ -276,6 +276,25 @@ func TestBuildSelectsModelSpecificPrompt(t *testing.T) {
 	}
 }
 
+func TestModelPresetsRenderToolGuidance(t *testing.T) {
+	for _, model := range []string{"gpt-5", "gpt-5-astra", "claude-sonnet"} {
+		out := Build(Context{
+			Workdir:      t.TempDir(),
+			Model:        model,
+			RequestModel: model,
+			ModelPrompts: true,
+			Tools:        []string{"shell"},
+			Now:          time.Now(),
+		})
+		if strings.Contains(out, "${") {
+			t.Fatalf("%s left a placeholder unrendered:\n%s", model, out)
+		}
+		if !strings.Contains(out, "Do not chain shell commands") {
+			t.Fatalf("%s preset missing tool guidance:\n%s", model, out)
+		}
+	}
+}
+
 func TestBuildPartsSeparatesBaseAndInstructionSections(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("project rules"), 0o644); err != nil {
