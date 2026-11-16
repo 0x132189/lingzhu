@@ -79,7 +79,7 @@ func (w *WebFetch) Run(ctx context.Context, call Call) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("webfetch: %w", err)
 	}
-	req.Header.Set("User-Agent", "lingzhu-agent/0.1 (+https://github.com/)")
+	req.Header.Set("User-Agent", "lingzhu-agent/0.1 (+https://github.com/miebh/lingzhu)")
 	req.Header.Set("Accept", "text/markdown, text/html, text/plain;q=0.9, */*;q=0.1")
 
 	client := w.Client
