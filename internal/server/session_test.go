@@ -104,7 +104,7 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 }
 
-func TestInterruptStopsRunAndRejectsConcurrentTurn(t *testing.T) {
+func TestInterruptStopsRunAndJoinsConcurrentPrompt(t *testing.T) {
 	p := &blockProvider{started: make(chan struct{}, 1)}
 	srv := httptest.NewServer(newServerWith(t, p).Handler())
 	defer srv.Close()
@@ -117,10 +117,12 @@ func TestInterruptStopsRunAndRejectsConcurrentTurn(t *testing.T) {
 		t.Fatal("run did not reach the provider")
 	}
 
+	// A concurrent prompt is admitted as a steer into the live turn instead of
+	// being rejected.
 	busy := prompt(t, srv.URL, "s1", "again")
 	busy.Body.Close()
-	if busy.StatusCode != http.StatusConflict {
-		t.Fatalf("want 409 for a concurrent turn, got %d", busy.StatusCode)
+	if busy.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 for a joined prompt, got %d", busy.StatusCode)
 	}
 
 	interrupted := post(t, srv.URL+"/sessions/s1/interrupt", "")

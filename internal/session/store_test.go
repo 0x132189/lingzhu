@@ -688,7 +688,7 @@ func TestInputDeliveryAndCancellation(t *testing.T) {
 		t.Fatalf("default delivery should be steer: %+v", recovery.Inputs[1])
 	}
 
-	if err := store.UpdateInputDelivery("s1", "inp_1", "steer"); err != nil {
+	if _, err := store.UpdateInputDelivery("s1", "inp_1", "steer"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.CancelInput("s1", "inp_2"); err != nil {

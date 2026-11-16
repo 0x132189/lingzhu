@@ -94,7 +94,7 @@ func TestMoveDuringTurnQueuesAndAppliesAtBoundary(t *testing.T) {
 		t.Fatalf("running move should be queued, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	source.agent.Interrupt("s1")
+	source.agent.Interrupt("s1", false)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, err := target.store.Info("s1"); err == nil {

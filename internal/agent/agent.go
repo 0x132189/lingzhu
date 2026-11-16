@@ -132,8 +132,6 @@ const (
 	// maxTimeouts bounds repeated timeout retries; a hung endpoint should not
 	// consume the whole general retry budget.
 	maxTimeouts = 3
-	// maxQueuedInput bounds the in-memory steering queue of one turn.
-	maxQueuedInput = 16
 )
 
 // Snapshotter captures one worktree snapshot and returns its identifier.
@@ -218,48 +216,75 @@ type Agent struct {
 	lastResponse map[string]time.Time
 }
 
-// pendingKind names what a queued item asks the turn to do. Only a prompt adds
-// words to the conversation; the other kinds are controls the turn handles at a
-// boundary.
+// pendingKind names what a queued item asks the turn to do. Prompts and
+// synthetic items add words to the conversation; the other kinds are controls
+// the turn handles at a boundary.
 type pendingKind string
 
 const (
 	pendingPrompt     pendingKind = "prompt"
 	pendingNotice     pendingKind = "notice"
 	pendingCompaction pendingKind = "compaction"
+	pendingMove       pendingKind = "move"
 )
 
 // pendingItem is one entry in a turn's ordered inbox. Delivery decides when it
 // is promoted: a steer joins the running turn at its next boundary, while a
-// queued prompt waits for the turn to finish and starts its own.
+// queued item waits for the turn's idle boundary.
 type pendingItem struct {
 	kind     pendingKind
 	delivery string
 	input    session.QueuedInput
-	text     string
 }
 
 // control reports whether the item changes how the turn proceeds rather than
-// adding to it. Only a compaction is a control: it must own its boundary so the
-// prompts behind it stay verbatim after the checkpoint instead of landing in its
-// summary. A notice is promoted inline like a prompt.
-func (i pendingItem) control() bool { return i.kind == pendingCompaction }
+// adding to it. A control owns its boundary: a compaction runs before the
+// prompts around it, and a move stops the turn so it can continue at the
+// destination.
+func (i pendingItem) control() bool { return i.kind == pendingCompaction || i.kind == pendingMove }
+
+// pendingItemFrom maps a durable inbox item onto the turn's in-memory form.
+func pendingItemFrom(input session.QueuedInput) pendingItem {
+	kind := pendingPrompt
+	switch input.Kind {
+	case session.KindSynthetic:
+		kind = pendingNotice
+	case session.KindCompaction:
+		kind = pendingCompaction
+	case session.KindMove:
+		kind = pendingMove
+	}
+	return pendingItem{kind: kind, delivery: normalizeDelivery(input.Delivery), input: input}
+}
+
+func normalizeDelivery(delivery string) string {
+	if delivery == "" {
+		return "steer"
+	}
+	return delivery
+}
 
 // runHandle owns one turn. Input arriving while the turn is active is queued
 // until a safe boundary; finishing closes the queue before the final events.
-// Steer input joins the current turn, while queue input waits for the turn to
-// finish and then starts the next one.
+// Steer input joins the current turn; queue input delivers at the idle boundary
+// inside the same turn.
 type runHandle struct {
 	release context.CancelCauseFunc
 	claimID string
-	// inbox holds every pending item in arrival order, so a control can be
-	// ordered against the prompts around it.
+	// inbox holds every pending item in arrival order, so controls stay
+	// ordered against the prompts around them.
 	inbox []pendingItem
 	// unattended marks a turn nobody is watching, such as a scheduled wake-up.
 	// An ask inside it becomes a deny instead of blocking forever.
 	unattended bool
 	finishing  bool
-	done       chan struct{}
+	// handoff keeps the claim open when a move control stops the turn; the
+	// destination resumes the same claim.
+	handoff bool
+	// resumeOnExit starts a successor for pending steering input after a user
+	// interruption.
+	resumeOnExit bool
+	done         chan struct{}
 }
 
 // warmState is one session's idle keep-alive window.
@@ -560,41 +585,191 @@ func (a *Agent) Pending(sessionID string) []permission.Request {
 	return a.perm.Pending(sessionID)
 }
 
-// Run starts one conversation turn for the selected provider/model. The turn
-// is owned by the session, not by the caller: cancelling ctx stops it, and so
-// does Interrupt. The returned channel delivers live events and closes when the
-// turn ends.
+// Submission is one prompt admitted to a session's inbox. ID lets a client
+// retry without admitting the same text twice.
+type Submission struct {
+	Text        string
+	Delivery    string
+	Attachments []model.Attachment
+	Extra       map[string]any
+	ID          string
+}
+
+// turnStart records the first visible message of a turn. The shadow snapshot
+// captured before the turn is paired with that sequence, so a resumed or
+// steer-woken turn still has its own revert point.
+type turnStart struct {
+	seq int64
+}
+
+// Run starts one conversation turn for the selected provider/model. The prompt
+// is admitted to the durable inbox before the turn starts and delivered at its
+// first boundary, so a crash between admission and delivery still resumes it.
 func (a *Agent) Run(ctx context.Context, sessionID, prompt string, selection provider.Selection) (<-chan event.Event, error) {
-	return a.start(ctx, sessionID, prompt, nil, "", selection, "", nil, false, false, false, nil)
+	return a.runSubmission(ctx, sessionID, Submission{Text: prompt}, selection, false)
 }
 
 // RunUnattended starts a turn nobody is watching, such as a scheduled wake-up.
 // Permission asks are denied instead of blocking on a client that will never
 // answer.
 func (a *Agent) RunUnattended(ctx context.Context, sessionID, prompt string, selection provider.Selection) (<-chan event.Event, error) {
-	return a.start(ctx, sessionID, prompt, nil, "", selection, "", nil, false, false, true, nil)
+	return a.runSubmission(ctx, sessionID, Submission{Text: prompt}, selection, true)
 }
 
 // RunWithAttachments starts a turn with inline prompt attachments. The attachment
 // bytes are stored on the user event, so no separate upload step is required.
 func (a *Agent) RunWithAttachments(ctx context.Context, sessionID, prompt string, attachments []model.Attachment, selection provider.Selection) (<-chan event.Event, error) {
-	return a.start(ctx, sessionID, prompt, attachments, "", selection, "", nil, false, false, false, nil)
+	return a.runSubmission(ctx, sessionID, Submission{Text: prompt, Attachments: attachments}, selection, false)
 }
 
 // RunWithMeta starts a turn with UI-only user message metadata such as
 // structured review comments or a voice marker. Providers never receive it.
 func (a *Agent) RunWithMeta(ctx context.Context, sessionID, prompt string, attachments []model.Attachment, selection provider.Selection, extra map[string]any) (<-chan event.Event, error) {
-	return a.start(ctx, sessionID, prompt, attachments, "", selection, "", nil, false, false, false, extra)
+	return a.runSubmission(ctx, sessionID, Submission{Text: prompt, Attachments: attachments, Extra: extra}, selection, false)
 }
 
-// RunQueued starts a new turn for one queue-delivery input. inputID is written
-// into the delivered user message so replay never delivers the same item twice.
-func (a *Agent) RunQueued(ctx context.Context, sessionID, prompt, inputID string, selection provider.Selection) (<-chan event.Event, error) {
-	return a.start(ctx, sessionID, prompt, nil, inputID, selection, "", nil, false, false, false, nil)
+func (a *Agent) runSubmission(ctx context.Context, sessionID string, in Submission, selection provider.Selection, unattended bool) (<-chan event.Event, error) {
+	stream, _, err := a.submit(ctx, sessionID, in, selection, unattended)
+	if err != nil {
+		return nil, err
+	}
+	if stream == nil {
+		return closedEvents(), nil
+	}
+	return stream, nil
+}
+
+// Submit admits one prompt and reports whether it joined a live turn. A nil
+// stream with joined=true means the text was queued into the running turn.
+func (a *Agent) Submit(ctx context.Context, sessionID string, in Submission, selection provider.Selection) (<-chan event.Event, bool, error) {
+	return a.submit(ctx, sessionID, in, selection, false)
+}
+
+func (a *Agent) submit(ctx context.Context, sessionID string, in Submission, selection provider.Selection, unattended bool) (<-chan event.Event, bool, error) {
+	text := strings.TrimSpace(in.Text)
+	if text == "" {
+		return nil, false, errors.New("prompt is empty")
+	}
+	delivery := in.Delivery
+	if delivery == "" {
+		delivery = "steer"
+	}
+	if delivery != "steer" && delivery != "queue" {
+		return nil, false, fmt.Errorf("delivery must be steer or queue")
+	}
+	item := session.QueuedInput{
+		ID:       in.ID,
+		Kind:     session.KindPrompt,
+		Text:     text,
+		Delivery: delivery,
+		Data:     submissionData(in),
+	}
+	if item.ID == "" {
+		item.ID = a.nextID("inp")
+	}
+	if in.ID != "" {
+		found, pending, err := a.store.InputState(sessionID, item.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		if found {
+			if !pending {
+				// An earlier retry already delivered it.
+				return nil, false, nil
+			}
+			return a.submitAdmitted(ctx, sessionID, item, selection, unattended)
+		}
+	}
+	if a.hooks != nil {
+		if exists, hashErr := a.store.HasEvents(sessionID); hashErr == nil && !exists {
+			a.hooks.SessionEvent(ctx, "session.created", sessionID)
+		}
+	}
+	if _, err := a.persistInbox(sessionID, item); err != nil {
+		return nil, false, err
+	}
+	return a.submitAdmitted(ctx, sessionID, item, selection, unattended)
+}
+
+func submissionData(in Submission) map[string]any {
+	if len(in.Attachments) == 0 && len(in.Extra) == 0 {
+		return nil
+	}
+	data := make(map[string]any, len(in.Extra)+1)
+	if len(in.Attachments) > 0 {
+		data["attachments"] = in.Attachments
+	}
+	for key, value := range in.Extra {
+		if value != nil {
+			data[key] = value
+		}
+	}
+	return data
+}
+
+// submitAdmitted schedules an already durable inbox item: it joins a live turn
+// or starts one. Queue delivery parks only when the caller asks it not to wake.
+func (a *Agent) submitAdmitted(ctx context.Context, sessionID string, item session.QueuedInput, selection provider.Selection, unattended bool) (<-chan event.Event, bool, error) {
+	for {
+		a.mu.Lock()
+		handle := a.runs[sessionID]
+		if handle == nil {
+			a.mu.Unlock()
+			stream, err := a.start(ctx, sessionID, selection, "", false, unattended)
+			if errors.Is(err, ErrBusy) {
+				continue
+			}
+			return stream, false, err
+		}
+		if !handle.finishing {
+			if !inboxHas(handle.inbox, item.ID) {
+				handle.inbox = append(handle.inbox, pendingItemFrom(item))
+			}
+			a.mu.Unlock()
+			return nil, true, nil
+		}
+		done := handle.done
+		a.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+}
+
+// persistInbox writes one admission event and publishes it, so every client's
+// pending projection sees the input immediately instead of polling for it.
+func (a *Agent) persistInbox(sessionID string, item session.QueuedInput) (event.Event, error) {
+	ev, err := a.store.QueueItem(sessionID, item)
+	if err != nil {
+		return ev, err
+	}
+	a.Publish(sessionID, ev)
+	return ev, nil
+}
+
+func inboxHas(items []pendingItem, inputID string) bool {
+	if inputID == "" {
+		return false
+	}
+	for _, item := range items {
+		if item.input.ID == inputID {
+			return true
+		}
+	}
+	return false
+}
+
+// closedEvents is an already-closed stream for a prompt that joined a live turn.
+func closedEvents() <-chan event.Event {
+	ch := make(chan event.Event)
+	close(ch)
+	return ch
 }
 
 // Resume continues a turn whose claim survived a process exit. claimID is the
-// open claim from the session log; empty means only queued input survived.
+// open claim from the session log; empty means only pending input survived.
 // A claim that has already been resumed MaxResumeAttempts times is abandoned,
 // so a turn that crashes at the same point cannot loop on every start.
 func (a *Agent) Resume(ctx context.Context, sessionID, claimID string, selection provider.Selection) (<-chan event.Event, error) {
@@ -626,10 +801,10 @@ func (a *Agent) Resume(ctx context.Context, sessionID, claimID string, selection
 			return nil, err
 		}
 	}
-	return a.start(ctx, sessionID, "", nil, "", selection, claimID, recovery.Inputs, recovery.Compact, true, false, nil)
+	return a.start(ctx, sessionID, selection, claimID, true, false)
 }
 
-func (a *Agent) start(ctx context.Context, sessionID, prompt string, attachments []model.Attachment, inputID string, selection provider.Selection, claimID string, initial []session.QueuedInput, compactQueued bool, resume bool, unattended bool, extra map[string]any) (<-chan event.Event, error) {
+func (a *Agent) start(ctx context.Context, sessionID string, selection provider.Selection, claimID string, resume bool, unattended bool) (<-chan event.Event, error) {
 	a.cancelWarming(sessionID)
 	profile := a.profile(sessionID)
 	if selection.Provider == "" && selection.Model == "" && profile.Model != "" {
@@ -657,12 +832,7 @@ func (a *Agent) start(ctx context.Context, sessionID, prompt string, attachments
 	// only has to be ready before local tools can modify files. This keeps a
 	// slow git snapshot from delaying the first token.
 	var snap *pendingSnapshot
-	var turnSeq int64
-	if !resume && a.hooks != nil {
-		if exists, hashErr := a.store.HasEvents(sessionID); hashErr == nil && !exists {
-			a.hooks.SessionEvent(ctx, "session.created", sessionID)
-		}
-	}
+	turn := &turnStart{}
 	for {
 		a.mu.Lock()
 		handle := a.runs[sessionID]
@@ -672,7 +842,7 @@ func (a *Agent) start(ctx context.Context, sessionID, prompt string, attachments
 				return nil, ctx.Err()
 			}
 			runCtx, release := a.runContext(ctx)
-			if !resume && a.snapshots != nil {
+			if a.snapshots != nil {
 				snap = &pendingSnapshot{done: make(chan struct{})}
 				go func() {
 					snap.id, snap.err = a.snapshots.Capture(runCtx)
@@ -680,34 +850,8 @@ func (a *Agent) start(ctx context.Context, sessionID, prompt string, attachments
 				}()
 			}
 			// Subscribe before the first durable write so the caller sees the
-			// user message and the turn claim cannot outlive a lost prompt.
+			// turn's events and the claim cannot outlive a lost prompt.
 			sub := a.hub.Subscribe(sessionID)
-			if !resume {
-				userEvent := event.User(prompt)
-				if inputID != "" {
-					userEvent = event.UserInput(prompt, inputID)
-				} else if len(attachments) > 0 {
-					userEvent = event.UserWithAttachments(prompt, attachments)
-				}
-				for key, value := range extra {
-					if value != nil {
-						userEvent.Data[key] = value
-					}
-				}
-				// Record the agent and model this turn runs with, so history can
-				// show the same meta the live footer showed.
-				userEvent.Data["agent"] = profile.ID
-				userEvent.Data["provider"] = target.ProviderID
-				userEvent.Data["model"] = target.Model
-				seq, err := a.emitSeq(sessionID, userEvent)
-				if err != nil {
-					a.mu.Unlock()
-					sub.Close()
-					release(context.Canceled)
-					return nil, err
-				}
-				turnSeq = seq
-			}
 			claim := claimID
 			if claim == "" {
 				claim = a.nextID("turn")
@@ -718,7 +862,14 @@ func (a *Agent) start(ctx context.Context, sessionID, prompt string, attachments
 					return nil, err
 				}
 			}
-			handle = &runHandle{release: release, claimID: claim, inbox: initialInbox(initial, compactQueued), unattended: unattended, done: make(chan struct{})}
+			pending, err := a.store.Recovery(sessionID)
+			if err != nil {
+				a.mu.Unlock()
+				sub.Close()
+				release(context.Canceled)
+				return nil, err
+			}
+			handle = &runHandle{release: release, claimID: claim, inbox: initialInbox(pending.Inputs), unattended: unattended, done: make(chan struct{})}
 			a.runs[sessionID] = handle
 			a.mu.Unlock()
 
@@ -740,44 +891,38 @@ func (a *Agent) start(ctx context.Context, sessionID, prompt string, attachments
 					switch {
 					case errors.Is(cause, errShutdown):
 						// Keep the claim and pending input for the next start.
-					case cause != nil:
-						if err := a.store.CancelTurn(sessionID, claim); err != nil {
-							logx.Error("cancel turn failed", logx.Session(sessionID), logx.Err(err))
-						}
+					case handle.handoff:
+						// The move handoff continues its claim at the destination.
+					case errors.Is(cause, errInterrupt):
+						// Interrupt released the claim without deleting input.
 					default:
 						if err := a.store.FinishTurn(sessionID, claim); err != nil {
 							logx.Error("finish turn failed", logx.Session(sessionID), logx.Err(err))
 						}
 					}
-					a.mu.Lock()
-					// Read the queue from the handle itself: hasQueued takes the
-					// same lock and would deadlock here.
-					hasQueued := false
-					for _, item := range handle.inbox {
-						if item.kind == pendingPrompt && item.delivery == "queue" {
-							hasQueued = true
-							break
-						}
-					}
-					if a.runs[sessionID] == handle {
-						delete(a.runs, sessionID)
-					}
-					close(handle.done)
-					a.idle.Broadcast()
-					a.mu.Unlock()
+					// Permissions and plugin hooks settle before the session is
+					// released, so a successor never inherits a stale rule set
+					// or sees an idle event after it already started.
 					if a.perm != nil {
 						a.perm.ClearSessionRules(sessionID)
 					}
 					if a.hooks != nil {
 						a.hooks.SessionEvent(context.Background(), "session.idle", sessionID)
 					}
+					a.mu.Lock()
+					if a.runs[sessionID] == handle {
+						delete(a.runs, sessionID)
+					}
+					close(handle.done)
+					a.idle.Broadcast()
+					a.mu.Unlock()
 					release(context.Canceled)
 					sub.Close()
-					if cause == nil && hasQueued {
-						go a.continueQueue(sessionID, target)
+					if errors.Is(cause, errInterrupt) && handle.resumeOnExit && !handle.handoff {
+						go a.resumePending(sessionID)
 					}
 				}()
-				a.loop(runCtx, sessionID, target, profile.ID, steps, snap, turnSeq, unattended)
+				a.loop(runCtx, sessionID, target, profile.ID, steps, snap, turn, unattended)
 			}()
 			return sub.Events(), nil
 		}
@@ -858,50 +1003,107 @@ func (a *Agent) WaitIdle(ctx context.Context, sessionID string) error {
 	}
 }
 
-// Interrupt cancels the running turn of a session and reports whether one was
-// running. Steer input queued for the interrupted turn survives as a fresh turn,
-// because the user asked for it to join the work and that work is now resuming;
-// queue-delivery input stays parked for its own turn either way.
-func (a *Agent) Interrupt(sessionID string) bool {
+// Interrupt stops the running turn and releases its claim without deleting any
+// pending input. With resume, pending steering input and control items continue
+// in a successor turn; queued prompts stay parked until the next wake.
+func (a *Agent) Interrupt(sessionID string, resume bool) bool {
 	a.mu.Lock()
 	handle := a.runs[sessionID]
 	if handle == nil {
 		a.mu.Unlock()
+		if resume {
+			go a.resumePending(sessionID)
+		}
 		return false
 	}
 	// A finishing turn still owns a possible wrap-up model call; cancelling it
 	// is safe because the turn has already stopped accepting new input.
 	handle.finishing = true
-	// Keep only steer prompts. A control item and a queued prompt both belong
-	// to a turn that no longer exists, and the durable claim is closed below.
-	resume := make([]session.QueuedInput, 0, len(handle.inbox))
-	for _, item := range handle.inbox {
-		if item.kind == pendingPrompt && item.delivery != "queue" {
-			resume = append(resume, item.input)
-		}
-	}
+	handle.resumeOnExit = resume
+	// The inbox items are already durable; the successor reloads them from the
+	// store. Clearing here only stops this turn from delivering more.
 	handle.inbox = nil
 	claim := handle.claimID
 	cancel := handle.release
 	a.mu.Unlock()
-	// Close the durable claim before the process can lose it, so a crash in the
-	// interruption window does not resume a turn the user stopped.
-	if err := a.store.CancelTurn(sessionID, claim); err != nil {
-		logx.Error("cancel turn failed", logx.Session(sessionID), logx.Err(err))
-	}
-	// CancelTurn also cancels every input queued before the claim, so the
-	// surviving steers are re-persisted to keep them deliverable. The next
-	// Resume picks them up; starting a turn here would race the cleanup.
-	if len(resume) > 0 {
-		for _, item := range resume {
-			if _, err := a.store.QueueInputDelivery(sessionID, item.ID, item.Text, "steer"); err != nil {
-				logx.Error("requeue steer failed", logx.Session(sessionID), logx.Err(err))
-				break
-			}
-		}
+	// Release the claim without cancelling input, so a crash in the window does
+	// not bring the stopped turn back and a successor can pick the input up.
+	if err := a.store.ReleaseTurn(sessionID, claim); err != nil {
+		logx.Error("release turn failed", logx.Session(sessionID), logx.Err(err))
 	}
 	cancel(errInterrupt)
 	return true
+}
+
+// Wake starts a turn for pending steering input when the session is idle. A
+// parked item changed to steer is a request for it to run, and nothing else
+// would start the turn that now owns it.
+func (a *Agent) Wake(sessionID string) {
+	if a.base.Err() != nil {
+		return
+	}
+	go a.resumePending(sessionID)
+}
+
+// resumePending delivers steering input and control items an interruption or a
+// delivery change left behind. It waits out a finishing turn first: settling
+// tools and permissions must finish before a replacement reads the same events.
+// Queue-only pending input stays parked until something wakes the session.
+func (a *Agent) resumePending(sessionID string) {
+	for {
+		a.mu.Lock()
+		handle := a.runs[sessionID]
+		if handle == nil {
+			a.mu.Unlock()
+			break
+		}
+		if !handle.finishing {
+			a.mu.Unlock()
+			return
+		}
+		done := handle.done
+		a.mu.Unlock()
+		select {
+		case <-done:
+		case <-a.base.Done():
+			return
+		}
+	}
+	if a.base.Err() != nil {
+		return
+	}
+	recovery, err := a.store.Recovery(sessionID)
+	if err != nil {
+		logx.Error("read steering input failed", logx.Session(sessionID), logx.Err(err))
+		return
+	}
+	steering := false
+	for _, input := range recovery.Inputs {
+		if input.Delivery != "queue" {
+			steering = true
+			break
+		}
+	}
+	if !steering {
+		return
+	}
+	meta, err := a.store.Meta(sessionID)
+	if err != nil {
+		logx.Error("read session selection failed", logx.Session(sessionID), logx.Err(err))
+		return
+	}
+	stream, err := a.start(context.Background(), sessionID, provider.Selection{
+		Provider: meta.Provider,
+		Model:    meta.Model,
+	}, "", true, false)
+	if err != nil {
+		if !errors.Is(err, ErrBusy) {
+			logx.Warn("resume steering input failed", logx.Session(sessionID), logx.Err(err))
+		}
+		return
+	}
+	for range stream {
+	}
 }
 
 // Running reports whether a session has an active turn, including one that is
@@ -912,48 +1114,47 @@ func (a *Agent) Running(sessionID string) bool {
 	return a.runs[sessionID] != nil
 }
 
-// Enqueue persists steering input for the active turn. The turn delivers it at
-// the next boundary between its model calls. ErrNotRunning means the caller
-// should start a normal Run instead.
+// Enqueue persists steering input for a session. The turn delivers it at the
+// next boundary; an idle session starts a turn for it.
 func (a *Agent) Enqueue(sessionID, prompt string) (string, error) {
 	return a.EnqueueDelivery(sessionID, prompt, "steer")
 }
 
-// EnqueueDelivery persists input for the active turn. Steer input joins the
-// current turn at its next boundary; queue input waits until the turn finishes
-// and then starts a new turn.
+// EnqueueDelivery admits input with its delivery preference. Steering joins the
+// running turn at its next boundary; queue delivery waits for the idle boundary
+// inside that turn, or for its own turn when the session is idle.
 func (a *Agent) EnqueueDelivery(sessionID, prompt, delivery string) (string, error) {
-	if strings.TrimSpace(prompt) == "" {
+	text := strings.TrimSpace(prompt)
+	if text == "" {
 		return "", errors.New("prompt is empty")
 	}
-	if delivery == "" {
-		delivery = "steer"
-	}
+	delivery = normalizeDelivery(delivery)
 	if delivery != "steer" && delivery != "queue" {
 		return "", fmt.Errorf("delivery must be steer or queue")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	handle := a.runs[sessionID]
-	if handle == nil || handle.finishing {
-		return "", ErrNotRunning
+	item := session.QueuedInput{
+		ID:       a.nextID("inp"),
+		Kind:     session.KindPrompt,
+		Text:     text,
+		Delivery: delivery,
 	}
-	if len(handle.inbox) >= maxQueuedInput {
-		return "", errors.New("too many queued prompts")
-	}
-	inputID := a.nextID("inp")
-	if _, err := a.store.QueueInputDelivery(sessionID, inputID, prompt, delivery); err != nil {
+	if _, err := a.persistInbox(sessionID, item); err != nil {
 		return "", err
 	}
-	handle.inbox = append(handle.inbox, pendingItem{
-		kind:     pendingPrompt,
-		delivery: delivery,
-		input:    session.QueuedInput{ID: inputID, Text: prompt, Delivery: delivery},
-	})
-	return inputID, nil
+	stream, _, err := a.submitAdmitted(context.Background(), sessionID, item, provider.Selection{}, false)
+	if err != nil {
+		return item.ID, err
+	}
+	if stream != nil {
+		go func() {
+			for range stream {
+			}
+		}()
+	}
+	return item.ID, nil
 }
 
-// SetInputDelivery moves a pending input between steer and queue delivery. It
+// SetInputDelivery moves a pending item between steer and queue delivery. It
 // reports whether the item was still held by an active turn.
 func (a *Agent) SetInputDelivery(sessionID, inputID, delivery string) bool {
 	if delivery != "steer" && delivery != "queue" {
@@ -1004,9 +1205,10 @@ func (a *Agent) CancelInput(sessionID, inputID string) bool {
 	return false
 }
 
-// Notify delivers a synthetic event to a session. An idle session starts a new
-// turn without a user message, so the model sees the event as context. A
-// running turn is told to read the event before it finishes.
+// Notify admits a synthetic event for delivery at a boundary. It stays outside
+// model history until delivered, so a queued wake-up that is cancelled never
+// becomes a stale instruction. An idle session is woken; a running turn reads
+// the event before it finishes.
 //
 // A scheduled wake-up starts an unattended turn: nobody is guaranteed to be
 // watching it, so permission asks are denied instead of blocking forever.
@@ -1018,66 +1220,56 @@ func (a *Agent) Notify(sessionID string, ev event.Event) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("notification text is empty")
 	}
-	if err := a.emit(sessionID, ev); err != nil {
+	data := make(map[string]any, len(ev.Data))
+	for key, value := range ev.Data {
+		data[key] = value
+	}
+	item := session.QueuedInput{
+		ID:       a.nextID("inp"),
+		Kind:     session.KindSynthetic,
+		Text:     text,
+		Delivery: "steer",
+		Data:     map[string]any{"event": string(ev.Type), "data": data},
+	}
+	if _, err := a.persistInbox(sessionID, item); err != nil {
 		return err
 	}
 	meta, _ := a.store.Meta(sessionID)
-	selection := provider.Selection{Provider: meta.Provider, Model: meta.Model}
-	unattended := ev.Type == event.ScheduleFired
-
-	for {
-		a.mu.Lock()
-		handle := a.runs[sessionID]
-		if handle == nil {
-			a.mu.Unlock()
-			stream, err := a.start(context.Background(), sessionID, "", nil, "", selection, "", nil, false, true, unattended, nil)
-			if errors.Is(err, ErrBusy) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			go func() {
-				for range stream {
-				}
-			}()
-			return nil
-		}
-		if !handle.finishing {
-			handle.inbox = append(handle.inbox, pendingItem{kind: pendingNotice, text: text})
-			a.mu.Unlock()
-			return nil
-		}
-		// A finishing turn performs no more model calls, so wait for it to
-		// release the session before starting the follow-up.
-		done := handle.done
-		a.mu.Unlock()
-		select {
-		case <-done:
-		case <-a.base.Done():
-			return nil
-		}
+	stream, _, err := a.submitAdmitted(context.Background(), sessionID, item, provider.Selection{
+		Provider: meta.Provider,
+		Model:    meta.Model,
+	}, ev.Type == event.ScheduleFired)
+	if err != nil {
+		return err
 	}
+	if stream != nil {
+		go func() {
+			for range stream {
+			}
+		}()
+	}
+	return nil
 }
 
 // boundary is what one promotion pass found in the inbox. prompts are the items
 // to add to the conversation now; control names a control item that owns this
 // boundary and was already consumed, so the caller handles it before spending a
-// model call on the prompts behind it.
+// model call on the prompts around it.
 type boundary struct {
 	prompts []pendingItem
 	control pendingKind
-	// queued reports that a queue-delivery prompt is still waiting.
-	queued bool
+	// controlItem is the consumed control, so the caller can name its inbox id
+	// in the event that settles it.
+	controlItem pendingItem
 	// notice reports that a synthetic item was included in prompts.
 	notice bool
 }
 
-// takeBoundary promotes the inbox up to the first control item. A steer prompt
-// joins the turn; a queue prompt only counts when allowQueued is set, which is
-// true at the start of a turn and false between its steps. The control is
-// consumed here and reported, so the caller handles it before spending a model
-// call on the prompts behind it.
+// takeBoundary promotes steer-delivery items at a safe step boundary. A control
+// owns its boundary: a steered compaction runs before earlier steers so their
+// text stays verbatim after the checkpoint, while a move only stops delivery
+// that follows it. Queue-delivery items are promoted one at a time only at the
+// entry or idle boundary, never between tool steps.
 func (a *Agent) takeBoundary(sessionID string, allowQueued bool) boundary {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1085,128 +1277,197 @@ func (a *Agent) takeBoundary(sessionID string, allowQueued bool) boundary {
 	if handle == nil || len(handle.inbox) == 0 {
 		return boundary{}
 	}
-	var result boundary
-	owned := false
-	remaining := make([]pendingItem, 0, len(handle.inbox))
+	steers := make([]pendingItem, 0, len(handle.inbox))
 	for _, item := range handle.inbox {
-		if owned {
-			// Everything behind the control waits for the next boundary.
-			remaining = append(remaining, item)
+		if item.delivery != "queue" {
+			steers = append(steers, item)
+		}
+	}
+	if len(steers) > 0 {
+		controlAt := -1
+		for index, item := range steers {
+			if item.control() {
+				controlAt = index
+				break
+			}
+		}
+		if controlAt >= 0 && steers[controlAt].kind == pendingCompaction && controlAt > 0 {
+			// The checkpoint must not summarize steers admitted before it. A
+			// move earlier in the queue is never crossed.
+			consumed := steers[controlAt]
+			handle.inbox = removeItems(handle.inbox, []pendingItem{consumed})
+			return boundary{control: consumed.kind, controlItem: consumed}
+		}
+		if controlAt == 0 {
+			consumed := steers[0]
+			handle.inbox = removeItems(handle.inbox, []pendingItem{consumed})
+			return boundary{control: consumed.kind, controlItem: consumed}
+		}
+		limit := len(steers)
+		if controlAt > 0 {
+			limit = controlAt
+		}
+		promoted := append([]pendingItem(nil), steers[:limit]...)
+		handle.inbox = removeItems(handle.inbox, promoted)
+		result := boundary{prompts: promoted}
+		for _, item := range promoted {
+			if item.kind == pendingNotice {
+				result.notice = true
+			}
+		}
+		return result
+	}
+	if !allowQueued {
+		return boundary{}
+	}
+	// The entry or idle boundary may take exactly one queued item. A queued
+	// control is handled before any queued prompt behind it.
+	for _, item := range handle.inbox {
+		if item.delivery != "queue" {
 			continue
 		}
+		handle.inbox = removeItems(handle.inbox, []pendingItem{item})
 		if item.control() {
-			result.control = item.kind
-			owned = true
-			continue
+			return boundary{control: item.kind, controlItem: item}
 		}
-		if item.delivery == "queue" && !allowQueued {
-			// A queue prompt is not promotable between steps, but it must not
-			// block a steer behind it either.
-			result.queued = true
-			remaining = append(remaining, item)
-			continue
-		}
-		result.prompts = append(result.prompts, item)
+		result := boundary{prompts: []pendingItem{item}}
 		if item.kind == pendingNotice {
 			result.notice = true
 		}
+		return result
 	}
-	handle.inbox = remaining
-	return result
+	return boundary{}
 }
 
-// initialInbox rebuilds the ordered inbox a resumed turn starts with. Recovery
-// reports prompts and a compaction request separately, but the original order
-// between them is what keeps a checkpoint from summarizing the prompts behind
-// it, so the compaction goes last: any prompt it should have preceded was
-// already delivered before the process stopped.
-func initialInbox(inputs []session.QueuedInput, compact bool) []pendingItem {
-	inbox := make([]pendingItem, 0, len(inputs)+1)
-	for _, input := range inputs {
-		delivery := input.Delivery
-		if delivery == "" {
-			delivery = "steer"
-		}
-		inbox = append(inbox, pendingItem{kind: pendingPrompt, delivery: delivery, input: input})
-	}
-	if compact {
-		inbox = append(inbox, pendingItem{kind: pendingCompaction})
-	}
-	return inbox
-}
-
-// takeOrFinish closes the turn to new input, reporting whether the turn has no
-// work left it can handle itself. A queue-delivery prompt belongs to a later
-// turn, so it does not keep this one alive. Closing under the same lock as
-// Enqueue ensures no prompt can slip between the final check and the end of the
-// turn.
-func (a *Agent) takeOrFinish(sessionID string) bool {
+// hasPromotable reports whether the next boundary would promote anything
+// without consuming it, so a control-only drain can finish cleanly.
+func (a *Agent) hasPromotable(sessionID string, allowQueued bool) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	handle := a.runs[sessionID]
 	if handle == nil {
-		return true
+		return false
 	}
 	for _, item := range handle.inbox {
-		if item.control() || item.delivery != "queue" {
-			return false
+		if item.delivery != "queue" || allowQueued {
+			return true
 		}
 	}
-	handle.finishing = true
-	return true
+	return false
 }
 
-// continueQueue starts the next queued turn after a turn finishes. Queue
-// delivery never joins the running turn: each item becomes its own turn in
-// arrival order.
-func (a *Agent) continueQueue(sessionID string, target provider.Target) {
-	if a.base.Err() != nil {
-		return
+// removeItems drops the promoted items by inbox id and keeps the arrival order
+// of everything that remains.
+func removeItems(items []pendingItem, drop []pendingItem) []pendingItem {
+	if len(drop) == 0 {
+		return items
 	}
-	recovery, err := a.store.Recovery(sessionID)
-	if err != nil {
-		logx.Error("read queue failed", logx.Session(sessionID), logx.Err(err))
-		return
+	ids := make(map[string]bool, len(drop))
+	for _, item := range drop {
+		if item.input.ID != "" {
+			ids[item.input.ID] = true
+		}
 	}
-	for _, item := range recovery.Inputs {
-		if item.Delivery != "queue" {
-			continue
-		}
-		stream, err := a.RunQueued(context.Background(), sessionID, item.Text, item.ID, provider.Selection{
-			Provider: target.ProviderID,
-			Model:    target.Model,
-		})
-		if err != nil {
-			if !errors.Is(err, ErrBusy) {
-				logx.Error("queued turn failed", logx.Session(sessionID), logx.Err(err))
-			}
-			return
-		}
-		for range stream {
-		}
-		return
+	if len(ids) == 0 {
+		return items
 	}
-}
-
-// deliver records promoted prompts before the next model request. The id on the
-// message marks the durable queue item as delivered, so replay never delivers it
-// twice. A notice was already persisted when it arrived, so it is not re-emitted
-// here; its text reaches the model through the context rebuild.
-func (a *Agent) deliver(sessionID string, items []pendingItem, agentID string, target provider.Target) bool {
+	out := items[:0]
 	for _, item := range items {
-		if item.kind != pendingPrompt {
+		if ids[item.input.ID] {
 			continue
 		}
-		user := event.UserInput(item.input.Text, item.input.ID)
-		user.Data["agent"] = agentID
-		user.Data["provider"] = target.ProviderID
-		user.Data["model"] = target.Model
-		if err := a.emit(sessionID, user); err != nil {
+		out = append(out, item)
+	}
+	return out
+}
+
+// initialInbox rebuilds the ordered inbox a turn starts with. Every kind shares
+// one list, so a compaction or move keeps its place relative to prompts.
+func initialInbox(inputs []session.QueuedInput) []pendingItem {
+	inbox := make([]pendingItem, 0, len(inputs))
+	for _, input := range inputs {
+		inbox = append(inbox, pendingItemFrom(input))
+	}
+	return inbox
+}
+
+// deliver records promoted prompts and synthetic items before the next model
+// request. The id on the message marks the durable inbox item as delivered, so
+// replay never delivers it twice.
+func (a *Agent) deliver(sessionID string, items []pendingItem, agentID string, target provider.Target, turn *turnStart) bool {
+	for _, item := range items {
+		ev := deliveryEvent(item, agentID, target)
+		seq, err := a.emitSeq(sessionID, ev)
+		if err != nil {
 			a.fail(sessionID, err)
 			return false
 		}
+		if turn != nil && turn.seq == 0 {
+			turn.seq = seq
+		}
 	}
 	return true
+}
+
+// deliveryEvent builds the visible event an inbox item becomes.
+func deliveryEvent(item pendingItem, agentID string, target provider.Target) event.Event {
+	if item.kind == pendingNotice {
+		evType := event.Synthetic
+		if name, _ := item.input.Data["event"].(string); name != "" {
+			evType = event.Type(name)
+		}
+		data := map[string]any{}
+		if payload, ok := item.input.Data["data"].(map[string]any); ok {
+			for key, value := range payload {
+				data[key] = value
+			}
+		}
+		ev := event.New(evType, data)
+		if evType == event.Synthetic {
+			ev.Data["text"] = item.input.Text
+		}
+		ev.Data["inputId"] = item.input.ID
+		ev.Data["delivery"] = item.delivery
+		return ev
+	}
+	user := event.User(item.input.Text)
+	if attachments := attachmentsFrom(item.input.Data["attachments"]); len(attachments) > 0 {
+		user = event.UserWithAttachments(item.input.Text, attachments)
+	}
+	if item.input.ID != "" {
+		user.Data["inputId"] = item.input.ID
+	}
+	for key, value := range item.input.Data {
+		if key == "attachments" || value == nil {
+			continue
+		}
+		user.Data[key] = value
+	}
+	user.Data["delivery"] = item.delivery
+	user.Data["agent"] = agentID
+	user.Data["provider"] = target.ProviderID
+	user.Data["model"] = target.Model
+	return user
+}
+
+// attachmentsFrom accepts either the in-memory attachment slice or the generic
+// JSON shape a restarted core decodes the inbox payload into.
+func attachmentsFrom(value any) []model.Attachment {
+	if value == nil {
+		return nil
+	}
+	if attachments, ok := value.([]model.Attachment); ok {
+		return attachments
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var attachments []model.Attachment
+	if json.Unmarshal(raw, &attachments) != nil {
+		return nil
+	}
+	return attachments
 }
 
 // Subscribe delivers live events of a session to a caller that is not the
@@ -1237,9 +1498,15 @@ func (a *Agent) DefaultTarget() provider.Target { return a.catalog.Default() }
 func (a *Agent) Providers() []provider.ProviderInfo { return a.catalog.Providers() }
 
 // Compact summarizes the conversation on demand, even when it is under budget.
-// While a turn is running the request is queued and applied at its next safe
-// boundary, matching the reference inbox's compaction control item.
+// While a turn is running the request joins the ordered inbox as a control item;
+// an idle session compacts immediately.
 func (a *Agent) Compact(ctx context.Context, sessionID string, selection provider.Selection) error {
+	return a.CompactDelivery(ctx, sessionID, selection, "steer")
+}
+
+// CompactDelivery admits a manual compaction with its delivery mode. A steered
+// compaction owns the next boundary; a queued one waits for the idle boundary.
+func (a *Agent) CompactDelivery(ctx context.Context, sessionID string, selection provider.Selection, delivery string) error {
 	target, err := a.catalog.Resolve(selection)
 	if err != nil {
 		return err
@@ -1247,15 +1514,20 @@ func (a *Agent) Compact(ctx context.Context, sessionID string, selection provide
 	if target.Model == "" {
 		return errors.New("model is not configured")
 	}
+	delivery = normalizeDelivery(delivery)
+	if delivery != "steer" && delivery != "queue" {
+		return fmt.Errorf("delivery must be steer or queue")
+	}
+	item := session.QueuedInput{ID: a.nextID("cmp"), Kind: session.KindCompaction, Delivery: delivery}
 	a.mu.Lock()
 	if handle := a.runs[sessionID]; handle != nil && !handle.finishing {
-		if _, err := a.store.Append(sessionID, event.CompactionQueuedEvent()); err != nil {
+		if _, err := a.persistInbox(sessionID, item); err != nil {
 			a.mu.Unlock()
 			return err
 		}
 		// The request joins the ordered inbox, so it lands after the prompts
 		// that arrived before it and before those that arrived after it.
-		handle.inbox = append(handle.inbox, pendingItem{kind: pendingCompaction})
+		handle.inbox = append(handle.inbox, pendingItemFrom(item))
 		a.mu.Unlock()
 		return nil
 	}
@@ -1269,10 +1541,47 @@ func (a *Agent) Compact(ctx context.Context, sessionID string, selection provide
 	if err != nil {
 		return err
 	}
-	return a.compact(ctx, sessionID, target, current, a.keep, "manual")
+	return a.compact(ctx, sessionID, target, current, a.keep, "manual", item.ID)
 }
 
-func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Target, agentID string, maxSteps int, snap *pendingSnapshot, turnSeq int64, unattended bool) {
+// QueueMove admits a move control into the running turn. The turn stops at its
+// next safe boundary and keeps the claim, so the move can continue at the
+// destination. An idle session returns false and the caller applies it now.
+func (a *Agent) QueueMove(sessionID, target, directory, delivery string) (string, bool, error) {
+	delivery = normalizeDelivery(delivery)
+	if delivery != "steer" && delivery != "queue" {
+		return "", false, fmt.Errorf("delivery must be steer or queue")
+	}
+	item := session.QueuedInput{
+		ID:       a.nextID("mov"),
+		Kind:     session.KindMove,
+		Delivery: delivery,
+		Data:     map[string]any{"target": target, "directory": directory},
+	}
+	a.mu.Lock()
+	handle := a.runs[sessionID]
+	if handle == nil || handle.finishing {
+		a.mu.Unlock()
+		return "", false, nil
+	}
+	if _, err := a.persistInbox(sessionID, item); err != nil {
+		a.mu.Unlock()
+		return "", false, err
+	}
+	handle.inbox = append(handle.inbox, pendingItemFrom(item))
+	a.mu.Unlock()
+	return item.ID, true, nil
+}
+
+func (a *Agent) markHandoff(sessionID string) {
+	a.mu.Lock()
+	if handle := a.runs[sessionID]; handle != nil {
+		handle.handoff = true
+	}
+	a.mu.Unlock()
+}
+
+func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Target, agentID string, maxSteps int, snap *pendingSnapshot, turn *turnStart, unattended bool) {
 	// Name the conversation while the first step runs, as the reference does:
 	// the title model must not delay the turn and must survive its cancellation.
 	if a.titlesOn {
@@ -1283,25 +1592,24 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 		}()
 	}
 	var state turnState
+	idle := false
+	stepped := false
 	for step := 0; ; {
 		if ctx.Err() != nil {
 			_ = a.emit(sessionID, event.End("interrupted"))
 			return
 		}
-		// A queue-delivery prompt always waits for its own turn, so this
-		// boundary only promotes steers. continueQueue starts the queued turn
-		// after this one finishes.
-		pending := a.takeBoundary(sessionID, false)
-		if len(pending.prompts) > 0 {
-			if !a.deliver(sessionID, pending.prompts, agentID, target) {
+		// The entry and idle boundaries may take one queued item; between tool
+		// steps only steers join the turn.
+		pending := a.takeBoundary(sessionID, !stepped || idle)
+		delivered := len(pending.prompts) > 0
+		if delivered {
+			if !a.deliver(sessionID, pending.prompts, agentID, target, turn) {
 				return
 			}
 			step = 0
 			state.reset()
-		}
-		if pending.notice {
-			step = 0
-			state.reset()
+			idle = false
 		}
 		// A control item owns this boundary. It is consumed here so the loop
 		// re-examines the inbox before spending a model call, which keeps the
@@ -1313,23 +1621,54 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 					a.fail(sessionID, err)
 					return
 				}
-				if err := a.compact(ctx, sessionID, target, current, a.keep, "manual"); err != nil && !strings.Contains(err.Error(), "nothing to compact") {
+				inputID := pending.controlItem.input.ID
+				if err := a.compact(ctx, sessionID, target, current, a.keep, "manual", inputID); err != nil && !strings.Contains(err.Error(), "nothing to compact") {
 					a.fail(sessionID, err)
 					return
 				}
 				state.recovered = true
 			}
+			if pending.control == pendingMove {
+				// Stop here and keep the claim: the server applies the move and
+				// the destination resumes the same turn from the event log.
+				a.recordSnapshot(ctx, sessionID, turn.seq, snap)
+				a.markHandoff(sessionID)
+				_ = a.emit(sessionID, event.End("done"))
+				return
+			}
+			// A turn started only to run a control must not spend a model call
+			// on unchanged history once the control is done.
+			if !stepped && !a.hasPromotable(sessionID, true) {
+				a.recordSnapshot(ctx, sessionID, turn.seq, snap)
+				a.finishTitle(ctx, sessionID, target)
+				if a.continueGoal(ctx, sessionID, target) {
+					step = 0
+					state.reset()
+					idle = false
+					continue
+				}
+				_ = a.emit(sessionID, event.End("done"))
+				return
+			}
 			continue
 		}
-		if maxSteps > 0 && step >= maxSteps {
-			// A queued prompt is work for a later turn, so it must not extend
-			// this one past its step budget. takeOrFinish accounts for that.
-			if !a.takeOrFinish(sessionID) {
+		if idle {
+			a.recordSnapshot(ctx, sessionID, turn.seq, snap)
+			a.finishTitle(ctx, sessionID, target)
+			// An active goal judges the turn and may continue it. The
+			// continuation is delivered as a synthetic message, so the next
+			// loop iteration runs a fresh step budget.
+			if a.continueGoal(ctx, sessionID, target) {
 				step = 0
 				state.reset()
+				idle = false
 				continue
 			}
-			a.recordSnapshot(ctx, sessionID, turnSeq, snap)
+			_ = a.emit(sessionID, event.End("done"))
+			return
+		}
+		if maxSteps > 0 && step >= maxSteps {
+			a.recordSnapshot(ctx, sessionID, turn.seq, snap)
 			a.wrapUp(ctx, sessionID, target, agentID, maxSteps)
 			return
 		}
@@ -1348,7 +1687,7 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 		if a.due(current.Tokens, target.Window) {
 			if !target.NativeCompaction && a.usePrecomputed(sessionID, target, current) {
 				// A precomputed summary replaced the history already.
-			} else if err := a.compact(ctx, sessionID, target, current, a.keep, "auto"); err != nil {
+			} else if err := a.compact(ctx, sessionID, target, current, a.keep, "auto", ""); err != nil {
 				a.fail(sessionID, err)
 				return
 			}
@@ -1397,7 +1736,7 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 				state.overflowShrinks++
 				batch.abort()
 				keep := int(float64(a.keep) * step)
-				if compactErr := a.compact(ctx, sessionID, target, current, keep, "overflow"); compactErr == nil {
+				if compactErr := a.compact(ctx, sessionID, target, current, keep, "overflow", ""); compactErr == nil {
 					state.recovered = true
 					continue
 				}
@@ -1475,32 +1814,20 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 				a.fail(sessionID, emitErr)
 				return
 			}
+			idle = false
+			stepped = true
 			continue
 		}
 		if len(result.Calls) == 0 {
 			batch.abort()
-			// The turn would end here. A steer that arrived during the final
-			// model call keeps it alive; the loop head delivers it. A queued
-			// prompt does not, because it owns a later turn.
-			if !a.takeOrFinish(sessionID) {
-				step = 0
-				state.reset()
-				continue
-			}
-			a.recordSnapshot(ctx, sessionID, turnSeq, snap)
-			a.finishTitle(ctx, sessionID, target)
-			// An active goal judges the turn and may continue it. The
-			// continuation is delivered as a synthetic message, so the next
-			// loop iteration runs a fresh step budget.
-			if a.continueGoal(ctx, sessionID, target) {
-				step = 0
-				state.reset()
-				continue
-			}
-			_ = a.emit(sessionID, event.End("done"))
-			return
+			// The turn would go idle. The loop head delivers any pending input
+			// first and finalizes only when nothing is left, so a queued prompt
+			// continues the same turn instead of starting a new one.
+			idle = true
+			stepped = true
+			continue
 		}
-		a.recordSnapshot(ctx, sessionID, turnSeq, snap)
+		a.recordSnapshot(ctx, sessionID, turn.seq, snap)
 		if !batch.announceAndFinish() {
 			return
 		}
@@ -1511,6 +1838,7 @@ func (a *Agent) loop(ctx context.Context, sessionID string, target provider.Targ
 			return
 		}
 		step++
+		stepped = true
 		state.outputLimits = 0
 		state.streamResumes = 0
 	}

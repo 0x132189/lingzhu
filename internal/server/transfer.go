@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lingzhu/internal/event"
+	"lingzhu/internal/provider"
 	"lingzhu/internal/session"
 )
 
@@ -35,6 +36,22 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
+	}
+	// A moved or interrupted session arrives with an open claim or pending
+	// input; continue it here instead of waiting for the next process start.
+	if recovery, recoveryErr := s.store.Recovery(info.ID); recoveryErr == nil && (recovery.ClaimID != "" || len(recovery.Inputs) > 0) {
+		meta, _ := s.store.Meta(info.ID)
+		go func() {
+			stream, resumeErr := s.agentFor(info.ID).Resume(context.Background(), info.ID, recovery.ClaimID, provider.Selection{
+				Provider: meta.Provider,
+				Model:    meta.Model,
+			})
+			if resumeErr != nil {
+				return
+			}
+			for range stream {
+			}
+		}()
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"session": info})
 }
@@ -81,16 +98,25 @@ func (s *Server) reanchorSnapshots(r *http.Request, ctx context.Context, bundle 
 	}
 }
 
+// queuedMove is one move request waiting for a safe turn boundary.
+type queuedMove struct {
+	inputID   string
+	target    string
+	directory string
+}
+
 // moveSession relocates one session. A directory inside this core only updates
 // the session's placement, because the workspace tree already exists; a
 // targetUrl sends the whole bundle to another core and deletes the local copy
-// after the target imported it. While a turn is running a cross-core transfer
-// is queued as a durable control item and applied at the boundary.
+// after the target imported it. While a turn runs the request becomes a control
+// item: the turn stops at its next safe boundary and keeps its claim, so the
+// destination continues the same work instead of waiting for a full idle turn.
 func (s *Server) moveSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
 		Directory string `json:"directory"`
 		TargetURL string `json:"targetUrl"`
+		Delivery  string `json:"delivery"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -99,8 +125,21 @@ func (s *Server) moveSession(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSession(w, r, id) {
 		return
 	}
+	delivery := strings.TrimSpace(body.Delivery)
+	if delivery != "" && delivery != "steer" && delivery != "queue" {
+		writeError(w, http.StatusBadRequest, errText("delivery must be steer or queue"))
+		return
+	}
 	if directory := strings.TrimSpace(body.Directory); directory != "" {
-		s.moveSessionLocal(w, r, id, directory)
+		if s.locations == nil {
+			writeError(w, http.StatusNotImplemented, errText("this core serves a single workspace"))
+			return
+		}
+		if _, ok := s.locations.Resolve(directory); !ok {
+			writeError(w, http.StatusNotFound, errText("destination workspace is not open"))
+			return
+		}
+		s.applyOrQueueMove(w, r, id, queuedMove{directory: directory}, delivery)
 		return
 	}
 	target, err := url.Parse(strings.TrimSpace(body.TargetURL))
@@ -108,52 +147,40 @@ func (s *Server) moveSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errText("targetUrl must be an http(s) URL"))
 		return
 	}
-	if s.agentFor(id).Running(id) {
-		ev := event.MoveQueuedEvent(target.String())
-		seq, err := s.store.Append(id, ev)
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		ev.Seq = seq
-		s.agentFor(id).Publish(id, ev)
-		s.startMove(context.Background(), id, target.String())
+	s.applyOrQueueMove(w, r, id, queuedMove{target: target.String()}, delivery)
+}
+
+// applyOrQueueMove admits the move as a control item when a turn is active; an
+// idle session applies it now.
+func (s *Server) applyOrQueueMove(w http.ResponseWriter, r *http.Request, id string, move queuedMove, delivery string) {
+	moveID, queued, err := s.agentFor(id).QueueMove(id, move.target, move.directory, delivery)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if queued {
+		move.inputID = moveID
+		s.startMove(context.Background(), id, move)
 		writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "sessionId": id})
 		return
 	}
-	title, err := s.transferSession(id, target.String())
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
+	if move.target != "" {
+		title, err := s.transferSession(id, move.target)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"moved": true, "sessionId": id, "title": title})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"moved": true, "sessionId": id, "title": title})
-}
-
-// moveSessionLocal rehomes a session inside this core. The destination must be
-// open already, so the caller opens it with POST /locations first; that keeps
-// a move from silently starting a second set of tools for a typo.
-func (s *Server) moveSessionLocal(w http.ResponseWriter, r *http.Request, id, directory string) {
-	if s.locations == nil {
-		writeError(w, http.StatusNotImplemented, errText("this core serves a single workspace"))
-		return
-	}
-	destination, ok := s.locations.Resolve(directory)
+	destination, ok := s.locations.Resolve(move.directory)
 	if !ok {
 		writeError(w, http.StatusNotFound, errText("destination workspace is not open"))
 		return
 	}
-	if s.agentFor(id).Running(id) {
-		writeError(w, http.StatusConflict, errText("session is running"))
-		return
-	}
-	if err := s.store.SetDirectory(id, destination.Root()); err != nil {
+	if err := s.applyLocalMove(id, destination.Root(), ""); err != nil {
 		writeStoreError(w, err)
 		return
-	}
-	ev := event.SessionMovedEvent(destination.Root())
-	if seq, err := s.store.Append(id, ev); err == nil {
-		ev.Seq = seq
-		s.agentFor(id).Publish(id, ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"moved":     true,
@@ -162,33 +189,64 @@ func (s *Server) moveSessionLocal(w http.ResponseWriter, r *http.Request, id, di
 	})
 }
 
-// ResumeMoves re-arms queued transfers after a process restart.
+// applyLocalMove switches the session's placement and continues the open claim
+// at the destination.
+func (s *Server) applyLocalMove(id, directory, moveID string) error {
+	if err := s.store.SetDirectory(id, directory); err != nil {
+		return err
+	}
+	ev := event.SessionMovedForInput(directory, moveID)
+	if seq, err := s.store.Append(id, ev); err == nil {
+		ev.Seq = seq
+		s.agentFor(id).Publish(id, ev)
+	}
+	s.resumeMoved(id)
+	return nil
+}
+
+// resumeMoved continues the claim a move handoff left open.
+func (s *Server) resumeMoved(id string) {
+	recovery, err := s.store.Recovery(id)
+	if err != nil || recovery.ClaimID == "" {
+		return
+	}
+	meta, _ := s.store.Meta(id)
+	go func() {
+		stream, resumeErr := s.agentFor(id).Resume(context.Background(), id, recovery.ClaimID, provider.Selection{
+			Provider: meta.Provider,
+			Model:    meta.Model,
+		})
+		if resumeErr != nil {
+			return
+		}
+		for range stream {
+		}
+	}()
+}
+
+// ResumeMoves re-arms queued moves after a process restart.
 func (s *Server) ResumeMoves(ctx context.Context) {
-	sessions, err := s.store.List()
+	recoveries, err := s.store.Recoveries()
 	if err != nil {
 		return
 	}
-	for _, info := range sessions {
-		events, err := s.store.Events(info.ID)
-		if err != nil {
-			continue
-		}
-		target := ""
-		for _, ev := range events {
-			switch ev.Type {
-			case event.MoveQueued:
-				target = stringEvent(ev, "target")
-			case event.MoveFailed:
-				target = ""
+	for _, recovery := range recoveries {
+		for _, item := range recovery.Inputs {
+			if item.Kind != session.KindMove {
+				continue
 			}
-		}
-		if target != "" {
-			s.startMove(ctx, info.ID, target)
+			target, _ := item.Data["target"].(string)
+			directory, _ := item.Data["directory"].(string)
+			s.startMove(ctx, recovery.SessionID, queuedMove{
+				inputID:   item.ID,
+				target:    target,
+				directory: directory,
+			})
 		}
 	}
 }
 
-func (s *Server) startMove(ctx context.Context, id, target string) {
+func (s *Server) startMove(ctx context.Context, id string, move queuedMove) {
 	s.moveMu.Lock()
 	if s.moveWait[id] {
 		s.moveMu.Unlock()
@@ -196,7 +254,7 @@ func (s *Server) startMove(ctx context.Context, id, target string) {
 	}
 	s.moveWait[id] = true
 	s.moveMu.Unlock()
-	go s.applyQueuedMove(ctx, id, target)
+	go s.applyQueuedMove(ctx, id, move)
 }
 
 func (s *Server) finishMove(id string) {
@@ -205,19 +263,38 @@ func (s *Server) finishMove(id string) {
 	s.moveMu.Unlock()
 }
 
-func (s *Server) applyQueuedMove(ctx context.Context, id, target string) {
+func (s *Server) applyQueuedMove(ctx context.Context, id string, move queuedMove) {
 	defer s.finishMove(id)
 	wait, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	if err := s.agentFor(id).WaitIdle(wait, id); err != nil {
 		return
 	}
-	if _, err := s.transferSession(id, target); err != nil {
-		ev := event.MoveFailedEvent(err.Error())
-		if seq, appendErr := s.store.Append(id, ev); appendErr == nil {
-			ev.Seq = seq
-			s.agentFor(id).Publish(id, ev)
+	if move.target != "" {
+		if _, err := s.transferSession(id, move.target); err != nil {
+			s.failMove(id, move.inputID, err)
 		}
+		return
+	}
+	if s.locations == nil {
+		s.failMove(id, move.inputID, errText("this core serves a single workspace"))
+		return
+	}
+	destination, ok := s.locations.Resolve(move.directory)
+	if !ok {
+		s.failMove(id, move.inputID, errText("destination workspace is not open"))
+		return
+	}
+	if err := s.applyLocalMove(id, destination.Root(), move.inputID); err != nil {
+		s.failMove(id, move.inputID, err)
+	}
+}
+
+func (s *Server) failMove(id, moveID string, err error) {
+	ev := event.MoveFailedEventForInput(err.Error(), moveID)
+	if seq, appendErr := s.store.Append(id, ev); appendErr == nil {
+		ev.Seq = seq
+		s.agentFor(id).Publish(id, ev)
 	}
 }
 

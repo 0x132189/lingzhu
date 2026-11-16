@@ -208,7 +208,7 @@ func (s *waitStream) Recv() (provider.Chunk, error) {
 
 func (s *waitStream) Close() error { return nil }
 
-func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
+func TestConcurrentRunJoinsLiveTurnAndInterrupts(t *testing.T) {
 	store := testStore(t)
 	fake := &waitProvider{started: make(chan struct{}, 1)}
 	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 2})
@@ -223,10 +223,14 @@ func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
 		t.Fatal("run did not reach the provider")
 	}
 
-	if _, err := a.Run(context.Background(), "s1", "again", provider.Selection{}); !errors.Is(err, ErrBusy) {
-		t.Fatalf("want ErrBusy for a concurrent turn, got %v", err)
+	// A prompt admitted into a live turn joins it instead of failing.
+	joined, err := a.Run(context.Background(), "s1", "again", provider.Selection{})
+	if err != nil {
+		t.Fatalf("want the prompt to join the live turn, got %v", err)
 	}
-	if !a.Interrupt("s1") {
+	for range joined {
+	}
+	if !a.Interrupt("s1", false) {
 		t.Fatal("interrupt should report a running turn")
 	}
 
@@ -240,7 +244,7 @@ func TestRunRejectsConcurrentTurnAndInterrupts(t *testing.T) {
 	if a.Running("s1") {
 		t.Fatal("session should not be running after the turn ends")
 	}
-	if a.Interrupt("s1") {
+	if a.Interrupt("s1", false) {
 		t.Fatal("interrupt after the turn ends should report false")
 	}
 }
@@ -308,7 +312,7 @@ func TestWaitHonoursItsDeadline(t *testing.T) {
 	if err := a.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want deadline error, got %v", err)
 	}
-	a.Interrupt("s1")
+	a.Interrupt("s1", false)
 }
 
 func TestSystemPromptIsSentWithoutPersisting(t *testing.T) {
@@ -465,7 +469,7 @@ func TestCompactionUsesCompactionAgentModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.compact(context.Background(), "s1", catalog.Default(), current, 0, "manual"); err != nil {
+	if err := a.compact(context.Background(), "s1", catalog.Default(), current, 0, "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.requests) != 1 {
@@ -495,7 +499,7 @@ func TestCompactionFallsBackToSessionModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.compact(context.Background(), "s1", catalog.Default(), current, 0, "manual"); err != nil {
+	if err := a.compact(context.Background(), "s1", catalog.Default(), current, 0, "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := fake.requests[0].Model; got != "session-model" {

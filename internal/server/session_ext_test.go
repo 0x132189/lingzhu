@@ -62,7 +62,7 @@ func TestSessionMessageLogAndSynthetic(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(log.Events) == 0 || log.Events[0].Type != "user.message" || log.Events[0].Seq == 0 {
+	if len(log.Events) < 2 || log.Events[0].Type != "input.queued" || log.Events[1].Type != "turn.started" || log.Events[0].Seq == 0 {
 		t.Fatalf("unexpected session log: %+v", log.Events)
 	}
 

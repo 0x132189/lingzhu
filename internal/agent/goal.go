@@ -81,7 +81,7 @@ func (a *Agent) StartGoal(ctx context.Context, sessionID, objective string, sele
 		_ = a.store.SetTitle(sessionID, goal.Truncate(text, 60))
 	}
 	kickoff := goal.Render(goal.Kickoff, map[string]string{"objective": goal.Escape(text)})
-	return a.start(ctx, sessionID, kickoff, nil, "", selection, "", nil, false, false, false, nil)
+	return a.runSubmission(ctx, sessionID, Submission{Text: kickoff}, selection, false)
 }
 
 // PauseGoal stops an active goal.
@@ -115,7 +115,7 @@ func (a *Agent) ResumeGoal(ctx context.Context, sessionID string, selection prov
 		"objective": goal.Escape(state.Objective),
 		"feedback":  "The user resumed the goal.",
 	})
-	return a.start(ctx, sessionID, text, nil, "", selection, "", nil, false, false, false, nil)
+	return a.runSubmission(ctx, sessionID, Submission{Text: text}, selection, false)
 }
 
 // ClearGoal removes a goal.

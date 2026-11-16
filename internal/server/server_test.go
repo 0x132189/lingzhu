@@ -337,14 +337,15 @@ func TestQueueDeliveryStartsNewTurn(t *testing.T) {
 	}
 }
 
-func TestInputRequiresActiveRun(t *testing.T) {
+func TestInputWakesIdleSession(t *testing.T) {
 	srv := httptest.NewServer(newTestServer(t).Handler())
 	defer srv.Close()
 
 	resp := post(t, srv.URL+"/sessions/s1/input", `{"text":"late"}`)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("want 409 without a run, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202 without a run, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 }
 
 func TestGlobalEventsTagSessions(t *testing.T) {

@@ -1060,16 +1060,27 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// interrupt cancels the running turn of a session.
+// interrupt stops the running turn. resume continues pending steering input and
+// control items, while queued prompts stay parked.
 func (s *Server) interrupt(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"interrupted": s.agentFor(r.PathValue("id")).Interrupt(r.PathValue("id"))})
+	id := r.PathValue("id")
+	resume := strings.EqualFold(r.URL.Query().Get("resume"), "true") || r.URL.Query().Get("resume") == "1"
+	writeJSON(w, http.StatusOK, map[string]bool{"interrupted": s.agentFor(id).Interrupt(id, resume)})
 }
 
-// compact summarizes the session on demand.
+// compact summarizes the session on demand. While a turn runs the request is a
+// control item; delivery decides whether it preempts the next step or waits for
+// the idle boundary.
 func (s *Server) compact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	body := struct {
+		Delivery string `json:"delivery"`
+	}{}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
 	target := s.targetFor(id)
-	err := s.agentFor(id).Compact(context.Background(), id, provider.Selection{Provider: target.ProviderID, Model: target.Model})
+	err := s.agentFor(id).CompactDelivery(context.Background(), id, provider.Selection{Provider: target.ProviderID, Model: target.Model}, body.Delivery)
 	switch {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
@@ -1171,6 +1182,7 @@ func (s *Server) replyPermission(w http.ResponseWriter, r *http.Request) {
 func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Text        string             `json:"text"`
+		Delivery    string             `json:"delivery"`
 		Provider    string             `json:"provider"`
 		Model       string             `json:"model"`
 		Agent       string             `json:"agent"`
@@ -1285,7 +1297,6 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	selection = provider.Selection{Provider: target.ProviderID, Model: target.Model}
-	var events <-chan event.Event
 	extra := map[string]any{}
 	if len(body.Comments) > 0 {
 		extra["comments"] = body.Comments
@@ -1296,13 +1307,12 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	if body.Voice {
 		extra["voice"] = true
 	}
-	if len(extra) > 0 {
-		events, err = s.agentFor(id).RunWithMeta(context.Background(), id, body.Text, attachments, selection, extra)
-	} else if len(attachments) > 0 {
-		events, err = s.agentFor(id).RunWithAttachments(context.Background(), id, body.Text, attachments, selection)
-	} else {
-		events, err = s.agentFor(id).Run(context.Background(), id, body.Text, selection)
-	}
+	events, joined, err := s.agentFor(id).Submit(context.Background(), id, agent.Submission{
+		Text:        body.Text,
+		Delivery:    body.Delivery,
+		Attachments: attachments,
+		Extra:       extra,
+	}, selection)
 	if err != nil {
 		if errors.Is(err, agent.ErrBusy) {
 			writeError(w, http.StatusConflict, err)
@@ -1315,6 +1325,11 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	stream, err := newSSEWriter(w)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if joined {
+		// The text joined the live turn and will be delivered at its next
+		// boundary; the caller follows it through the event feed.
 		return
 	}
 
@@ -1334,8 +1349,8 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// input appends a prompt to the active turn. It never starts a run: clients
-// call prompt when idle, and input only while an SSE stream is already open.
+// input admits a prompt with its delivery preference. It joins a live turn or,
+// when the session is idle, starts the turn that now owns it.
 func (s *Server) input(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Text     string `json:"text"`
@@ -1359,11 +1374,7 @@ func (s *Server) input(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.agentFor(r.PathValue("id")).EnqueueDelivery(r.PathValue("id"), body.Text, delivery); err != nil {
-		if errors.Is(err, agent.ErrNotRunning) {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
-		writeError(w, http.StatusTooManyRequests, err)
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "delivery": delivery})

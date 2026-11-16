@@ -278,14 +278,17 @@ func messageFingerprint(messages []model.Message) string {
 // compact summarizes everything before the kept tail and records a checkpoint.
 // keep is the token budget of the tail left verbatim; zero keeps only the last
 // exchange.
-func (a *Agent) compact(ctx context.Context, sessionID string, target provider.Target, current session.Context, keep int, reason string) error {
+func (a *Agent) compact(ctx context.Context, sessionID string, target provider.Target, current session.Context, keep int, reason, inputID string) error {
 	a.clearPrecomputed(sessionID)
 	target = a.compactionTarget(target)
 	if target.NativeCompaction {
-		return a.compactNative(ctx, sessionID, target, current, keep, reason)
+		return a.compactNative(ctx, sessionID, target, current, keep, reason, inputID)
 	}
 	split := keepTail(current.Messages, keep)
 	if split <= 0 {
+		if inputID != "" {
+			_ = a.emit(sessionID, event.CompactionFailedForInput("compact: nothing to compact yet", inputID))
+		}
 		return errors.New("compact: nothing to compact yet")
 	}
 	if err := a.emit(sessionID, event.CompactionStartEvent()); err != nil {
@@ -294,11 +297,11 @@ func (a *Agent) compact(ctx context.Context, sessionID string, target provider.T
 
 	summary, usage, err := a.summarize(ctx, sessionID, target, current.Messages[:split])
 	if err != nil {
-		_ = a.emit(sessionID, event.CompactionFailedEvent(err.Error()))
+		_ = a.emit(sessionID, event.CompactionFailedForInput(err.Error(), inputID))
 		return fmt.Errorf("compact: %w", err)
 	}
 	if strings.TrimSpace(summary) == "" {
-		_ = a.emit(sessionID, event.CompactionFailedEvent("model returned an empty summary"))
+		_ = a.emit(sessionID, event.CompactionFailedForInput("model returned an empty summary", inputID))
 		return errors.New("compact: model returned an empty summary")
 	}
 	if !hasRequiredSections(summary) {
@@ -317,7 +320,7 @@ func (a *Agent) compact(ctx context.Context, sessionID string, target provider.T
 	}
 
 	recent := transcript(current.Messages[split:], 0)
-	compaction := event.CompactionEventWithReason(session.Checkpoint(summary, recent), split, reason)
+	compaction := event.CompactionEventForInput(session.Checkpoint(summary, recent), split, reason, inputID)
 	if usage != nil {
 		compaction.Data["usage"] = map[string]any{
 			"input":      usage.Input,
@@ -336,7 +339,7 @@ func (a *Agent) compact(ctx context.Context, sessionID string, target provider.T
 // compactNative asks the provider to replace its own context window. The
 // checkpoint text is provider-produced, so the transcript keeps it verbatim and
 // later requests replay the provider's window instead of a local summary.
-func (a *Agent) compactNative(ctx context.Context, sessionID string, target provider.Target, current session.Context, keep int, reason string) error {
+func (a *Agent) compactNative(ctx context.Context, sessionID string, target provider.Target, current session.Context, keep int, reason, inputID string) error {
 	if err := a.emit(sessionID, event.CompactionStartEvent()); err != nil {
 		return err
 	}
@@ -406,7 +409,7 @@ func (a *Agent) compactNative(ctx context.Context, sessionID string, target prov
 	if text == "" {
 		return errors.New("compact: provider returned no native checkpoint")
 	}
-	if err := a.emit(sessionID, event.CompactionEventWithReason(session.Checkpoint(text, ""), 0, reason)); err != nil {
+	if err := a.emit(sessionID, event.CompactionEventForInput(session.Checkpoint(text, ""), 0, reason, inputID)); err != nil {
 		return err
 	}
 	a.advanceInstructionEpoch(sessionID)

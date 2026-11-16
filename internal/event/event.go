@@ -35,9 +35,17 @@ const (
 	InputQueued       Type = "input.queued"
 	InputUpdated      Type = "input.updated"
 	InputCancelled    Type = "input.cancelled"
-	TurnStarted       Type = "turn.started"
-	TurnFinished      Type = "turn.finished"
-	TurnCancelled     Type = "turn.cancelled"
+	// SyntheticQueued admits synthetic input for delivery at a boundary. The
+	// visible event is published when it is delivered, so it stays outside
+	// model history until then.
+	SyntheticQueued Type = "synthetic.queued"
+	TurnStarted     Type = "turn.started"
+	TurnFinished    Type = "turn.finished"
+	TurnCancelled   Type = "turn.cancelled"
+	// TurnReleased closes a claim without cancelling pending input. A user
+	// interruption releases the turn and leaves steering and queued prompts
+	// deliverable by the next execution.
+	TurnReleased Type = "turn.released"
 	// TurnResumed records that a surviving turn claim was picked up again.
 	// Repeated resumes without a terminal mark a crash loop.
 	TurnResumed Type = "turn.resumed"
@@ -333,19 +341,56 @@ func PermissionsEvent(rules permission.Rules) Event {
 
 // MoveQueuedEvent records a transfer target waiting for the current turn.
 func MoveQueuedEvent(target string) Event {
-	return New(MoveQueued, map[string]any{"target": target})
+	return MoveQueuedItemEvent("", "steer", target, "")
+}
+
+// MoveQueuedItemEvent is MoveQueuedEvent with the inbox identity and delivery
+// mode, so the request can be cancelled or ordered like any other control.
+func MoveQueuedItemEvent(inputID, delivery, target, directory string) Event {
+	data := map[string]any{}
+	if inputID != "" {
+		data["id"] = inputID
+	}
+	if delivery != "" {
+		data["delivery"] = delivery
+	}
+	if target != "" {
+		data["target"] = target
+	}
+	if directory != "" {
+		data["directory"] = directory
+	}
+	return New(MoveQueued, data)
 }
 
 // MoveFailedEvent closes a queued move that could not be applied.
 func MoveFailedEvent(message string) Event {
-	return New(MoveFailed, map[string]any{"message": message})
+	return MoveFailedEventForInput(message, "")
+}
+
+// MoveFailedEventForInput also names the inbox item that failed.
+func MoveFailedEventForInput(message, inputID string) Event {
+	data := map[string]any{"message": message}
+	if inputID != "" {
+		data["inputId"] = inputID
+	}
+	return New(MoveFailed, data)
 }
 
 // SessionMoved records a session that changed workspace inside one core. The
 // durable event keeps the transcript truthful after a restart, and a client
 // reads it to update the project a session belongs to.
 func SessionMovedEvent(directory string) Event {
-	return New(SessionMoved, map[string]any{"directory": directory})
+	return SessionMovedForInput(directory, "")
+}
+
+// SessionMovedForInput also names the move control it consumed.
+func SessionMovedForInput(directory, inputID string) Event {
+	data := map[string]any{"directory": directory}
+	if inputID != "" {
+		data["inputId"] = inputID
+	}
+	return New(SessionMoved, data)
 }
 
 // InstructionUpdatedEvent announces changed instruction sections. It travels as
@@ -506,6 +551,16 @@ func CompactionEventWithReason(checkpoint string, covered int, reason string) Ev
 	return event
 }
 
+// CompactionEventForInput names the inbox item a manual compaction consumed, so
+// recovery can settle exactly that request.
+func CompactionEventForInput(checkpoint string, covered int, reason, inputID string) Event {
+	event := CompactionEventWithReason(checkpoint, covered, reason)
+	if inputID != "" {
+		event.Data["inputId"] = inputID
+	}
+	return event
+}
+
 func CompactionStartEvent() Event {
 	return New(CompactionStart, nil)
 }
@@ -515,10 +570,26 @@ func CompactionFailedEvent(message string) Event {
 	return New(CompactionFailed, map[string]any{"message": message})
 }
 
+// CompactionFailedForInput also names the inbox item that failed.
+func CompactionFailedForInput(message, inputID string) Event {
+	event := CompactionFailedEvent(message)
+	if inputID != "" {
+		event.Data["inputId"] = inputID
+	}
+	return event
+}
+
 // CompactionQueuedEvent records a manual compaction waiting for the turn's next
-// safe boundary.
-func CompactionQueuedEvent() Event {
-	return New(CompactionQueued, nil)
+// safe boundary. The id is the inbox identity a client cancels or changes.
+func CompactionQueuedEvent(inputID, delivery string) Event {
+	data := map[string]any{}
+	if inputID != "" {
+		data["id"] = inputID
+	}
+	if delivery != "" {
+		data["delivery"] = delivery
+	}
+	return New(CompactionQueued, data)
 }
 
 func End(reason string) Event {
@@ -560,4 +631,58 @@ func InputQueuedDeliveryEvent(inputID, text, delivery string) Event {
 		data["delivery"] = delivery
 	}
 	return New(InputQueued, data)
+}
+
+// InputQueuedPayloadEvent also stores UI-only payload such as attachments or
+// review metadata, so a recovered turn rebuilds the same user message.
+func InputQueuedPayloadEvent(inputID, text, delivery string, payload map[string]any) Event {
+	event := InputQueuedDeliveryEvent(inputID, text, delivery)
+	if len(payload) > 0 {
+		event.Data["payload"] = payload
+	}
+	return event
+}
+
+// SyntheticQueuedEvent admits one externally produced event for delivery at a
+// boundary. eventType and data are replayed on the visible event, so a
+// job.completed or schedule.fired keeps its transcript rendering.
+func SyntheticQueuedEvent(inputID, text, delivery, eventType string, data map[string]any) Event {
+	payload := map[string]any{"event": eventType}
+	if len(data) > 0 {
+		payload["data"] = data
+	}
+	return SyntheticQueuedEventWith(inputID, text, delivery, payload)
+}
+
+// SyntheticQueuedEventWith is SyntheticQueuedEvent with an explicit payload map.
+func SyntheticQueuedEventWith(inputID, text, delivery string, payload map[string]any) Event {
+	event := New(SyntheticQueued, map[string]any{"id": inputID, "text": text})
+	if delivery != "" {
+		event.Data["delivery"] = delivery
+	}
+	if len(payload) > 0 {
+		event.Data["payload"] = payload
+	}
+	return event
+}
+
+// SyntheticInputEvent is a delivered synthetic inbox item. The input id marks
+// the pending item delivered, so replay never publishes it twice.
+func SyntheticInputEvent(inputID, text, delivery string, data map[string]any) Event {
+	event := New(Synthetic, map[string]any{"text": text})
+	for key, value := range data {
+		event.Data[key] = value
+	}
+	if inputID != "" {
+		event.Data["inputId"] = inputID
+	}
+	if delivery != "" {
+		event.Data["delivery"] = delivery
+	}
+	return event
+}
+
+// TurnReleasedEvent closes a turn claim without cancelling pending input.
+func TurnReleasedEvent(turnID string) Event {
+	return New(TurnReleased, map[string]any{"id": turnID})
 }

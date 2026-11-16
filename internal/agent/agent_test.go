@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -727,10 +726,27 @@ func TestEnqueueDeliversInputAtNextBoundary(t *testing.T) {
 	}
 }
 
-func TestEnqueueRequiresRunningTurn(t *testing.T) {
-	a, _ := newTestAgent(t, &fakeProvider{})
-	if _, err := a.Enqueue("s1", "late"); !errors.Is(err, ErrNotRunning) {
-		t.Fatalf("want ErrNotRunning, got %v", err)
+// Admission wakes an idle session: nothing else would start the turn that now
+// owns the input.
+func TestEnqueueWakesIdleSession(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "answer"}}}}
+	a, store := newTestAgent(t, fake)
+	if _, err := a.Enqueue("s1", "late"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		messages, err := store.Messages("s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) == 2 && messages[0].Content == "late" && messages[1].Content == "answer" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("enqueue did not wake the session: %+v", messages)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -866,6 +882,81 @@ func TestCompactionControlKeepsLaterPromptsParked(t *testing.T) {
 	}
 }
 
+// A manual compaction admitted after earlier steers still owns the boundary:
+// the checkpoint must run first so the steer text stays verbatim after it
+// instead of being folded into the summary.
+func TestCompactionAfterSteersRunsFirst(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "checkpoint done"}},
+		{{Text: "steers done"}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if _, err := a.Enqueue("s1", "STEER_A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Compact(context.Background(), "s1", provider.Selection{}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	closed = true
+	for range stream {
+	}
+
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactionAt, steerAt := -1, -1
+	for index, ev := range events {
+		switch ev.Type {
+		case event.Compaction:
+			if compactionAt < 0 {
+				compactionAt = index
+			}
+		case event.UserMessage:
+			if text, _ := ev.Data["text"].(string); text == "STEER_A" {
+				steerAt = index
+			}
+		}
+	}
+	if compactionAt < 0 || steerAt < 0 {
+		t.Fatalf("missing events: compaction=%d steer=%d", compactionAt, steerAt)
+	}
+	if steerAt < compactionAt {
+		t.Fatalf("steer was delivered before the control: steer=%d compaction=%d", steerAt, compactionAt)
+	}
+	if len(fake.requests) < 2 {
+		t.Fatalf("want at least two model calls, got %d", len(fake.requests))
+	}
+	for _, message := range fake.requests[1].Messages {
+		if message.Role == model.RoleUser && strings.Contains(message.Content, "STEER_A") {
+			t.Fatalf("compaction folded the steer into its summary: %+v", fake.requests[1].Messages)
+		}
+	}
+}
+
 func TestQueueDeliveryStartsTurnAfterFinish(t *testing.T) {
 	started := make(chan string, 1)
 	release := make(chan struct{})
@@ -933,7 +1024,10 @@ func TestEnqueueDeliveryRejectsUnknownMode(t *testing.T) {
 	}
 }
 
-func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
+// Stopping must not strand steering input: once the interrupted turn settles,
+// the work the user asked to join it continues in a fresh turn and is delivered
+// exactly once.
+func TestInterruptResumesSteeringInput(t *testing.T) {
 	started := make(chan string, 1)
 	release := make(chan struct{})
 	defer close(release)
@@ -941,9 +1035,10 @@ func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 	registry.Add(barrierTool{name: "hold", started: started, release: release})
 	fake := &fakeProvider{chunks: [][]provider.Chunk{
 		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "steered after interrupt"}},
 	}}
 	store := testStore(t)
-	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4, Snapshots: fixedSnapshotter{id: "commit123"}})
 
 	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
 	if err != nil {
@@ -954,7 +1049,7 @@ func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("tool did not start")
 	}
-	if _, err := a.Enqueue("s1", "queued"); err != nil {
+	if _, err := a.Enqueue("s1", "STEER_A"); err != nil {
 		t.Fatal(err)
 	}
 	recoveries, err := store.Recoveries()
@@ -965,26 +1060,115 @@ func TestRunClaimsTurnAndInterruptCancelsQueue(t *testing.T) {
 		t.Fatalf("claim or queued input was not persisted: %+v", recoveries)
 	}
 
-	a.Interrupt("s1")
+	if !a.Interrupt("s1", true) {
+		t.Fatal("interrupt should report a running turn")
+	}
 	for range stream {
 	}
-	recoveries, err = store.Recoveries()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var messages []model.Message
+	for {
+		messages, err = store.Messages("s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) > 0 && messages[len(messages)-1].Role == model.RoleAssistant && messages[len(messages)-1].Content == "steered after interrupt" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("interrupt did not resume the steer: %+v", messages)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var users []string
+	for _, message := range messages {
+		if message.Role == model.RoleUser {
+			users = append(users, message.Content)
+		}
+	}
+	if len(users) != 2 || users[0] != "start" || users[1] != "STEER_A" {
+		t.Fatalf("steer should be delivered once, after the interrupted prompt: %+v", users)
+	}
+	recovery, err := store.Recovery("s1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The claim is closed, but the steer input survives: it was work the user
-	// asked to join the turn, and the turn is resuming under a new claim.
-	if len(recoveries) != 1 || recoveries[0].ClaimID != "" {
-		t.Fatalf("interrupt should close the claim: %+v", recoveries)
+	if len(recovery.Inputs) != 0 || recovery.ClaimID != "" {
+		t.Fatalf("steer should be delivered exactly once: %+v", recovery)
 	}
-	if len(recoveries[0].Inputs) != 1 || recoveries[0].Inputs[0].Text != "queued" {
-		t.Fatalf("steer input should survive an interrupt: %+v", recoveries[0])
+	// The successor turn still records its own revert point.
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	steerSeq := int64(0)
+	snapshotTurn := int64(0)
+	for _, ev := range events {
+		switch ev.Type {
+		case event.UserMessage:
+			if ev.Data["text"] == "STEER_A" {
+				steerSeq = ev.Seq
+			}
+		case event.TurnSnapshot:
+			switch seq := ev.Data["turnSeq"].(type) {
+			case int64:
+				snapshotTurn = seq
+			case float64:
+				snapshotTurn = int64(seq)
+			}
+		}
+	}
+	if steerSeq == 0 || snapshotTurn != steerSeq {
+		t.Fatalf("resumed turn should have its own snapshot: steer=%d snapshot=%d", steerSeq, snapshotTurn)
 	}
 }
 
-// Queue-delivery input is not resumed by an interrupt: it was told to wait for
-// its own turn, and that turn never started.
-func TestInterruptDropsQueuedPrompt(t *testing.T) {
+// Steering input left by an earlier turn is delivered ahead of a fresh prompt,
+// matching the idle boundary where steers take priority.
+func TestRunDeliversParkedSteerFirst(t *testing.T) {
+	store := testStore(t)
+	if _, err := store.QueueInputDelivery("s1", "inp_1", "STRANDED", "steer"); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "answer"}}}}
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "fresh prompt", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var users []string
+	for _, message := range messages {
+		if message.Role == model.RoleUser {
+			users = append(users, message.Content)
+		}
+	}
+	if len(users) != 2 || users[0] != "STRANDED" || users[1] != "fresh prompt" {
+		t.Fatalf("parked steer should lead the new prompt: %+v", users)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("want one model call, got %d", len(fake.requests))
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.Inputs) != 0 || recovery.ClaimID != "" {
+		t.Fatalf("adopted steer should be delivered exactly once: %+v", recovery)
+	}
+}
+
+// An interrupt keeps queued prompts parked: they are not deleted, but nothing
+// starts them until a later wake.
+func TestInterruptKeepsQueuedPromptParked(t *testing.T) {
 	started := make(chan string, 1)
 	release := make(chan struct{})
 	defer close(release)
@@ -1008,15 +1192,18 @@ func TestInterruptDropsQueuedPrompt(t *testing.T) {
 	if _, err := a.EnqueueDelivery("s1", "later", "queue"); err != nil {
 		t.Fatal(err)
 	}
-	a.Interrupt("s1")
+	a.Interrupt("s1", false)
 	for range stream {
 	}
-	recoveries, err := store.Recoveries()
+	recovery, err := store.Recovery("s1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recoveries) != 0 {
-		t.Fatalf("queued prompt should not survive an interrupt: %+v", recoveries)
+	if len(recovery.Inputs) != 1 || recovery.Inputs[0].Text != "later" || recovery.Inputs[0].Delivery != "queue" {
+		t.Fatalf("queued prompt should survive an interrupt: %+v", recovery)
+	}
+	if recovery.ClaimID != "" {
+		t.Fatalf("interrupt should release the claim: %+v", recovery)
 	}
 }
 
@@ -1900,4 +2087,368 @@ func TestAssistantMessageCarriesModelMetadata(t *testing.T) {
 		return
 	}
 	t.Fatal("assistant message missing")
+}
+
+// A claimless recovery with only queued prompts delivers the first one as the
+// turn's prompt instead of spending a model call on no new input.
+func TestResumeQueuedOnlyDoesNotSpendAnEmptyCall(t *testing.T) {
+	store := testStore(t)
+	if _, err := store.QueueInputDelivery("s1", "inp_1", "queued while away", "queue"); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "queued answer"}}}}
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 4})
+
+	stream, err := a.Resume(context.Background(), "s1", "", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0].Content != "queued while away" || messages[1].Content != "queued answer" {
+		t.Fatalf("unexpected resumed history: %+v", messages)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("want one model call, got %d", len(fake.requests))
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.Inputs) != 0 || recovery.ClaimID != "" {
+		t.Fatalf("queued input should be delivered exactly once: %+v", recovery)
+	}
+}
+
+// Synthetic input stays outside model history until its boundary delivery, then
+// keeps its original event type so clients render it as before.
+func TestSyntheticInputStaysPendingUntilDelivered(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "noticed"}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if err := a.Notify("s1", event.JobCompletedEvent("job_1", "go test", "done", "", "tests passed", 0)); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSynthetic := false
+	for _, item := range recovery.Inputs {
+		if item.Kind == session.KindSynthetic {
+			pendingSynthetic = true
+		}
+	}
+	if !pendingSynthetic {
+		t.Fatalf("synthetic input should be pending: %+v", recovery.Inputs)
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if ev.Type == event.JobCompleted {
+			t.Fatalf("synthetic input became visible before delivery: %+v", ev)
+		}
+	}
+
+	close(release)
+	closed = true
+	for range stream {
+	}
+	events, err = store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivered := false
+	for _, ev := range events {
+		if ev.Type == event.JobCompleted {
+			delivered = true
+			if ev.Data["inputId"] == nil || ev.Data["inputId"] == "" {
+				t.Fatalf("delivered synthetic input lost its id: %+v", ev)
+			}
+		}
+	}
+	if !delivered {
+		t.Fatal("synthetic input was never delivered")
+	}
+	recovery, err = store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.Inputs) != 0 || recovery.ClaimID != "" {
+		t.Fatalf("synthetic input should be delivered exactly once: %+v", recovery)
+	}
+}
+
+// A queued manual compaction carries an inbox identity and can be cancelled
+// before the boundary.
+func TestQueuedCompactionCarriesIdentityAndCanBeCancelled(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+		{{Text: "after"}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	if err := a.CompactDelivery(context.Background(), "s1", provider.Selection{}, "steer"); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactionID := ""
+	for _, item := range recovery.Inputs {
+		if item.Kind == session.KindCompaction {
+			compactionID = item.ID
+		}
+	}
+	if compactionID == "" {
+		t.Fatalf("queued compaction should have an inbox id: %+v", recovery.Inputs)
+	}
+	if !a.CancelInput("s1", compactionID) {
+		t.Fatal("cancelling the live compaction should succeed")
+	}
+	if _, err := store.CancelInput("s1", compactionID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	closed = true
+	for range stream {
+	}
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if ev.Type == event.Compaction {
+			t.Fatalf("cancelled compaction still ran: %+v", ev)
+		}
+	}
+}
+
+// A move control stops the turn at its next boundary and keeps the claim open
+// for the destination to continue.
+func TestMoveControlHandsOffAtTheBoundary(t *testing.T) {
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := false
+	defer func() {
+		if !closed {
+			close(release)
+		}
+	}()
+	registry := tool.NewRegistry()
+	registry.Add(barrierTool{name: "hold", started: started, release: release})
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{{ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "hold", Arguments: `{}`}}}},
+	}}
+	store := testStore(t)
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4})
+
+	stream, err := a.Run(context.Background(), "s1", "start", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool did not start")
+	}
+	moveID, queued, err := a.QueueMove("s1", "http://127.0.0.1:1", "", "steer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued || moveID == "" {
+		t.Fatalf("move should be queued: queued=%v id=%q", queued, moveID)
+	}
+	close(release)
+	closed = true
+	var last event.Event
+	for ev := range stream {
+		last = ev
+	}
+	if last.Type != event.RunEnd {
+		t.Fatalf("want a run end at the move boundary, got %+v", last)
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.ClaimID == "" {
+		t.Fatal("move handoff should keep the turn claim open")
+	}
+	found := false
+	for _, item := range recovery.Inputs {
+		if item.ID == moveID && item.Kind == session.KindMove {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("move control should stay pending until it is applied: %+v", recovery.Inputs)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("the move boundary should not spend another model call: %d", len(fake.requests))
+	}
+}
+
+// A turn started only to run a queued compaction ends after the checkpoint
+// instead of spending a model call on unchanged history.
+func TestCompactionOnlyTurnDoesNotSpendAnEmptyCall(t *testing.T) {
+	store := testStore(t)
+	if _, err := store.Append("s1", event.User("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("s1", event.Assistant("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueueItem("s1", session.QueuedInput{
+		ID:       "cmp_1",
+		Kind:     session.KindCompaction,
+		Delivery: "steer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "## Objective\n- done\n\n## Work State\n- done\n\n## Next Move\n- none\n"}}}}
+	a := New(store, testCatalog(fake, "test-model", 0), tool.NewRegistry(), nil, Options{MaxSteps: 4})
+
+	stream, err := a.Resume(context.Background(), "s1", "", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("compaction-only turn should make one summary call, got %d", len(fake.requests))
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range messages {
+		if message.Role == model.RoleAssistant && message.Content == "hi" {
+			continue
+		}
+		if message.Role == model.RoleAssistant {
+			t.Fatalf("compaction-only turn produced an extra reply: %+v", messages)
+		}
+	}
+	recovery, err := store.Recovery("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.Inputs) != 0 || recovery.ClaimID != "" {
+		t.Fatalf("compaction should settle: %+v", recovery)
+	}
+}
+
+// Admission is a live fact too, so clients update their pending projection
+// without polling for the inbox.
+func TestSubmitPublishesInboxFact(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "answer"}}}}
+	a, _ := newTestAgent(t, fake)
+	sub := a.Subscribe("s1")
+	defer sub.Close()
+	stream, _, err := a.Submit(context.Background(), "s1", Submission{Text: "hello"}, provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for range stream {
+		}
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-sub.Events():
+			if !ok {
+				t.Fatal("subscription closed")
+			}
+			if ev.Type != event.InputQueued || ev.Data["text"] != "hello" {
+				continue
+			}
+			if ev.Data["id"] == nil || ev.Data["id"] == "" {
+				t.Fatalf("queued fact lost its id: %+v", ev)
+			}
+			if ev.Seq == 0 || ev.Global == 0 {
+				t.Fatalf("queued fact is missing its stream position: %+v", ev)
+			}
+			return
+		case <-deadline:
+			t.Fatal("admission did not publish an input.queued fact")
+		}
+	}
+}
+
+// A retried prompt id reconciles instead of being admitted twice.
+func TestSubmitReconcilesByClientID(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{{Text: "answer"}}}}
+	a, store := newTestAgent(t, fake)
+	stream, joined, err := a.Submit(context.Background(), "s1", Submission{Text: "once", ID: "inp_fixed"}, provider.Selection{})
+	if err != nil || joined {
+		t.Fatalf("first submit should start a turn: joined=%v err=%v", joined, err)
+	}
+	for range stream {
+	}
+	stream, joined, err = a.Submit(context.Background(), "s1", Submission{Text: "once", ID: "inp_fixed"}, provider.Selection{})
+	if err != nil || joined || stream != nil {
+		t.Fatalf("retry should reconcile without a turn: joined=%v err=%v", joined, err)
+	}
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0].Content != "once" {
+		t.Fatalf("retry duplicated the prompt: %+v", messages)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("retry spent another model call: %d", len(fake.requests))
+	}
 }
