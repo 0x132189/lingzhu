@@ -254,6 +254,33 @@ func TestBuildMessagesRevertOnlyHidesUpToItself(t *testing.T) {
 	}
 }
 
+func TestBuildMessageRecordsKeepsHistoryBeforeCompaction(t *testing.T) {
+	checkpoint := Checkpoint("## Objective\n- resume", "[User]: latest")
+	events := []event.Event{
+		event.User("old"),
+		event.Assistant("older"),
+		event.CompactionEvent(checkpoint, 2),
+		event.User("new"),
+	}
+
+	records := BuildMessageRecords(events)
+	if len(records) != 4 {
+		t.Fatalf("transcript should keep every turn plus the checkpoint: %+v", records)
+	}
+	if records[0].Content != "old" || records[1].Content != "older" {
+		t.Fatalf("history before the checkpoint was dropped: %+v", records)
+	}
+	if !records[2].Compaction || records[2].Content != checkpoint || records[2].CompactionCovered != 2 {
+		t.Fatalf("checkpoint divider missing: %+v", records[2])
+	}
+	if records[3].Content != "new" {
+		t.Fatalf("turn after the checkpoint missing: %+v", records[3])
+	}
+	if messages := BuildMessages(events); len(messages) != 2 || messages[0].Content != checkpoint {
+		t.Fatalf("model context must restart at the checkpoint: %+v", messages)
+	}
+}
+
 func TestBuildMessagesKeepsUserAttachments(t *testing.T) {
 	events := []event.Event{
 		event.UserWithAttachments("look", []model.Attachment{

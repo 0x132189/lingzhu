@@ -54,7 +54,7 @@ func (s *Store) MessageRecords(id string) ([]MessageRecord, error) {
 }
 
 func BuildMessageRecords(events []event.Event) []MessageRecord {
-	messages, times, metas := buildWithTimes(events, nil)
+	messages, times, metas := buildWithTimes(events, nil, true)
 	records := make([]MessageRecord, len(messages))
 	for index := range messages {
 		records[index] = MessageRecord{
@@ -72,7 +72,7 @@ func BuildMessageRecords(events []event.Event) []MessageRecord {
 }
 
 func BuildMessages(events []event.Event) []model.Message {
-	messages, _, _ := buildWithTimes(events, nil)
+	messages, _, _ := buildWithTimes(events, nil, false)
 	out := make([]model.Message, 0, len(messages))
 	for _, message := range messages {
 		if message.Switch != nil || message.Failure != nil {
@@ -220,11 +220,12 @@ func shellContext(command, output string) string {
 		command + "\n\nOutput:\n" + output
 }
 
-// build reconstructs messages and reports, after each event, how many messages
-// exist. Compaction events replace everything before them with one checkpoint.
-// Switch rows are transcript-only, so the model never receives them.
+// build reconstructs the model-facing messages and reports, after each event,
+// how many messages exist. Compaction events replace everything before them
+// with one checkpoint. Switch rows are transcript-only, so the model never
+// receives them.
 func build(events []event.Event, observe func(messages int, ev event.Event)) []model.Message {
-	messages, _, _ := buildWithTimes(events, observe)
+	messages, _, _ := buildWithTimes(events, observe, false)
 	out := make([]model.Message, 0, len(messages))
 	for _, message := range messages {
 		if message.Switch != nil || message.Failure != nil {
@@ -237,8 +238,9 @@ func build(events []event.Event, observe func(messages int, ev event.Event)) []m
 
 // buildWithTimes mirrors build while recording the durable time and user-turn
 // meta of each message. Tool-call events extend the preceding assistant
-// message and add no time.
-func buildWithTimes(events []event.Event, observe func(messages int, ev event.Event)) ([]model.Message, []time.Time, []messageMeta) {
+// message and add no time. A transcript build keeps every turn and renders a
+// compaction as one divider row; only a model build restarts at its checkpoint.
+func buildWithTimes(events []event.Event, observe func(messages int, ev event.Event), transcript bool) ([]model.Message, []time.Time, []messageMeta) {
 	events = visible(events)
 	messages := make([]model.Message, 0, len(events))
 	times := make([]time.Time, 0, len(events))
@@ -259,9 +261,19 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 	for _, ev := range events {
 		switch ev.Type {
 		case event.Compaction:
-			messages = []model.Message{{Role: model.RoleUser, Content: str(ev, "checkpoint")}}
+			checkpoint := model.Message{Role: model.RoleUser, Content: str(ev, "checkpoint")}
+			meta := messageMeta{compaction: true, compactionCovered: int(eventInt(ev, "covered")), compactionReason: str(ev, "reason")}
+			if transcript {
+				// The transcript keeps every turn; the checkpoint is one divider
+				// row between them, and only the model request restarts from it.
+				messages = append(messages, checkpoint)
+				times = append(times, ev.At)
+				metas = append(metas, meta)
+				break
+			}
+			messages = []model.Message{checkpoint}
 			times = []time.Time{ev.At}
-			metas = []messageMeta{{compaction: true, compactionCovered: int(eventInt(ev, "covered")), compactionReason: str(ev, "reason")}}
+			metas = []messageMeta{meta}
 			modelMessages = 1
 		case event.UserMessage:
 			appendMessage(
