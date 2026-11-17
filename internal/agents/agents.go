@@ -50,7 +50,6 @@ type Definition struct {
 	Hidden      bool              `json:"hidden,omitempty"`
 	Disabled    bool              `json:"disabled,omitempty"`
 	Color       string            `json:"color,omitempty"`
-	Tools       map[string]bool   `json:"tools,omitempty"`
 	Options     map[string]any    `json:"options,omitempty"`
 	Headers     map[string]string `json:"headers,omitempty"`
 	Request     *RequestConfig    `json:"request,omitempty"`
@@ -98,7 +97,6 @@ type Profile struct {
 	Steps       int               `json:"-"`
 	Hidden      bool              `json:"hidden,omitempty"`
 	Color       string            `json:"color,omitempty"`
-	Tools       map[string]bool   `json:"-"`
 	Options     map[string]any    `json:"-"`
 	Headers     map[string]string `json:"-"`
 	Permissions permission.Rules  `json:"-"`
@@ -340,18 +338,8 @@ func New(cfg Config, defaultAgent string) *Registry {
 		if def.Hidden || def.HiddenSet {
 			profile.Hidden = def.Hidden
 		}
-		if len(def.Tools) > 0 {
-			if profile.Tools == nil {
-				profile.Tools = map[string]bool{}
-			}
-			for name, enabled := range def.Tools {
-				profile.Tools[name] = enabled
-			}
-		}
-		// A legacy tools entry becomes a permission rule so tool availability
-		// has one source of truth. Explicit permissions come after the derived
-		// rules, and the last matching rule wins, so permissions override tools.
-		profile.Permissions = append(profile.Permissions, ToolsRules(def.Tools)...)
+		// Explicit permissions come after the built-in rules, and the last
+		// matching rule wins.
 		profile.Permissions = append(profile.Permissions, def.Permissions...)
 		profiles[id] = profile
 	}
@@ -517,42 +505,13 @@ func NormalizeMode(value string) string {
 }
 
 // AllowsTool reports whether an agent may use a tool. Availability has one
-// source of truth: permission rules. A legacy tools entry is converted into a
-// rule when the profile is built, so this only reads the resolved rules and
-// mirrors the reference migration where write and patch share edit.
+// source of truth: permission rules, where write and patch share edit.
 func (p Profile) AllowsTool(name string) bool {
 	action := name
 	if action == "write" || action == "patch" {
 		action = "edit"
 	}
 	return !p.Permissions.WhollyDenies(action)
-}
-
-// ToolsRules converts a legacy tools map into permission rules. A false entry
-// denies the action; a true entry allows it. write and patch share edit, as in
-// the reference configuration migration.
-func ToolsRules(tools map[string]bool) permission.Rules {
-	if len(tools) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(tools))
-	for name := range tools {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	rules := make(permission.Rules, 0, len(names))
-	for _, name := range names {
-		action := name
-		if action == "write" || action == "patch" {
-			action = "edit"
-		}
-		effect := permission.Deny
-		if tools[name] {
-			effect = permission.Allow
-		}
-		rules = append(rules, permission.Rule{Action: action, Resource: "*", Effect: effect})
-	}
-	return rules
 }
 
 // NormalizeModelRef accepts the reference's "provider/model#variant" form and

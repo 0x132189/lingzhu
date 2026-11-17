@@ -146,15 +146,7 @@ func (s *Store) setup() error {
 	if err := s.backfillOrder(); err != nil {
 		return err
 	}
-
-	var version int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return err
-	}
-	if version >= 1 {
-		return nil
-	}
-	return s.migrateLegacy()
+	return nil
 }
 
 // ensureColumn adds a column to a table created by an older release. New
@@ -610,8 +602,8 @@ func (s *Store) Meta(id string) (Meta, error) {
 
 // List returns every session with durable events, sorted by ID.
 func (s *Store) List() ([]Info, error) {
-	// The first user message supplies a title for migrated rows in one query;
-	// resolving it per session turned the list into an N+1 read.
+	// The first user message supplies a title for rows without one in a single
+	// query; resolving it per session turned the list into an N+1 read.
 	rows, err := s.db.Query(
 		`SELECT s.id, s.title, s.provider, s.model, s.agent, s.parent, s.directory, s.updated,
 		        COALESCE((SELECT e.data FROM events e
@@ -814,7 +806,7 @@ func (s *Store) SetParent(id, parent string) error {
 	return err
 }
 
-// Delete removes a session, its events, and any legacy files.
+// Delete removes a session and its events.
 func (s *Store) Delete(id string) error {
 	if !validID.MatchString(id) {
 		return fmt.Errorf("invalid session id %q", id)
@@ -836,7 +828,5 @@ func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	s.forgetLocked(id)
 	s.mu.Unlock()
-	_ = os.Remove(s.legacyPath(id))
-	_ = os.Remove(s.legacyMetaPath(id))
 	return nil
 }

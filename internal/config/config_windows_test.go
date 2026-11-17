@@ -26,21 +26,6 @@ func TestDefaultShellPrefersPwsh(t *testing.T) {
 	}
 }
 
-func TestLoadReplacesLegacyDefaultShell(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	legacy := `{"shell":["powershell","-NoProfile","-NonInteractive","-Command"]}`
-	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(cfg.Shell, DefaultShell()) {
-		t.Fatalf("legacy default should follow the dynamic selection: %+v", cfg.Shell)
-	}
-}
-
 func TestLoadKeepsAnExplicitShell(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	explicit := `{"shell":["cmd.exe","/c"]}`

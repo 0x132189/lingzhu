@@ -7,8 +7,8 @@ import (
 	"lingzhu/internal/event"
 )
 
-// firstUserTitle reads only the first user message. It backs sessions migrated
-// without a stored title; normal sessions get their title when the message is
+// firstUserTitle reads only the first user message. It backs sessions that
+// have no stored title; normal sessions get their title when the message is
 // appended.
 func (s *Store) firstUserTitle(id string) string {
 	var data string

@@ -144,57 +144,24 @@ func TestExploreProfileIsReadOnly(t *testing.T) {
 	}
 }
 
-func TestAllowsToolWhitelistAndBlacklist(t *testing.T) {
-	// A legacy tools entry becomes a permission rule, so tool availability has
-	// one source of truth. A false entry only disables that action.
-	blacklist, _ := New(Config{Agents: map[string]Definition{
-		"build": {Tools: map[string]bool{"shell": false}},
+func TestAllowsToolHonorsPermissions(t *testing.T) {
+	denied, _ := New(Config{Agents: map[string]Definition{
+		"build": {Permissions: permission.Rules{{Action: "shell", Resource: "*", Effect: permission.Deny}}},
 	}}, "").Get("build")
-	if blacklist.AllowsTool("shell") || !blacklist.AllowsTool("read") {
-		t.Fatalf("a false entry should only disable that tool: %+v", blacklist.Permissions)
+	if denied.AllowsTool("shell") || !denied.AllowsTool("read") {
+		t.Fatalf("a denied action must not hide unrelated actions: %+v", denied.Permissions)
 	}
-	if blacklist.Permissions.Evaluate("shell", "*") != permission.Deny {
-		t.Fatalf("tools entry did not become a rule: %+v", blacklist.Permissions)
-	}
-	if blacklist.Permissions.WhollyDenies("read") {
-		t.Fatalf("unrelated actions must stay available: %+v", blacklist.Permissions)
-	}
-
-	allow, _ := New(Config{Agents: map[string]Definition{
-		"build": {Tools: map[string]bool{"read": true}},
-	}}, "").Get("build")
-	if !allow.AllowsTool("read") || !allow.AllowsTool("shell") {
-		t.Fatal("a true entry must not turn the map into a whitelist")
+	if denied.Permissions.WhollyDenies("read") {
+		t.Fatalf("unrelated actions must stay available: %+v", denied.Permissions)
 	}
 	if !(Profile{}).AllowsTool("anything") {
 		t.Fatal("an empty ruleset should allow everything")
 	}
 	edit, _ := New(Config{Agents: map[string]Definition{
-		"build": {Tools: map[string]bool{"edit": false}},
+		"build": {Permissions: permission.Rules{{Action: "edit", Resource: "*", Effect: permission.Deny}}},
 	}}, "").Get("build")
-	if edit.AllowsTool("patch") {
-		t.Fatal("patch follows the edit entry")
-	}
-}
-
-func TestPermissionsOverrideDerivedToolsRules(t *testing.T) {
-	registry := New(Config{Agents: map[string]Definition{
-		"build": {
-			Tools:       map[string]bool{"edit": false},
-			Permissions: permission.Rules{{Action: "edit", Resource: "docs/*", Effect: permission.Allow}},
-		},
-	}}, "")
-	profile, _ := registry.Get("build")
-	// The narrowed allow keeps the action available; the directory check still
-	// denies every other path.
-	if !profile.AllowsTool("edit") {
-		t.Fatal("a narrowed allow must keep the action available")
-	}
-	if got := profile.Permissions.Evaluate("edit", "docs/a.md"); got != permission.Allow {
-		t.Fatalf("docs should be writable, got %s", got)
-	}
-	if got := profile.Permissions.Evaluate("edit", "src/a.go"); got != permission.Deny {
-		t.Fatalf("other paths stay denied, got %s", got)
+	if edit.AllowsTool("patch") || edit.AllowsTool("write") {
+		t.Fatal("write and patch follow the edit action")
 	}
 }
 
@@ -259,23 +226,6 @@ func TestDefinitionJSON(t *testing.T) {
 	def := cfg.Agents["demo"]
 	if def.Name != "Demo" || def.Mode != "primary" || len(def.Permissions) != 1 || def.Permissions[0].Effect != permission.Deny {
 		t.Fatalf("unexpected definition: %+v", def)
-	}
-}
-
-func TestDefinitionToolsJSON(t *testing.T) {
-	var cfg Config
-	body := `{"reviewer":{"description":"reads only","tools":{"write":false,"read":true}}}`
-	if err := json.Unmarshal([]byte(body), &cfg); err != nil {
-		t.Fatal(err)
-	}
-	tools := cfg.Agents["reviewer"].Tools
-	if len(tools) != 2 || tools["write"] || !tools["read"] {
-		t.Fatalf("unexpected tools: %+v", tools)
-	}
-	registry := New(cfg, "")
-	profile, ok := registry.Get("reviewer")
-	if !ok || profile.Tools["write"] {
-		t.Fatalf("tools not resolved: %+v", profile)
 	}
 }
 

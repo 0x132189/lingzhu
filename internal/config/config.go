@@ -388,7 +388,7 @@ func applyFile(cfg *Config, file File, dir string) {
 	if file.SubagentDepth > 0 {
 		cfg.SubagentDepth = file.SubagentDepth
 	}
-	if len(file.Shell) > 0 && !legacyDefaultShell(file.Shell) {
+	if len(file.Shell) > 0 {
 		cfg.Shell = file.Shell
 	}
 	if len(file.Permission) > 0 {
@@ -546,20 +546,6 @@ func DefaultShell() []string {
 		return defaultWindowsShell()
 	}
 	return []string{"bash", "-lc"}
-}
-
-// legacyDefaultShell reports the Windows prefix older builds persisted even
-// when the user never chose a shell. It is treated as unset so the dynamic
-// selection can take over; any other explicit prefix is kept as-is.
-func legacyDefaultShell(shell []string) bool {
-	if runtime.GOOS != "windows" || len(shell) != 4 {
-		return false
-	}
-	name := strings.ToLower(filepath.Base(shell[0]))
-	return (name == "powershell" || name == "powershell.exe") &&
-		shell[1] == "-NoProfile" &&
-		shell[2] == "-NonInteractive" &&
-		shell[3] == "-Command"
 }
 
 // defaultWindowsShell mirrors the reference harness: PowerShell 7 when it is

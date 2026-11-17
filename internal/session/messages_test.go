@@ -178,18 +178,6 @@ func TestJobNoticeKeepsTheJobID(t *testing.T) {
 	}
 }
 
-func TestJobNoticeReadsLegacyExitAsCompleted(t *testing.T) {
-	// A non-zero command exit used to be stored as a failed job. The exit code
-	// is data now, so old records with an exit code read as completed.
-	events := []event.Event{
-		event.JobCompletedEvent("job_1_1", "go run ./cmd/server", "failed", "/tmp/out.log", "exit 1", 1),
-	}
-	messages := BuildMessages(events)
-	if messages[0].SyntheticState != "completed" {
-		t.Fatalf("a legacy non-zero exit must read as completed, got %q", messages[0].SyntheticState)
-	}
-}
-
 func TestSubagentNoticeKeepsTheChildID(t *testing.T) {
 	events := []event.Event{
 		event.SubagentCompletedEvent("sub_1", "explore the repo", "completed", "[Subagent finished]", ""),

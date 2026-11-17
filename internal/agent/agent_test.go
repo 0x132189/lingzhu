@@ -1844,7 +1844,7 @@ func TestAgentProfileFiltersAndBlocksDisabledTools(t *testing.T) {
 		"limited": {
 			Description: "Only edit is available",
 			Mode:        agents.ModePrimary,
-			Tools:       map[string]bool{"echo": false},
+			Permissions: permission.Rules{{Action: "echo", Resource: "*", Effect: permission.Deny}},
 		},
 	}}, "limited")
 	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{MaxSteps: 4, Agents: profiles})

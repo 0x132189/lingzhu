@@ -31,13 +31,8 @@ func Roots(configPath, workdir string) []string {
 	candidates := []string{
 		filepath.Join(configDir, "agent"),
 		filepath.Join(configDir, "agents"),
-		// Legacy layouts: a mode directory always yields primary agents.
-		filepath.Join(configDir, "mode"),
-		filepath.Join(configDir, "modes"),
 		filepath.Join(workdir, ".lingzhu", "agent"),
 		filepath.Join(workdir, ".lingzhu", "agents"),
-		filepath.Join(workdir, ".lingzhu", "mode"),
-		filepath.Join(workdir, ".lingzhu", "modes"),
 	}
 	var roots []string
 	seen := map[string]bool{}
@@ -98,16 +93,6 @@ func (c Config) Overlay(defs map[string]Definition) Config {
 		if len(def.Permissions) > 0 {
 			base.Permissions = append(base.Permissions, def.Permissions...)
 		}
-		if len(def.Tools) > 0 {
-			tools := make(map[string]bool, len(base.Tools)+len(def.Tools))
-			for name, enabled := range base.Tools {
-				tools[name] = enabled
-			}
-			for name, enabled := range def.Tools {
-				tools[name] = enabled
-			}
-			base.Tools = tools
-		}
 		out.Agents[id] = base
 	}
 	return out
@@ -115,15 +100,13 @@ func (c Config) Overlay(defs map[string]Definition) Config {
 
 // Discover reads markdown agent files from the given roots. Directories are
 // walked recursively, so a nested file becomes an id with a slash. Files
-// without frontmatter are ignored. Legacy mode/modes directories force the
-// primary mode, matching the reference migration rules.
+// without frontmatter are ignored.
 func Discover(roots []string, logf func(string, ...any)) map[string]Definition {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	out := map[string]Definition{}
 	for _, root := range roots {
-		legacyPrimary := legacyModeRoot(root)
 		var paths []string
 		err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 			if walkErr != nil {
@@ -159,9 +142,6 @@ func Discover(roots []string, logf func(string, ...any)) map[string]Definition {
 				logf("agents: skipping %s: %q is not a valid agent id", path, id)
 				continue
 			}
-			if legacyPrimary {
-				def.Mode = ModePrimary
-			}
 			out[id] = def
 		}
 	}
@@ -180,15 +160,6 @@ func validAgentID(id string) bool {
 		}
 	}
 	return true
-}
-
-// legacyModeRoot reports whether a discovery root is the V1 mode/modes folder.
-func legacyModeRoot(root string) bool {
-	switch strings.ToLower(filepath.Base(filepath.Clean(root))) {
-	case "mode", "modes":
-		return true
-	}
-	return false
 }
 
 func loadAgentFile(path string, logf func(string, ...any)) (Definition, bool) {
@@ -350,17 +321,6 @@ func definition(values map[string]frontValue, body string) Definition {
 	def.Hidden = parseBool(scalar("hidden"))
 	def.HiddenSet = values["hidden"].scalar != ""
 	def.Disabled = parseBool(scalar("disabled"))
-
-	if tools, ok := values["tools"]; ok && len(tools.mapping) > 0 {
-		def.Tools = map[string]bool{}
-		for name, value := range tools.mapping {
-			enabled, err := strconv.ParseBool(strings.TrimSpace(value))
-			if err != nil {
-				continue
-			}
-			def.Tools[name] = enabled
-		}
-	}
 
 	for _, key := range []string{"permissions", "permission"} {
 		value, ok := values[key]

@@ -21,7 +21,7 @@ func writeAgent(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-func TestDiscoverNestedAndLegacyModes(t *testing.T) {
+func TestDiscoverNestedAgents(t *testing.T) {
 	root := t.TempDir()
 	writeAgent(t, filepath.Join(root, "agent", "team"), "reviewer.md", `---
 description: Nested reviewer
@@ -29,26 +29,13 @@ variant: high
 ---
 Review.
 `)
-	writeAgent(t, filepath.Join(root, "modes"), "planner.md", `---
-description: Legacy planner
-mode: subagent
----
-Plan.
-`)
-	discovered := Discover([]string{
-		filepath.Join(root, "agent"),
-		filepath.Join(root, "modes"),
-	}, t.Logf)
+	discovered := Discover([]string{filepath.Join(root, "agent")}, t.Logf)
 	reviewer, ok := discovered["team/reviewer"]
 	if !ok {
 		t.Fatalf("nested agent missing: %+v", discovered)
 	}
 	if reviewer.Model != "" || reviewer.Variant != "high" {
 		t.Fatalf("variant was not parsed: %+v", reviewer)
-	}
-	planner, ok := discovered["planner"]
-	if !ok || planner.Mode != ModePrimary {
-		t.Fatalf("legacy mode folder should force primary: %+v", discovered)
 	}
 }
 
@@ -61,9 +48,6 @@ description: Reviews code changes
 mode: primary
 model: work/fast
 steps: 3
-tools:
-  write: false
-  read: true
 permissions:
   - action: shell
     resource: "*"
@@ -105,9 +89,6 @@ Second prompt.
 	if reviewer.Model != "work/fast" || reviewer.Steps != 3 || reviewer.System != "You review code carefully." {
 		t.Fatalf("unexpected parsed fields: %+v", reviewer)
 	}
-	if len(reviewer.Tools) != 2 || reviewer.Tools["write"] || !reviewer.Tools["read"] {
-		t.Fatalf("unexpected tools: %+v", reviewer.Tools)
-	}
 	if len(reviewer.Permissions) != 1 || reviewer.Permissions[0].Action != "shell" || reviewer.Permissions[0].Effect != permission.Deny {
 		t.Fatalf("unexpected permissions: %+v", reviewer.Permissions)
 	}
@@ -146,7 +127,6 @@ func TestOverlayMarkdownOverConfig(t *testing.T) {
 			Description: "markdown description",
 			Model:       "work/smart",
 			System:      "Review prompt.",
-			Tools:       map[string]bool{"write": false},
 			Permissions: permission.Rules{{Action: "shell", Resource: "*", Effect: permission.Deny}},
 		},
 		"newcomer": {
@@ -162,9 +142,6 @@ func TestOverlayMarkdownOverConfig(t *testing.T) {
 	if len(reviewer.Permissions) != 2 || reviewer.Permissions[1].Action != "shell" {
 		t.Fatalf("permissions not appended: %+v", reviewer.Permissions)
 	}
-	if reviewer.Tools["write"] {
-		t.Fatalf("tools not merged: %+v", reviewer.Tools)
-	}
 	if merged.Agents["build"].Model != "work/fast" {
 		t.Fatalf("unrelated config agent lost: %+v", merged.Agents["build"])
 	}
@@ -176,9 +153,6 @@ func TestOverlayMarkdownOverConfig(t *testing.T) {
 	profile, ok := registry.Get("reviewer")
 	if !ok || profile.Description != "markdown description" || profile.Model != "work/smart" {
 		t.Fatalf("registry did not resolve merged agent: %+v", profile)
-	}
-	if profile.Tools["write"] {
-		t.Fatalf("profile tools missing: %+v", profile.Tools)
 	}
 }
 
@@ -200,16 +174,11 @@ func TestRootsIncludeUserAndProjectDirectories(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	workdir := t.TempDir()
 	roots := Roots(configPath, workdir)
-	// Legacy mode directories are scanned too, so an older layout keeps working.
 	want := []string{
 		filepath.Join(filepath.Dir(configPath), "agent"),
 		filepath.Join(filepath.Dir(configPath), "agents"),
-		filepath.Join(filepath.Dir(configPath), "mode"),
-		filepath.Join(filepath.Dir(configPath), "modes"),
 		filepath.Join(workdir, ".lingzhu", "agent"),
 		filepath.Join(workdir, ".lingzhu", "agents"),
-		filepath.Join(workdir, ".lingzhu", "mode"),
-		filepath.Join(workdir, ".lingzhu", "modes"),
 	}
 	if len(roots) != len(want) {
 		t.Fatalf("unexpected roots: %v", roots)

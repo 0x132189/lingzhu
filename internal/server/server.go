@@ -400,8 +400,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /locations", s.listLocations)
 	mux.HandleFunc("POST /locations", s.openLocation)
 	mux.HandleFunc("DELETE /locations", s.closeLocation)
-	mux.HandleFunc("GET /migration", s.migrationStatus)
-	mux.HandleFunc("POST /migration", s.runMigration)
 	mux.HandleFunc("GET /usage", s.workspaceUsage)
 	mux.HandleFunc("GET /search", s.searchEvents)
 	mux.HandleFunc("GET /sessions", s.listSessions)

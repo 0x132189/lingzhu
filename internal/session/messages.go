@@ -179,15 +179,7 @@ func syntheticNotice(ev event.Event) (source, description, state, id string, sou
 		source = "shell"
 		description = str(ev, "command")
 		id = str(ev, "id")
-		status := str(ev, "status")
-		// Older records stored a command's non-zero exit as a failed job. A job
-		// that ended with an exit code is completed now, so read those records
-		// the same way and keep the failure on the command's exit code.
-		if status == "failed" && eventInt(ev, "exit_code") >= 0 {
-			state = "completed"
-			break
-		}
-		switch status {
+		switch str(ev, "status") {
 		case "failed":
 			state = "error"
 		case "cancelled":
