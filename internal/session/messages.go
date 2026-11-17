@@ -351,6 +351,7 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 				Name:        str(ev, "name"),
 				Diff:        str(ev, "diff"),
 				Failed:      eventBool(ev, "failed"),
+				Cancelled:   eventBool(ev, "cancelled"),
 				Metadata:    metadataOf(ev),
 				Attachments: attachmentsOf(ev),
 			}, ev.At, messageMeta{})

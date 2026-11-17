@@ -3,10 +3,13 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -16,6 +19,7 @@ const (
 	maxFetchBytes          = 5 * 1024 * 1024
 	defaultFetchTimeout    = 30 * time.Second
 	maxFetchTimeoutSeconds = 120
+	fetchRetryDelay        = 200 * time.Millisecond
 )
 
 // WebFetch downloads an HTTP or HTTPS resource for the model.
@@ -75,20 +79,42 @@ func (w *WebFetch) Run(ctx context.Context, call Call) (string, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", fmt.Errorf("webfetch: %w", err)
-	}
-	req.Header.Set("User-Agent", "lingzhu-agent/0.1 (+https://github.com/miebh/lingzhu)")
-	req.Header.Set("Accept", "text/markdown, text/html, text/plain;q=0.9, */*;q=0.1")
 
 	client := w.Client
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("webfetch: %w", err)
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return "", fmt.Errorf("webfetch: %w", err)
+		}
+		req.Header.Set("User-Agent", "lingzhu-agent/0.1 (+https://github.com/miebh/lingzhu)")
+		req.Header.Set("Accept", "text/markdown, text/html, text/plain;q=0.9, */*;q=0.1")
+
+		resp, err = client.Do(req)
+		if err != nil {
+			if attempt == 0 && ctx.Err() == nil && retryableFetchError(err) {
+				call.SetMetadata("retried", true)
+				if !waitFetchRetry(ctx) {
+					return "", fmt.Errorf("webfetch: %w", err)
+				}
+				continue
+			}
+			return "", fmt.Errorf("webfetch: %w", err)
+		}
+		// A server error is often transient. Retry it once; a client error is
+		// the request's own fault and would fail again unchanged.
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 && attempt == 0 {
+			_ = resp.Body.Close()
+			call.SetMetadata("retried", true)
+			if !waitFetchRetry(ctx) {
+				return "", fmt.Errorf("webfetch: %s returned %s", url, resp.Status)
+			}
+			continue
+		}
+		break
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -122,6 +148,32 @@ func (w *WebFetch) Run(ctx context.Context, call Call) (string, error) {
 		text += "\n\n(result truncated)"
 	}
 	return text, nil
+}
+
+// retryableFetchError reports transport failures that a second attempt can fix.
+// A caller deadline or a TLS/certificate failure is not retryable.
+func retryableFetchError(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return errors.Is(urlErr.Err, io.EOF) || errors.Is(urlErr.Err, io.ErrUnexpectedEOF)
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// waitFetchRetry waits before the single retry without outliving the call.
+func waitFetchRetry(ctx context.Context) bool {
+	timer := time.NewTimer(fetchRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func isHTML(contentType, body string) bool {

@@ -173,6 +173,35 @@ func TestSessionShellForeground(t *testing.T) {
 	}
 }
 
+func TestSessionShellNonZeroExit(t *testing.T) {
+	workdir := t.TempDir()
+	srv, _ := newSessionServer(t, func(s *Server) {
+		s.SetConfig(config.Config{Shell: config.DefaultShell(), Workdir: workdir})
+	})
+	seedSession(t, srv.store, "s1")
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	resp, err := http.Post(httpSrv.URL+"/sessions/s1/shell", "application/json", strings.NewReader(`{"command":"exit 3"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 for a non-zero exit, got %d", resp.StatusCode)
+	}
+	var result struct {
+		Exit     int  `json:"exit"`
+		TimedOut bool `json:"timedOut"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Exit != 3 || result.TimedOut {
+		t.Fatalf("unexpected shell result: %+v", result)
+	}
+}
+
 func TestSessionBackgroundJobs(t *testing.T) {
 	workdir := t.TempDir()
 	jobs := job.New()

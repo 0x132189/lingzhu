@@ -21,9 +21,9 @@ const createNewProcessGroup = 0x00000200
 // core exits, which is exactly when it has to keep running.
 const createBreakawayFromJob = 0x01000000
 
-// createNoWindow starts a console program without allocating a console.
-// DETACHED_PROCESS is not used: a console host such as PowerShell fails to run
-// at all without one, so the update relay would silently never start.
+// createNoWindow gives a console program an invisible console instead of a new
+// window. DETACHED_PROCESS is not used: a console host such as PowerShell fails
+// to run at all without a console, so the update relay would never start.
 const createNoWindow = 0x08000000
 
 // jobs maps a running command to the job object that owns its tree. A job is
@@ -32,12 +32,17 @@ const createNoWindow = 0x08000000
 // handles, which leaves a working directory locked for a moment.
 var jobs sync.Map
 
-// Configure gives the command its own process group.
+// Configure gives the command its own process group and an invisible console.
+// The core runs without a console, so a console child would otherwise allocate
+// a visible window of its own. CreateNoWindow still gives the child a console
+// for hosts such as PowerShell, but without a window, and its children inherit
+// that invisible console.
 func Configure(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.CreationFlags |= createNewProcessGroup
+	cmd.SysProcAttr.CreationFlags |= createNewProcessGroup | createNoWindow
+	cmd.WaitDelay = WaitDelay
 }
 
 // launchDetached starts a command that must outlive this process. It leaves the
@@ -113,6 +118,18 @@ func ConfigureDetached(cmd *exec.Cmd) {
 	}
 	cmd.SysProcAttr.CreationFlags |= createNewProcessGroup | createBreakawayFromJob | createNoWindow
 	cmd.SysProcAttr.HideWindow = true
+}
+
+// Release closes the job object after a command has exited. Closing it also
+// ends any descendant that outlived the command, so a finished tool call leaves
+// no stray process behind, and it drops the handle from the process map.
+func Release(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	if value, ok := jobs.LoadAndDelete(cmd); ok {
+		windows.CloseHandle(value.(windows.Handle))
+	}
 }
 
 // terminate has no graceful signal on Windows, so it reports false and the

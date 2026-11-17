@@ -278,22 +278,76 @@ func (m *Manager) Start(sessionID string, shell []string, dir, command string, t
 		if timer != nil {
 			timer.Stop()
 		}
+		proc.Release(cmd)
 		_ = file.Close()
-		status := Completed
-		exit := 0
-		message := ""
-		if waitErr != nil {
-			status = Failed
-			exit = -1
-			message = waitErr.Error()
-			var exitErr *exec.ExitError
-			if errors.As(waitErr, &exitErr) {
-				exit = exitErr.ExitCode()
-			}
-		}
+		status, exit, message := jobOutcome(cmd, waitErr)
 		m.Finish(item.ID, status, exit, message, tail(path, 8*1024))
 	}()
 	return item, nil
+}
+
+// Adopt registers a command that has already started as a background job. The
+// caller stops waiting and hands over the wait result; the manager owns the
+// completion notification. prepare runs before the watcher starts, so the
+// caller can copy output captured before the handoff into the job file and
+// point future writes at it.
+func (m *Manager) Adopt(sessionID, command string, cmd *exec.Cmd, wait <-chan error, prepare func(io.Writer) error) (Job, error) {
+	if cmd == nil || cmd.Process == nil {
+		return Job{}, errors.New("job: command is not running")
+	}
+	id := fmt.Sprintf("job_%d_%d", time.Now().UnixNano(), m.seq.Add(1))
+	file, err := m.createOutput(id)
+	if err != nil {
+		return Job{}, err
+	}
+	path := file.Name()
+	if prepare != nil {
+		if err := prepare(file); err != nil {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return Job{}, err
+		}
+	}
+	item := m.register(id, sessionID, command, path)
+	m.Attach(id, cmd)
+	go func() {
+		waitErr := <-wait
+		proc.Release(cmd)
+		_ = file.Close()
+		status, exit, message := jobOutcome(cmd, waitErr)
+		m.Finish(item.ID, status, exit, message, tail(path, 8*1024))
+	}()
+	return item, nil
+}
+
+// jobOutcome turns a finished process into the job's terminal fields.
+func jobOutcome(cmd *exec.Cmd, waitErr error) (Status, int, string) {
+	status := Completed
+	exit := 0
+	message := ""
+	// A detached descendant can keep the output file's inherited handles open.
+	// WaitDelay bounds that drain and reports ErrWaitDelay; the command's own
+	// exit status is still authoritative.
+	if errors.Is(waitErr, exec.ErrWaitDelay) {
+		waitErr = nil
+		if cmd.ProcessState != nil {
+			exit = cmd.ProcessState.ExitCode()
+		}
+		if exit != 0 {
+			status = Failed
+			message = fmt.Sprintf("exit status %d", exit)
+		}
+	}
+	if waitErr != nil {
+		status = Failed
+		exit = -1
+		message = waitErr.Error()
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exit = exitErr.ExitCode()
+		}
+	}
+	return status, exit, message
 }
 
 // Get returns one job snapshot.

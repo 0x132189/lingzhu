@@ -248,6 +248,15 @@ func ToolResultEvent(id, name, output string, failed bool) Event {
 	return ToolResultWithDiff(id, name, output, "", failed)
 }
 
+// ToolResultCancelled records a tool call the user interrupted. It stays a
+// failed result for the model, but clients render it as cancelled instead of
+// showing an error card.
+func ToolResultCancelled(id, name, output string, attachments []model.Attachment, metadata ...map[string]any) Event {
+	ev := ToolResultWithAttachments(id, name, output, "", true, attachments, metadata...)
+	ev.Data["cancelled"] = true
+	return ev
+}
+
 // ToolResultWithDiff records a UI-only unified diff beside the model-visible
 // output.
 func ToolResultWithDiff(id, name, output, diff string, failed bool) Event {

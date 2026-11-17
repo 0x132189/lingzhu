@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -387,7 +388,7 @@ func applyFile(cfg *Config, file File, dir string) {
 	if file.SubagentDepth > 0 {
 		cfg.SubagentDepth = file.SubagentDepth
 	}
-	if len(file.Shell) > 0 {
+	if len(file.Shell) > 0 && !legacyDefaultShell(file.Shell) {
 		cfg.Shell = file.Shell
 	}
 	if len(file.Permission) > 0 {
@@ -542,9 +543,46 @@ func SavePermission(path string, rules []Rule) error {
 // DefaultShell returns the command prefix used by the built-in shell tool.
 func DefaultShell() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"powershell", "-NoProfile", "-NonInteractive", "-Command"}
+		return defaultWindowsShell()
 	}
 	return []string{"bash", "-lc"}
+}
+
+// legacyDefaultShell reports the Windows prefix older builds persisted even
+// when the user never chose a shell. It is treated as unset so the dynamic
+// selection can take over; any other explicit prefix is kept as-is.
+func legacyDefaultShell(shell []string) bool {
+	if runtime.GOOS != "windows" || len(shell) != 4 {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(shell[0]))
+	return (name == "powershell" || name == "powershell.exe") &&
+		shell[1] == "-NoProfile" &&
+		shell[2] == "-NonInteractive" &&
+		shell[3] == "-Command"
+}
+
+// defaultWindowsShell mirrors the reference harness: PowerShell 7 when it is
+// installed, then Windows PowerShell, Git Bash, and finally the command
+// interpreter. A missing candidate is skipped instead of treated as an error.
+func defaultWindowsShell() []string {
+	if path, err := exec.LookPath("pwsh"); err == nil {
+		return []string{path, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}
+	}
+	if path, err := exec.LookPath("powershell"); err == nil {
+		return []string{path, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}
+	}
+	if git, err := exec.LookPath("git"); err == nil {
+		bash := filepath.Join(git, "..", "..", "bin", "bash.exe")
+		if info, statErr := os.Stat(bash); statErr == nil && info.Size() > 0 {
+			return []string{bash, "-c"}
+		}
+	}
+	cmd := strings.TrimSpace(os.Getenv("COMSPEC"))
+	if cmd == "" {
+		cmd = "cmd.exe"
+	}
+	return []string{cmd, "/c"}
 }
 
 // Update merges top-level fields into the config file, creating it if needed.

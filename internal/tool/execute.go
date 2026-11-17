@@ -32,7 +32,7 @@ func NewExecute(registry *Registry, dir string) *Execute {
 func (e *Execute) Name() string { return "execute" }
 
 func (e *Execute) Description() string {
-	return "Run JavaScript in Code Mode. Call other tools with tool(name, args) or tools.name(args). Return a string or JSON value, or log with console.log. The script has no filesystem, network, imports or timers: there is no setTimeout or sleep, and only the registered tools are available."
+	return "Run JavaScript in Code Mode. Call other tools with tool(name, args) or tools.name(args). Only the Code Mode tools listed in the system prompt can be called here; shell, read, write, edit, glob, grep, patch and webfetch are direct tools and must be called as top-level tool calls. Return a string or JSON value, or log with console.log. The script has no filesystem, network, imports or timers: there is no setTimeout or sleep, and only the registered tools are available."
 }
 
 func (e *Execute) Schema() json.RawMessage {
@@ -162,7 +162,7 @@ func (e *Execute) Run(ctx context.Context, call Call) (string, error) {
 				}
 				mu.Unlock()
 				if err != nil {
-					write(map[string]any{"type": "result", "id": msg.ID, "error": err.Error()})
+					write(map[string]any{"type": "result", "id": msg.ID, "error": err.Error(), "tool": true})
 					return
 				}
 				write(map[string]any{"type": "result", "id": msg.ID, "output": output})
@@ -243,12 +243,20 @@ func (e *Execute) runNested(ctx context.Context, call Call, name string, raw jso
 	if len(data) == 0 || string(data) == "null" {
 		data = json.RawMessage(`{}`)
 	}
+	if name == "execute" {
+		return "", errors.New("execute cannot call itself")
+	}
 	t, ok := e.Registry.CodemodeGet(name)
 	if e.AllTools {
 		t, ok = e.Registry.Get(name)
 	}
-	if !ok || name == "execute" {
-		return "", fmt.Errorf("execute: tool %q is not available in Code Mode", name)
+	if !ok {
+		if !e.AllTools {
+			if _, direct := e.Registry.Get(name); direct {
+				return "", fmt.Errorf("%s is a direct tool; call it as a top-level tool call, not inside execute", name)
+			}
+		}
+		return "", fmt.Errorf("unknown Code Mode tool %q; use search({ query }) to discover tools", name)
 	}
 	if err := Validate(name, t.Schema(), data); err != nil {
 		return "", err
@@ -322,6 +330,7 @@ type executeMessage struct {
 	Args   json.RawMessage `json:"args"`
 	Output string          `json:"output"`
 	Error  string          `json:"error"`
+	Tool   bool            `json:"tool"`
 	Logs   []string        `json:"logs"`
 }
 
@@ -408,7 +417,11 @@ input.on("line", (line) => {
   const waiter = waiters.get(message.id);
   if (!waiter) return;
   waiters.delete(message.id);
-  if (message.error) waiter.reject(new Error(message.error));
+  if (message.error) {
+    const failure = new Error(message.error);
+    failure.tool = message.tool === true;
+    waiter.reject(failure);
+  }
   else waiter.resolve(decorate(message.output));
 });
 (async () => {
@@ -432,7 +445,8 @@ input.on("line", (line) => {
     }
     send({ type: "done", output, logs });
   } catch (error) {
-    send({ type: "done", error: String(error && error.stack || error), logs });
+    const detail = error && error.tool ? error.message : String(error && error.stack || error);
+    send({ type: "done", error: detail, logs });
   } finally {
     input.close();
   }

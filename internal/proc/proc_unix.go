@@ -14,6 +14,7 @@ func Configure(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
+	cmd.WaitDelay = WaitDelay
 }
 
 // ConfigureDetached starts a command in a session of its own, so it survives
@@ -28,6 +29,9 @@ func ConfigureDetached(cmd *exec.Cmd) {
 // Track is a no-op: the process group created by Configure already covers the
 // tree, because a child inherits its parent's group.
 func Track(cmd *exec.Cmd) {}
+
+// Release is a no-op: Unix process groups need no handle to close after exit.
+func Release(cmd *exec.Cmd) {}
 
 // terminate asks the whole group to stop. It reports whether a signal was
 // delivered.

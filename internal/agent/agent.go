@@ -2709,6 +2709,7 @@ type toolResult struct {
 	output       string
 	diff         string
 	failed       bool
+	cancelled    bool
 	attachments  []model.Attachment
 	metadata     map[string]any
 	instructions []tool.Instruction
@@ -2857,10 +2858,15 @@ func (b *toolBatch) execute(run *toolRun, reason string) {
 			return b.agent.formatter.FormatFile(ctx, path)
 		},
 	})
-	failed := err != nil
+	cancelled := b.ctx.Err() != nil
 	if err != nil {
 		var declined *permission.DeclinedError
 		var corrected *permission.CorrectedError
+		// A denied call is a rejection, not a cancellation, even though the
+		// bare rejection also cancels the rest of the batch.
+		if errors.As(err, &declined) {
+			cancelled = false
+		}
 		switch {
 		case errors.As(err, &declined):
 			b.declined.Store(true)
@@ -2878,6 +2884,7 @@ func (b *toolBatch) execute(run *toolRun, reason string) {
 			output = strings.TrimSpace(output + "\n" + err.Error())
 		}
 	}
+	failed := err != nil || cancelled
 	// Every tool result is bounded here, so a result from an MCP server, a
 	// plugin or a subagent is capped like a built-in tool's own output. The
 	// marker names the saved file, which keeps the full text recoverable.
@@ -2896,7 +2903,7 @@ func (b *toolBatch) execute(run *toolRun, reason string) {
 		logx.Timing(started),
 		logx.Err(err),
 	)
-	b.finishRun(run, toolResult{call: run.call, output: output, diff: diff, failed: failed, attachments: attachments, metadata: metadata, instructions: instructions})
+	b.finishRun(run, toolResult{call: run.call, output: output, diff: diff, failed: failed, cancelled: cancelled, attachments: attachments, metadata: metadata, instructions: instructions})
 }
 
 // finishRun stores a result and publishes it to live subscribers immediately.
@@ -2909,6 +2916,15 @@ func (b *toolBatch) finishRun(run *toolRun, result toolResult) {
 	b.publishResult(run)
 }
 
+// resultEvent renders one tool result. A cancellation is still failed for the
+// model, but carries the flag clients use to avoid an error card.
+func resultEvent(result toolResult) event.Event {
+	if result.cancelled {
+		return event.ToolResultCancelled(result.call.ID, result.call.Name, result.output, result.attachments, result.metadata)
+	}
+	return event.ToolResultWithAttachments(result.call.ID, result.call.Name, result.output, result.diff, result.failed, result.attachments, result.metadata)
+}
+
 // publishResult sends one result to live subscribers once.
 func (b *toolBatch) publishResult(run *toolRun) {
 	b.mu.Lock()
@@ -2919,7 +2935,7 @@ func (b *toolBatch) publishResult(run *toolRun) {
 	run.liveSent = true
 	result := run.result
 	b.mu.Unlock()
-	b.agent.hub.Publish(b.sessionID, event.ToolResultWithAttachments(result.call.ID, result.call.Name, result.output, result.diff, result.failed, result.attachments, result.metadata))
+	b.agent.hub.Publish(b.sessionID, resultEvent(result))
 }
 
 // emitResult persists one result once, in completion order.
@@ -2932,7 +2948,7 @@ func (b *toolBatch) emitResult(run *toolRun) bool {
 	run.emitted = true
 	result := run.result
 	b.mu.Unlock()
-	if err := b.agent.emit(b.sessionID, event.ToolResultWithAttachments(result.call.ID, result.call.Name, result.output, result.diff, result.failed, result.attachments, result.metadata)); err != nil {
+	if err := b.agent.emit(b.sessionID, resultEvent(result)); err != nil {
 		b.agent.fail(b.sessionID, err)
 		return false
 	}
@@ -2978,6 +2994,7 @@ func (b *toolBatch) abort() {
 			run.result = toolResult{call: run.call, output: "aborted", failed: true}
 		}
 		run.result.failed = true
+		run.result.cancelled = true
 		run.completed = time.Now()
 	}
 	b.mu.Unlock()
@@ -3037,7 +3054,7 @@ func (b *toolBatch) finish() bool {
 	for _, run := range runs {
 		b.mu.Lock()
 		if run.completed.IsZero() {
-			run.result = toolResult{call: run.call, output: "aborted", failed: true}
+			run.result = toolResult{call: run.call, output: "aborted", failed: true, cancelled: true}
 			run.completed = time.Now()
 		}
 		result := run.result

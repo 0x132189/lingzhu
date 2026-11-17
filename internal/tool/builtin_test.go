@@ -203,6 +203,63 @@ func TestShellWorkdirAndTimeout(t *testing.T) {
 	}
 }
 
+func TestShellTimeoutMovesToBackground(t *testing.T) {
+	jobs := job.New()
+	defer jobs.Close()
+	done := make(chan job.Job, 1)
+	jobs.SetNotifier(func(item job.Job) { done <- item })
+	registry := NewRegistry()
+	registry.Add(&Shell{Command: platformShell(), Dir: t.TempDir(), Jobs: jobs})
+
+	out, err := run(t, registry, "shell", `{"command":`+quoteJSON(platformSleep())+`,"timeout":100}`, allowAll())
+	if err != nil {
+		t.Fatalf("timeout should hand off to the job manager: %v", err)
+	}
+	if !strings.Contains(out, "moved to the background") || !strings.Contains(out, "job ID:") {
+		t.Fatalf("background notice missing: %q", out)
+	}
+	select {
+	case item := <-done:
+		if item.Status != job.Completed || item.ExitCode != 0 {
+			t.Fatalf("unexpected adopted job: %+v", item)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("adopted command never completed")
+	}
+}
+
+func TestShellNonZeroExitIsAResult(t *testing.T) {
+	registry := NewRegistry()
+	registry.Add(&Shell{Command: platformShell(), Dir: t.TempDir()})
+
+	out, err := run(t, registry, "shell", `{"command":"exit 3"}`, allowAll())
+	if err != nil {
+		t.Fatalf("a non-zero exit must not fail the tool call: %v", err)
+	}
+	if !strings.Contains(out, "Exit code: 3") {
+		t.Fatalf("exit notice missing: %q", out)
+	}
+}
+
+func TestShellInterruptIsNotANormalExit(t *testing.T) {
+	registry := NewRegistry()
+	registry.Add(&Shell{Command: platformShell(), Dir: t.TempDir()})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	_, err := registry.Run(ctx, Call{
+		Name:      "shell",
+		Input:     []byte(`{"command":` + quoteJSON(platformSleep()) + `}`),
+		Perm:      allowAll(),
+		SessionID: "test",
+	})
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("a stopped command must read as interrupted, got %v", err)
+	}
+}
+
 func TestShellStreamsOutput(t *testing.T) {
 	registry := NewRegistry()
 	registry.Add(&Shell{Command: platformShell(), Dir: t.TempDir()})

@@ -29,6 +29,9 @@ type Message struct {
 	// Failed marks a tool result that reported an error, so history keeps the
 	// same error card the live event showed instead of grouping it away.
 	Failed bool `json:"failed,omitempty"`
+	// Cancelled marks a tool result the user interrupted. It stays failed for
+	// the model, but clients show a neutral cancelled row.
+	Cancelled bool `json:"cancelled,omitempty"`
 	// Metadata carries UI-only tool result fields such as counts and nested
 	// Code Mode calls; providers never receive it.
 	Metadata map[string]any `json:"metadata,omitempty"`

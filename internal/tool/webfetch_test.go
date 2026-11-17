@@ -32,6 +32,43 @@ func TestWebFetchRejectsNonHTTP(t *testing.T) {
 	}
 }
 
+func TestWebFetchRetriesServerErrorOnce(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte("second attempt"))
+	}))
+	defer server.Close()
+
+	out, err := run(t, mustRegistry(t), "webfetch", `{"url":`+quoteJSON(server.URL)+`}`, allowAll())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || !strings.Contains(out, "second attempt") {
+		t.Fatalf("want one retry, calls=%d output=%q", calls, out)
+	}
+}
+
+func TestWebFetchDoesNotRetryClientError(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	if _, err := run(t, mustRegistry(t), "webfetch", `{"url":`+quoteJSON(server.URL)+`}`, allowAll()); err == nil {
+		t.Fatal("want a 404 error")
+	}
+	if calls != 1 {
+		t.Fatalf("client errors must not retry, calls=%d", calls)
+	}
+}
+
 func mustRegistry(t *testing.T) *Registry {
 	t.Helper()
 	registry, _ := newRegistry(t, nil)

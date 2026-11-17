@@ -147,6 +147,9 @@ func TestCancelledTurnSettlesAStuckTool(t *testing.T) {
 			if results[0].Data["output"] != "aborted" {
 				t.Fatalf("want an aborted settlement, got %+v", results[0].Data)
 			}
+			if results[0].Data["cancelled"] != true {
+				t.Fatalf("aborted tools must be marked cancelled: %+v", results[0].Data)
+			}
 			return
 		}
 		time.Sleep(50 * time.Millisecond)

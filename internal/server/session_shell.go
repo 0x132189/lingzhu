@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"lingzhu/internal/config"
 	"lingzhu/internal/event"
 	"lingzhu/internal/job"
+	"lingzhu/internal/proc"
 	"lingzhu/internal/provider"
 )
 
@@ -139,12 +141,37 @@ func (s *Server) runSessionShell(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, shell[0], append(append([]string{}, shell[1:]...), command)...)
+	cmd := exec.Command(shell[0], append(append([]string{}, shell[1:]...), command)...)
 	cmd.Dir = dir
-	output, runErr := cmd.CombinedOutput()
+	proc.Configure(cmd)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	proc.Track(cmd)
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			proc.Stop(cmd, proc.Grace)
+		case <-stopped:
+		}
+	}()
+	runErr := cmd.Wait()
+	close(stopped)
+	proc.Release(cmd)
 	result := sessionShellResult{}
-	result.Output, result.Truncated = truncateShellOutput(output)
+	result.Output, result.Truncated = truncateShellOutput(output.Bytes())
 	result.Exit = 0
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		runErr = nil
+		if cmd.ProcessState != nil {
+			result.Exit = cmd.ProcessState.ExitCode()
+		}
+	}
 	if runErr != nil {
 		result.Exit = -1
 		var exitErr *exec.ExitError

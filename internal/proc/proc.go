@@ -12,6 +12,11 @@ import (
 // forced. It matches the reference harness.
 const Grace = 3 * time.Second
 
+// WaitDelay bounds how long Wait spends draining output pipes after the
+// process has exited. A detached descendant can inherit those pipes and keep
+// them open; without a bound the tool call would wait until its timeout.
+const WaitDelay = time.Second
+
 // Launch starts a command that must outlive this process, such as a self-update
 // installer or a relaunch helper. The command leaves the caller's job object
 // and is never tracked, so shutting the core down cannot kill it. It returns as

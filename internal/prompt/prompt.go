@@ -338,7 +338,7 @@ func mcpInstructions(c Context) string {
 	for _, server := range c.MCP {
 		lines = append(lines, `  <server name="`+server.Name+`">`)
 		if c.MCPCodemode {
-			lines = append(lines, "    Use tools from this server through `execute` under `tools[\""+server.Name+"\"]`.")
+			lines = append(lines, "    Use tools from this server through `execute`: find them with `search({ namespace: \""+server.Name+"\" })`.")
 		}
 		for _, line := range strings.Split(server.Instructions, "\n") {
 			lines = append(lines, "    "+line)

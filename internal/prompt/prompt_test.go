@@ -367,7 +367,7 @@ func TestBuildInjectsMCPInstructions(t *testing.T) {
 	for _, want := range []string{
 		"<mcp_instructions>",
 		`<server name="figma">`,
-		"Use tools from this server through `execute` under `tools[\"figma\"]`.",
+		"Use tools from this server through `execute`: find them with `search({ namespace: \"figma\" })`.",
 		"    Use the design tools.",
 		"    Prefer vectors.",
 		"</mcp_instructions>",

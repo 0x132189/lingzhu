@@ -114,14 +114,36 @@ func TestExecuteRejectsDirectOnlyTools(t *testing.T) {
 		Input:    json.RawMessage(`{"code":"return await tool('echo', { value: 'hello' })"}`),
 		Metadata: map[string]any{},
 	})
-	if err == nil || !strings.Contains(err.Error(), "not available in Code Mode") {
+	if err == nil || !strings.Contains(err.Error(), "is a direct tool") {
 		t.Fatalf("direct-only tool should be rejected: %v", err)
+	}
+	if strings.Contains(err.Error(), "at ") {
+		t.Fatalf("direct-tool error should not include a stack trace: %v", err)
+	}
+}
+
+func TestExecuteRejectsUnknownToolsWithoutStack(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not available")
+	}
+	registry := NewRegistry()
+	execute := NewExecute(registry, ".")
+	_, err := execute.Run(context.Background(), Call{
+		Name:     "execute",
+		Input:    json.RawMessage(`{"code":"return await tool('missing_tool', {})"}`),
+		Metadata: map[string]any{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unknown Code Mode tool") {
+		t.Fatalf("unknown tool should be rejected: %v", err)
+	}
+	if strings.Contains(err.Error(), "at ") {
+		t.Fatalf("unknown-tool error should not include a stack trace: %v", err)
 	}
 }
 
 func TestExecuteDescriptionMentionsNoTimers(t *testing.T) {
 	description := NewExecute(NewRegistry(), ".").Description()
-	for _, want := range []string{"setTimeout", "timers", "console.log"} {
+	for _, want := range []string{"setTimeout", "timers", "console.log", "direct tools"} {
 		if !strings.Contains(description, want) {
 			t.Fatalf("execute description missing %q: %s", want, description)
 		}

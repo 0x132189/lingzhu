@@ -49,6 +49,30 @@ func TestEditFuzzyVariantsAndCRLF(t *testing.T) {
 	}
 }
 
+func TestEditMissHintShowsClosestLines(t *testing.T) {
+	_, edit := editFixture(t, "alpha\nbeta\ngamma\ndelta\n")
+
+	_, err := runEdit(t, edit, `{"path":"a.txt","oldString":"alpha\nbetta\ngamma","newString":"alpha\nBETA\ngamma"}`)
+	if err == nil {
+		t.Fatal("want a miss")
+	}
+	if !strings.Contains(err.Error(), "The closest lines in the file:") ||
+		!strings.Contains(err.Error(), "2: beta") ||
+		!strings.Contains(err.Error(), "3: gamma") {
+		t.Fatalf("closest-line hint missing: %v", err)
+	}
+}
+
+func TestEditMissHintReportsAnAlreadyAppliedEdit(t *testing.T) {
+	line := "the quick brown fox jumps over the lazy dog"
+	_, edit := editFixture(t, line+"\n")
+
+	_, err := runEdit(t, edit, `{"path":"a.txt","oldString":"not present at all","newString":`+quoteJSON(line)+`}`)
+	if err == nil || !strings.Contains(err.Error(), "already in the file") {
+		t.Fatalf("already-applied hint missing: %v", err)
+	}
+}
+
 func TestEditTrailingWhitespaceTier(t *testing.T) {
 	dir, edit := editFixture(t, "alpha   \nbeta\n")
 

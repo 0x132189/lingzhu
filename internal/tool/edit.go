@@ -248,6 +248,96 @@ func matchView(source, oldString, newString string) ([]textMatch, func(textMatch
 	return mapped, replace
 }
 
+const (
+	hintLines      = 12
+	hintLineLength = 200
+)
+
+// editMissHint helps the next attempt after oldString misses. It first checks
+// whether the replacement is already present; otherwise it shows the numbered
+// lines closest to the search, gathered by whitespace-insensitive line votes so
+// one wrong line does not hide the rest of the match.
+func editMissHint(source, oldString, newString string) string {
+	view, _ := viewOffsets(source)
+	replacement := strings.ReplaceAll(newString, "\r\n", "\n")
+	if len([]rune(strings.TrimSpace(replacement))) >= 20 && strings.Contains(normalizeString(view), normalizeString(replacement)) {
+		return " newString is already in the file, so this edit may already be applied."
+	}
+
+	key := func(line string) string {
+		return strings.Join(strings.Fields(normalizeString(line)), " ")
+	}
+	distinct := func(line string) bool {
+		for _, value := range line {
+			if unicode.IsLetter(value) || unicode.IsNumber(value) {
+				return true
+			}
+		}
+		return false
+	}
+
+	lines := strings.Split(view, "\n")
+	search := strings.Split(strings.ReplaceAll(oldString, "\r\n", "\n"), "\n")
+	positions := map[string][]int{}
+	for index, line := range lines {
+		value := key(line)
+		if value == "" || !distinct(value) {
+			continue
+		}
+		positions[value] = append(positions[value], index)
+	}
+	votes := map[int]int{}
+	wanted := 0
+	for offset, line := range search {
+		value := key(line)
+		if value == "" || !distinct(value) {
+			continue
+		}
+		wanted++
+		for _, index := range positions[value] {
+			votes[index-offset]++
+		}
+	}
+	start, count := 0, 0
+	for index, value := range votes {
+		if value > count {
+			start, count = index, value
+		}
+	}
+	if count == 0 || count*2 < wanted {
+		return ""
+	}
+
+	var matched []int
+	for offset, line := range search {
+		value := key(line)
+		index := start + offset
+		if value == "" || index < 0 || index >= len(lines) || key(lines[index]) != value {
+			continue
+		}
+		matched = append(matched, index)
+	}
+	if len(matched) == 0 {
+		return ""
+	}
+	from := matched[0]
+	to := matched[len(matched)-1] + 1
+	if to > from+hintLines {
+		to = from + hintLines
+	}
+
+	var b strings.Builder
+	b.WriteString("\n\nThe closest lines in the file:")
+	for index := from; index < to; index++ {
+		line := []rune(lines[index])
+		if len(line) > hintLineLength {
+			line = append(line[:hintLineLength], '…')
+		}
+		fmt.Fprintf(&b, "\n%d: %s", index+1, string(line))
+	}
+	return b.String()
+}
+
 func applyMatches(source string, matches []textMatch, replaceAll bool, replace func(textMatch) string) (string, int) {
 	selected := matches
 	if !replaceAll {
@@ -311,11 +401,7 @@ func (e *Edit) Run(ctx context.Context, call Call) (string, error) {
 	}
 
 	if len(matches) == 0 {
-		hint := ""
-		replacement := strings.ReplaceAll(strings.TrimSpace(args.NewString), "\r\n", "\n")
-		if len([]rune(replacement)) >= 20 && strings.Contains(normalizeString(strings.ReplaceAll(source, "\r\n", "\n")), normalizeString(replacement)) {
-			hint = " newString is already in the file, so this edit may already be applied."
-		}
+		hint := editMissHint(source, args.OldString, args.NewString)
 		return "", fmt.Errorf("edit: Could not find oldString in %s. It must match exactly, including whitespace and indentation.%s", relPath(e.Dir, path), hint)
 	}
 	if len(matches) > 1 && !args.ReplaceAll {

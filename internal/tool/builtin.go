@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -47,6 +48,7 @@ type shellStream struct {
 	all     bytes.Buffer
 	pending bytes.Buffer
 	emit    func(string)
+	sink    io.Writer
 	last    time.Time
 	sent    int
 }
@@ -63,6 +65,9 @@ func (s *shellStream) append(p []byte) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.all.Write(p)
+	if s.sink != nil {
+		_, _ = s.sink.Write(p)
+	}
 	if s.emit == nil || s.sent >= maxStreamBytes {
 		return ""
 	}
@@ -106,6 +111,19 @@ func (s *shellStream) snapshot() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.all.String()
+}
+
+// adopt copies the output captured so far into w and sends every later chunk
+// there too. The lock keeps a chunk from being duplicated or lost during the
+// handoff to a background job.
+func (s *shellStream) adopt(w io.Writer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := w.Write(s.all.Bytes()); err != nil {
+		return err
+	}
+	s.sink = w
+	return nil
 }
 
 // Builtins returns the built-in tools: shell, read, write, edit, glob, grep,
@@ -241,39 +259,101 @@ func (s *Shell) Run(ctx context.Context, call Call) (string, error) {
 		return "", fmt.Errorf("shell: %w", err)
 	}
 	proc.Track(cmd)
-	stopped := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			proc.Stop(cmd, proc.Grace)
-		case <-stopped:
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	var runErr error
+	finished := false
+	select {
+	case runErr = <-waitCh:
+		finished = true
+	case <-ctx.Done():
+		// A foreground timeout hands the still-running command to the job
+		// manager instead of discarding its work. A user interrupt still
+		// stops the tree and settles the call as interrupted.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) && s.Jobs != nil {
+			select {
+			case runErr = <-waitCh:
+				finished = true
+			default:
+				item, err := s.Jobs.Adopt(call.SessionID, command, cmd, waitCh, stream.adopt)
+				if err == nil {
+					stream.finish()
+					preview, file := boundedTail(stream.snapshot())
+					if file != "" {
+						call.SetMetadata("truncated", true)
+						call.SetMetadata("outputFile", file)
+					}
+					call.SetMetadata("timeout", true)
+					call.SetMetadata("shellID", item.ID)
+					call.SetMetadata("background", true)
+					notice := fmt.Sprintf("Command exceeded timeout of %d ms and moved to the background (job ID: %s).\nOutput is streaming to: %s\nYou will be notified automatically when it completes. Do not poll for completion; continue with unrelated work or end your response.", timeout.Milliseconds(), item.ID, item.File)
+					return withNotice(preview, notice), nil
+				}
+			}
 		}
-	}()
-	runErr := cmd.Wait()
-	close(stopped)
+		if !finished {
+			proc.Stop(cmd, proc.Grace)
+			runErr = <-waitCh
+		}
+	}
+	// The adopted-timeout path returned above; this call owns the job handle.
+	proc.Release(cmd)
 	stream.finish()
 	preview, file := boundedTail(stream.snapshot())
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		call.SetMetadata("timeout", true)
 		message := fmt.Sprintf("Command exceeded timeout of %d ms. Retry with a larger timeout if the command is expected to take longer.", timeout.Milliseconds())
-		return preview + "\n\n" + message, fmt.Errorf("shell: timeout after %s", timeout)
+		return withNotice(preview, message), fmt.Errorf("shell: timeout after %s", timeout)
+	}
+	// A stopped command exits with a non-zero status, which looks like an
+	// ordinary command failure. The interrupted turn must win over that.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return preview, fmt.Errorf("shell: interrupted")
 	}
 	if file != "" {
 		call.SetMetadata("truncated", true)
 		call.SetMetadata("outputFile", file)
 		preview += "\n\n(full output: " + file + ")"
 	}
-	if runErr != nil {
-		code := -1
-		var exit *exec.ExitError
-		if errors.As(runErr, &exit) {
-			code = exit.ExitCode()
+	// A detached descendant can keep the output pipe open after the command
+	// itself has exited. WaitDelay bounds that drain, and ErrWaitDelay only
+	// means the last bytes may be missing; the command result is still valid.
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		code := 0
+		if cmd.ProcessState != nil {
+			code = cmd.ProcessState.ExitCode()
 		}
 		call.SetMetadata("exit", code)
+		if code != 0 {
+			preview = withExitCode(preview, code)
+		}
+		return preview, nil
+	}
+	if runErr != nil {
+		var exit *exec.ExitError
+		if errors.As(runErr, &exit) {
+			code := exit.ExitCode()
+			call.SetMetadata("exit", code)
+			return withExitCode(preview, code), nil
+		}
+		call.SetMetadata("exit", -1)
 		return preview, fmt.Errorf("shell: %w", runErr)
 	}
 	call.SetMetadata("exit", 0)
 	return preview, nil
+}
+
+// withExitCode appends the model-facing exit notice to a command's output.
+func withExitCode(output string, code int) string {
+	return withNotice(output, fmt.Sprintf("Exit code: %d", code))
+}
+
+// withNotice appends a model-facing note to command output.
+func withNotice(output, notice string) string {
+	if strings.TrimSpace(output) == "" {
+		return notice
+	}
+	return strings.TrimRight(output, "\n") + "\n\n" + notice
 }
 
 // runBackground starts a command that outlives the current turn. Completion is
