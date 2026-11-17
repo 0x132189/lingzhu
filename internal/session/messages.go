@@ -172,14 +172,22 @@ func stringSlice(ev event.Event, key string) []string {
 // notice row. The core's stored text stays model-facing. id identifies the job
 // or child session behind the notice, so a transcript can tell two background
 // reports apart instead of collapsing them into one row.
-func syntheticNotice(ev event.Event) (source, description, state, id string) {
+func syntheticNotice(ev event.Event) (source, description, state, id string, sources []string) {
 	state = "completed"
 	switch ev.Type {
 	case event.JobCompleted:
 		source = "shell"
 		description = str(ev, "command")
 		id = str(ev, "id")
-		switch str(ev, "status") {
+		status := str(ev, "status")
+		// Older records stored a command's non-zero exit as a failed job. A job
+		// that ended with an exit code is completed now, so read those records
+		// the same way and keep the failure on the command's exit code.
+		if status == "failed" && eventInt(ev, "exit_code") >= 0 {
+			state = "completed"
+			break
+		}
+		switch status {
 		case "failed":
 			state = "error"
 		case "cancelled":
@@ -210,8 +218,13 @@ func syntheticNotice(ev event.Event) (source, description, state, id string) {
 		}
 		description = str(ev, "description")
 		id = str(ev, "id")
+		sources = stringSlice(ev, "sources")
+		// An instruction update is informational, not a completed task.
+		if source == "instructions" {
+			state = ""
+		}
 	}
-	return source, description, state, id
+	return source, description, state, id, sources
 }
 
 // shellContext is the user-turn text a shell result contributes to the model.
@@ -242,6 +255,15 @@ func build(events []event.Event, observe func(messages int, ev event.Event)) []m
 // compaction as one divider row; only a model build restarts at its checkpoint.
 func buildWithTimes(events []event.Event, observe func(messages int, ev event.Event), transcript bool) ([]model.Message, []time.Time, []messageMeta) {
 	events = visible(events)
+	// Instruction updates before the latest checkpoint are stale: the checkpoint
+	// reset the instruction baseline, so the transcript stops showing them while
+	// it keeps the rest of the earlier turns.
+	var epoch int64
+	for _, ev := range events {
+		if ev.Type == event.Compaction {
+			epoch = ev.Seq
+		}
+	}
 	messages := make([]model.Message, 0, len(events))
 	times := make([]time.Time, 0, len(events))
 	metas := make([]messageMeta, 0, len(events))
@@ -259,6 +281,9 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 		}
 	}
 	for _, ev := range events {
+		if transcript && ev.Seq < epoch && ev.Type == event.Synthetic && str(ev, "source") == "instructions" {
+			continue
+		}
 		switch ev.Type {
 		case event.Compaction:
 			checkpoint := model.Message{Role: model.RoleUser, Content: str(ev, "checkpoint")}
@@ -290,7 +315,7 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 			)
 		case event.JobCompleted, event.SubagentCompleted, event.ScheduleFired, event.Synthetic, event.FormReplied:
 			if notice := str(ev, "text"); notice != "" {
-				source, description, state, id := syntheticNotice(ev)
+				source, description, state, id, sources := syntheticNotice(ev)
 				appendMessage(model.Message{
 					Role:                 model.RoleUser,
 					Content:              notice,
@@ -299,6 +324,7 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 					SyntheticDescription: description,
 					SyntheticState:       state,
 					SyntheticID:          id,
+					SyntheticSources:     sources,
 					SyntheticPaths:       stringSlice(ev, "paths"),
 				}, ev.At, messageMeta{})
 			}

@@ -136,7 +136,7 @@ func TestBuildMessagesMergesStreamedAssistantAfterEarlyToolCall(t *testing.T) {
 
 func TestInstructionUpdatePersistsAsSyntheticNotice(t *testing.T) {
 	events := []event.Event{
-		event.InstructionUpdatedEvent("The harness instructions changed."),
+		event.InstructionUpdatedEvent("The harness instructions changed.", []string{"agents", "environment"}),
 	}
 	messages := BuildMessages(events)
 	if len(messages) != 1 {
@@ -144,6 +144,12 @@ func TestInstructionUpdatePersistsAsSyntheticNotice(t *testing.T) {
 	}
 	if messages[0].SyntheticSource != "instructions" || messages[0].SyntheticDescription != "Instructions updated" {
 		t.Fatalf("instruction notice metadata missing: %+v", messages[0])
+	}
+	if messages[0].SyntheticState != "" {
+		t.Fatalf("an instruction update must not carry a completion state, got %q", messages[0].SyntheticState)
+	}
+	if len(messages[0].SyntheticSources) != 2 || messages[0].SyntheticSources[0] != "agents" {
+		t.Fatalf("instruction sources missing: %+v", messages[0].SyntheticSources)
 	}
 	if !strings.Contains(messages[0].Content, "harness instructions changed") {
 		t.Fatalf("model-facing text missing: %+v", messages[0])
@@ -155,7 +161,7 @@ func TestJobNoticeKeepsTheJobID(t *testing.T) {
 	// report collapses onto one row key and the rows stack on each other.
 	events := []event.Event{
 		event.JobCompletedEvent("job_1_1", "npm run dev", "completed", "/tmp/out.log", "[Background shell completed]", 0),
-		event.JobCompletedEvent("job_1_2", "npm test", "failed", "/tmp/out2.log", "[Background shell completed]", 1),
+		event.JobCompletedEvent("job_1_2", "npm test", "failed", "/tmp/out2.log", "[Background shell failed]", -1),
 	}
 	messages := BuildMessages(events)
 	if len(messages) != 2 {
@@ -168,7 +174,19 @@ func TestJobNoticeKeepsTheJobID(t *testing.T) {
 		t.Fatalf("each report keeps its own id, got %q", messages[1].SyntheticID)
 	}
 	if messages[1].SyntheticState != "error" {
-		t.Fatalf("a non-zero exit must read as an error, got %q", messages[1].SyntheticState)
+		t.Fatalf("a failed job must read as an error, got %q", messages[1].SyntheticState)
+	}
+}
+
+func TestJobNoticeReadsLegacyExitAsCompleted(t *testing.T) {
+	// A non-zero command exit used to be stored as a failed job. The exit code
+	// is data now, so old records with an exit code read as completed.
+	events := []event.Event{
+		event.JobCompletedEvent("job_1_1", "go run ./cmd/server", "failed", "/tmp/out.log", "exit 1", 1),
+	}
+	messages := BuildMessages(events)
+	if messages[0].SyntheticState != "completed" {
+		t.Fatalf("a legacy non-zero exit must read as completed, got %q", messages[0].SyntheticState)
 	}
 }
 
@@ -237,6 +255,32 @@ func TestBuildMessagesHidesStagedRevert(t *testing.T) {
 	}
 	if messages[3].Content != "second answer" || messages[4].Content != "new branch" {
 		t.Fatalf("unexpected reapplied order: %+v", messages)
+	}
+}
+
+func TestBuildMessageRecordsDropsInstructionUpdatesBeforeCheckpoint(t *testing.T) {
+	checkpoint := event.CompactionEvent(Checkpoint("## Objective\n- resume", "[User]: latest"), 1)
+	checkpoint.Seq = 5
+	before := event.InstructionUpdatedEvent("The harness instructions changed.", []string{"agents"})
+	before.Seq = 1
+	after := event.InstructionUpdatedEvent("The harness instructions changed.", []string{"environment"})
+	after.Seq = 6
+	events := []event.Event{
+		before,
+		event.User("old"),
+		checkpoint,
+		after,
+	}
+
+	records := BuildMessageRecords(events)
+	if len(records) != 3 {
+		t.Fatalf("only stale instruction updates should disappear: %+v", records)
+	}
+	if records[0].Content != "old" || !records[1].Compaction {
+		t.Fatalf("history around the checkpoint was changed: %+v", records)
+	}
+	if records[2].SyntheticSource != "instructions" || len(records[2].SyntheticSources) != 1 {
+		t.Fatalf("the update after the checkpoint must stay: %+v", records[2])
 	}
 }
 

@@ -48,7 +48,14 @@ type Job struct {
 // Notification renders the synthetic message handed back to the model.
 func (j Job) Notification() string {
 	var b strings.Builder
-	b.WriteString("[Background shell completed]\n")
+	switch j.Status {
+	case Cancelled:
+		b.WriteString("[Background shell cancelled]\n")
+	case Failed:
+		b.WriteString("[Background shell failed]\n")
+	default:
+		b.WriteString("[Background shell completed]\n")
+	}
 	b.WriteString("Job: " + j.ID + "\n")
 	b.WriteString("Command: " + j.Command + "\n")
 	if j.ExitCode >= 0 {
@@ -105,8 +112,8 @@ func Open(dir string) (*Manager, error) {
 }
 
 // load reads every recorded job. A job still marked running belongs to a
-// process that is gone, so it is closed as interrupted rather than reported as
-// running forever.
+// process that is gone; it did not fail, so it is closed as cancelled with the
+// restart as the reason instead of reporting running forever.
 func (m *Manager) load() {
 	entries, err := os.ReadDir(m.dir)
 	if err != nil {
@@ -125,8 +132,8 @@ func (m *Manager) load() {
 			continue
 		}
 		if item.Status == Running {
-			item.Status = Failed
-			item.Error = "interrupted by a restart"
+			item.Status = Cancelled
+			item.Error = "cancelled by a restart"
 			item.ExitCode = -1
 			if item.Finished.IsZero() {
 				item.Finished = time.Now().UTC()
@@ -320,34 +327,29 @@ func (m *Manager) Adopt(sessionID, command string, cmd *exec.Cmd, wait <-chan er
 	return item, nil
 }
 
-// jobOutcome turns a finished process into the job's terminal fields.
+// jobOutcome turns a finished process into the job's terminal fields. A
+// command's exit code is data, not a job failure: the job completed as long as
+// its process could be observed to exit. Only a wait failure that is not the
+// process's own exit fails the job.
 func jobOutcome(cmd *exec.Cmd, waitErr error) (Status, int, string) {
-	status := Completed
-	exit := 0
-	message := ""
 	// A detached descendant can keep the output file's inherited handles open.
 	// WaitDelay bounds that drain and reports ErrWaitDelay; the command's own
 	// exit status is still authoritative.
 	if errors.Is(waitErr, exec.ErrWaitDelay) {
 		waitErr = nil
-		if cmd.ProcessState != nil {
-			exit = cmd.ProcessState.ExitCode()
-		}
-		if exit != 0 {
-			status = Failed
-			message = fmt.Sprintf("exit status %d", exit)
-		}
 	}
 	if waitErr != nil {
-		status = Failed
-		exit = -1
-		message = waitErr.Error()
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
-			exit = exitErr.ExitCode()
+			return Completed, exitErr.ExitCode(), ""
 		}
+		return Failed, -1, waitErr.Error()
 	}
-	return status, exit, message
+	exit := 0
+	if cmd.ProcessState != nil {
+		exit = cmd.ProcessState.ExitCode()
+	}
+	return Completed, exit, ""
 }
 
 // Get returns one job snapshot.
@@ -374,8 +376,9 @@ func (m *Manager) Output(id string, limit int64) (string, bool, bool) {
 	return tail(item.File, limit), item.Status == Running, true
 }
 
-// Cancel stops one running job and marks it cancelled without notifying the
-// session, because a manual cancellation is already visible to the user.
+// Cancel stops one running job and reports it as cancelled, so a background
+// command the user stopped settles like any other terminal outcome instead of
+// reading as a failure.
 func (m *Manager) Cancel(id string) (Job, error) {
 	m.mu.Lock()
 	item, ok := m.jobs[id]
@@ -392,12 +395,17 @@ func (m *Manager) Cancel(id string) (Job, error) {
 	item.Status = Cancelled
 	item.ExitCode = -1
 	item.Error = "cancelled"
+	item.Tail = tail(item.File, 8*1024)
 	item.Finished = time.Now().UTC()
 	m.persistLocked(item)
 	snapshot := *item
+	notify := m.notify
 	m.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		proc.Stop(cmd, proc.Grace)
+	}
+	if notify != nil {
+		go notify(snapshot)
 	}
 	return snapshot, nil
 }

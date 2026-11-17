@@ -50,6 +50,9 @@ type Message struct {
 	// SyntheticID is the job or child session the notice reports on, so a
 	// transcript can tell two background reports apart.
 	SyntheticID string `json:"syntheticId,omitempty"`
+	// SyntheticSources names the instruction sections an update changed, so
+	// history can say what changed instead of only that something did.
+	SyntheticSources []string `json:"syntheticSources,omitempty"`
 	// SyntheticPaths lists instruction files a synthetic turn loaded, so history
 	// draws the same "Loaded ..." row the live event showed.
 	SyntheticPaths []string `json:"syntheticPaths,omitempty"`

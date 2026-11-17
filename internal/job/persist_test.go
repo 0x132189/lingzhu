@@ -51,7 +51,7 @@ func TestOpenRestoresRecordedJobs(t *testing.T) {
 }
 
 // TestOpenClosesJobsThatWereRunning proves a job whose process died with the
-// previous core is reported as interrupted instead of running forever.
+// previous core is reported as cancelled instead of failed or running forever.
 func TestOpenClosesJobsThatWereRunning(t *testing.T) {
 	dir := t.TempDir()
 	first, err := Open(dir)
@@ -68,8 +68,8 @@ func TestOpenClosesJobsThatWereRunning(t *testing.T) {
 	if !ok {
 		t.Fatal("the job must be restored")
 	}
-	if item.Status != Failed {
-		t.Fatalf("a job whose process died must not report running, got %s", item.Status)
+	if item.Status != Cancelled {
+		t.Fatalf("a job whose process died must not report running or failed, got %s", item.Status)
 	}
 	if item.Error == "" {
 		t.Fatal("an interrupted job must explain why it stopped")
@@ -83,7 +83,7 @@ func TestOpenClosesJobsThatWereRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, _ := again.Get("job_1_1")
-	if restored.Status != Failed || restored.Error != item.Error {
+	if restored.Status != Cancelled || restored.Error != item.Error {
 		t.Fatalf("the corrected status must be stored: %+v", restored)
 	}
 }

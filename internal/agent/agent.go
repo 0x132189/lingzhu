@@ -2349,14 +2349,14 @@ func (a *Agent) takeInstructionUpdate(sessionID string, target provider.Target) 
 		a.instructionMu.Unlock()
 		return ""
 	}
-	update := renderInstructionUpdate(snapshot.current, current)
+	update, sources := renderInstructionUpdate(snapshot.current, current)
 	snapshot.current = current
 	a.instructionMu.Unlock()
 	a.persistInstructionState(sessionID, snapshot)
 	if update == "" {
 		return ""
 	}
-	_ = a.emit(sessionID, event.InstructionUpdatedEvent(update))
+	_ = a.emit(sessionID, event.InstructionUpdatedEvent(update, sources))
 	return update
 }
 
@@ -2515,7 +2515,9 @@ func stringMap(ev event.Event, key string) map[string]string {
 	return nil
 }
 
-func renderInstructionUpdate(previous, current map[string]string) string {
+// renderInstructionUpdate renders the model-facing update and returns the keys
+// of the sections that changed, in prompt order.
+func renderInstructionUpdate(previous, current map[string]string) (string, []string) {
 	keys := make([]string, 0, len(previous)+len(current))
 	seen := map[string]bool{}
 	for key := range previous {
@@ -2531,15 +2533,17 @@ func renderInstructionUpdate(previous, current map[string]string) string {
 		}
 	}
 	sort.Strings(keys)
-	var changed, removed []string
+	var changed, removed, sources []string
 	for _, key := range keys {
 		before, had := previous[key]
 		after, has := current[key]
 		switch {
 		case !has && had:
 			removed = append(removed, instructionLabel(key))
+			sources = append(sources, key)
 		case has && before != after:
 			changed = append(changed, key)
+			sources = append(sources, key)
 		}
 	}
 	var b strings.Builder
@@ -2556,7 +2560,29 @@ func renderInstructionUpdate(previous, current map[string]string) string {
 		b.WriteString(strings.Join(removed, ", "))
 		b.WriteString(".")
 	}
-	return b.String()
+	return b.String(), orderInstructionKeys(sources)
+}
+
+// orderInstructionKeys puts changed sections in the order they appear in the
+// system prompt, leaving unknown sections last in alphabetical order.
+func orderInstructionKeys(keys []string) []string {
+	rank := map[string]int{}
+	for index, key := range instructionSectionOrder {
+		rank[key] = index
+	}
+	out := append([]string(nil), keys...)
+	sort.SliceStable(out, func(i, j int) bool {
+		left, leftKnown := rank[out[i]]
+		right, rightKnown := rank[out[j]]
+		if leftKnown != rightKnown {
+			return leftKnown
+		}
+		if leftKnown {
+			return left < right
+		}
+		return out[i] < out[j]
+	})
+	return out
 }
 
 func instructionLabel(key string) string {

@@ -404,14 +404,18 @@ func SessionMovedForInput(directory, inputID string) Event {
 
 // InstructionUpdatedEvent announces changed instruction sections. It travels as
 // a synthetic user message so the model sees the change without the system
-// prefix being rewritten. The text stays model-facing; description drives the
-// transcript notice.
-func InstructionUpdatedEvent(text string) Event {
-	return New(Synthetic, map[string]any{
+// prefix being rewritten. Sources names the changed sections so the transcript
+// can say what changed instead of reporting a generic completion.
+func InstructionUpdatedEvent(text string, sources []string) Event {
+	data := map[string]any{
 		"text":        text,
 		"source":      "instructions",
 		"description": "Instructions updated",
-	})
+	}
+	if len(sources) > 0 {
+		data["sources"] = sources
+	}
+	return New(Synthetic, data)
 }
 
 // InstructionStateEvent freezes the baseline sections and records the latest

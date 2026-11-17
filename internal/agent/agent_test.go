@@ -664,6 +664,21 @@ func TestInstructionStateFreezesPrefixAndSendsUpdates(t *testing.T) {
 	}
 }
 
+func TestRenderInstructionUpdateReportsChangedSections(t *testing.T) {
+	text, sources := renderInstructionUpdate(
+		map[string]string{"agents": "rules v1", "date": "Mon", "environment": "old"},
+		map[string]string{"agents": "rules v2", "date": "Tue"},
+	)
+	for _, want := range []string{"rules v2", "Tue", "Environment"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("update missing %q: %s", want, text)
+		}
+	}
+	if strings.Join(sources, ",") != "agents,date,environment" {
+		t.Fatalf("changed sections must keep prompt order, got %v", sources)
+	}
+}
+
 func TestEnqueueDeliversInputAtNextBoundary(t *testing.T) {
 	started := make(chan string, 1)
 	release := make(chan struct{})

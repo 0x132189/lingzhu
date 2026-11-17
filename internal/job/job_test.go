@@ -1,10 +1,66 @@
 package job
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func testShell() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmd", "/c"}
+	}
+	return []string{"/bin/sh", "-c"}
+}
+
+// TestNonZeroExitSettlesCompleted proves a command's exit code is data on a
+// completed job, not a job failure.
+func TestNonZeroExitSettlesCompleted(t *testing.T) {
+	manager, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	done := make(chan Job, 1)
+	manager.SetNotifier(func(item Job) { done <- item })
+
+	if _, err := manager.Start("s1", testShell(), t.TempDir(), "exit 3", 0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.Status != Completed || got.ExitCode != 3 {
+			t.Fatalf("exit code must stay data on a completed job: %+v", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("job did not finish")
+	}
+}
+
+// TestCancelReportsCancelled proves a user-stopped background command settles
+// as cancelled and notifies the session, instead of disappearing or failing.
+func TestCancelReportsCancelled(t *testing.T) {
+	manager := New()
+	done := make(chan Job, 1)
+	manager.SetNotifier(func(item Job) { done <- item })
+
+	item := manager.Create("s1", "npm run dev", "out.log")
+	if _, err := manager.Cancel(item.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.Status != Cancelled {
+			t.Fatalf("unexpected cancelled job: %+v", got)
+		}
+		if !strings.Contains(got.Notification(), "[Background shell cancelled]") {
+			t.Fatalf("cancelled notice missing: %s", got.Notification())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not notify")
+	}
+}
 
 func TestFinishNotifiesOnce(t *testing.T) {
 	manager := New()
