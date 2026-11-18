@@ -88,6 +88,9 @@ func serve(args []string) {
 
 	cfg := setup.Config
 	application := setup.App
+	// Recovery must finish before the listener answers: a client that read the
+	// session list mid-recovery would see a resumed turn as idle. It is a single
+	// query on a clean start, so it stays ahead of ListenAndServe.
 	if err := application.Recover(context.Background()); err != nil {
 		log.Printf("recover: %v", err)
 	}
