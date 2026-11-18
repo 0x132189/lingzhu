@@ -66,6 +66,19 @@ type Message struct {
 	// model step. Providers never receive it; older history falls back to the
 	// aggregated Reasoning and Content fields.
 	Parts []MessagePart `json:"parts,omitempty"`
+	// Started, FirstToken, Streamed and Completed time one model step. Clients
+	// divide output tokens by FirstToken..Streamed, so tool time and the wait
+	// for the first token never enter the throughput. They are UI metadata;
+	// providers never receive them.
+	Started    string `json:"started,omitempty"`
+	FirstToken string `json:"firstToken,omitempty"`
+	Streamed   string `json:"streamed,omitempty"`
+	Completed  string `json:"completed,omitempty"`
+	// OutputTokens and ReasoningTokens are what the provider reported for this
+	// step. ReasoningTokens stays zero for APIs whose output total already
+	// includes reasoning.
+	OutputTokens    int `json:"outputTokens,omitempty"`
+	ReasoningTokens int `json:"reasoningTokens,omitempty"`
 	// Shell describes a command the user ran directly, rendered as a shell
 	// message. Content carries the same output into the model context.
 	Shell *ShellRun `json:"shell,omitempty"`

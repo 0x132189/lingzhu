@@ -352,17 +352,20 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 				last.ReasoningCreated = str(ev, "reasoningCreated")
 				last.ReasoningCompleted = str(ev, "reasoningCompleted")
 				last.Parts = partsOf(ev)
+				applyStepMetrics(last, ev)
 				times[len(messages)-1] = ev.At
 				break
 			}
-			appendMessage(model.Message{
+			message := model.Message{
 				Role:               model.RoleAssistant,
 				Content:            text(ev),
 				Reasoning:          str(ev, "reasoning"),
 				ReasoningCreated:   str(ev, "reasoningCreated"),
 				ReasoningCompleted: str(ev, "reasoningCompleted"),
 				Parts:              partsOf(ev),
-			}, ev.At, messageMeta{})
+			}
+			applyStepMetrics(&message, ev)
+			appendMessage(message, ev.At, messageMeta{})
 		case event.ToolCall:
 			if len(messages) == 0 || messages[len(messages)-1].Role != model.RoleAssistant {
 				appendMessage(model.Message{Role: model.RoleAssistant}, ev.At, messageMeta{})
@@ -419,6 +422,17 @@ func buildWithTimes(events []event.Event, observe func(messages int, ev event.Ev
 		}
 	}
 	return messages, times, metas
+}
+
+// applyStepMetrics copies one step's timing and token counts onto its message.
+// The fields are UI metadata; requests keep sending only content and tool calls.
+func applyStepMetrics(message *model.Message, ev event.Event) {
+	message.Started = str(ev, "started")
+	message.FirstToken = str(ev, "firstToken")
+	message.Streamed = str(ev, "streamed")
+	message.Completed = str(ev, "completed")
+	message.OutputTokens = int(eventInt(ev, "outputTokens"))
+	message.ReasoningTokens = int(eventInt(ev, "reasoningTokens"))
 }
 
 // partsOf decodes the ordered reasoning/text segments of one assistant step.

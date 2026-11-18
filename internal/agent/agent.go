@@ -356,6 +356,13 @@ type stepResult struct {
 	Usage           *provider.Usage
 	Finish          string
 	Err             error
+	// Started, FirstToken, Streamed and Completed measure the step's provider
+	// window. Clients divide output tokens by FirstToken..Streamed, so tool
+	// time and the wait for the first token never enter the throughput.
+	Started    time.Time
+	FirstToken time.Time
+	Streamed   time.Time
+	Completed  time.Time
 }
 
 func New(store *session.Store, catalog *provider.Catalog, tools *tool.Registry, perm *permission.Manager, opts Options) *Agent {
@@ -1884,9 +1891,12 @@ func (a *Agent) finishTitle(ctx context.Context, sessionID string, target provid
 	a.generateTitle(ctx, sessionID, target)
 }
 
-// recordAssistant persists non-empty assistant text and reasoning as one message.
+// recordAssistant persists one model step as an assistant message. A step that
+// only called tools has no text but still carries its timing and token counts,
+// so a turn's throughput covers every step the provider ran.
 func (a *Agent) recordAssistant(sessionID string, result stepResult, target provider.Target, agentID string) error {
-	if strings.TrimSpace(result.Text) == "" && strings.TrimSpace(result.Reasoning) == "" {
+	if strings.TrimSpace(result.Text) == "" && strings.TrimSpace(result.Reasoning) == "" &&
+		(result.Err != nil || len(result.Calls) == 0) {
 		return nil
 	}
 	ev := event.AssistantWithReasoning(result.Text, result.Reasoning)
@@ -1900,6 +1910,24 @@ func (a *Agent) recordAssistant(sessionID string, result stepResult, target prov
 	}
 	if !result.ReasoningCompleted.IsZero() {
 		ev.Data["reasoningCompleted"] = result.ReasoningCompleted.Format(time.RFC3339Nano)
+	}
+	if !result.Started.IsZero() {
+		ev.Data["started"] = result.Started.UTC().Format(time.RFC3339Nano)
+	}
+	if !result.FirstToken.IsZero() {
+		ev.Data["firstToken"] = result.FirstToken.UTC().Format(time.RFC3339Nano)
+	}
+	if !result.Streamed.IsZero() {
+		ev.Data["streamed"] = result.Streamed.UTC().Format(time.RFC3339Nano)
+	}
+	if !result.Completed.IsZero() {
+		ev.Data["completed"] = result.Completed.UTC().Format(time.RFC3339Nano)
+	}
+	if result.Usage != nil {
+		ev.Data["outputTokens"] = result.Usage.Output
+		// Providers here count reasoning inside their output token total, so the
+		// separate field stays zero and clients can still add both like upstream.
+		ev.Data["reasoningTokens"] = 0
 	}
 	if len(result.Parts) > 0 {
 		ev.Data["parts"] = result.Parts
@@ -2129,6 +2157,7 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 		CacheTTL:   target.CacheTTL,
 		CacheKey:   sessionID,
 	}
+	stepStarted := time.Now()
 	stream, err := target.Provider.Stream(ctx, req)
 	if err != nil {
 		logx.Warn("model request failed",
@@ -2143,6 +2172,7 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 	requestStarted := time.Now()
 
 	var result stepResult
+	result.Started = stepStarted
 	var text strings.Builder
 	var reasoning strings.Builder
 	var reasoningStarted, reasoningCompleted time.Time
@@ -2184,17 +2214,21 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 			break
 		}
 		if err != nil {
-			return stepResult{
-				Text:               text.String(),
-				Reasoning:          reasoning.String(),
-				ReasoningStarted:   reasoningStarted,
-				ReasoningCompleted: reasoningCompleted,
-				Parts:              parts,
-				Calls:              ordered(calls),
-				Usage:              result.Usage,
-				Finish:             result.Finish,
-				Err:                err,
-			}
+			// A stream that dies mid-response still measured the tokens it
+			// delivered, so the turn keeps its partial throughput.
+			result.Text = text.String()
+			result.Reasoning = reasoning.String()
+			result.ReasoningStarted = reasoningStarted
+			result.ReasoningCompleted = reasoningCompleted
+			result.Parts = parts
+			result.Calls = ordered(calls)
+			result.Streamed = time.Now().UTC()
+			result.Completed = result.Streamed
+			result.Err = err
+			return result
+		}
+		if result.FirstToken.IsZero() && (chunk.Text != "" || chunk.Reasoning != "" || len(chunk.ToolCalls) > 0) {
+			result.FirstToken = time.Now().UTC()
 		}
 		if chunk.Usage != nil {
 			result.Usage = chunk.Usage
@@ -2262,6 +2296,8 @@ func (a *Agent) stream(ctx context.Context, sessionID string, messages []model.M
 	result.ReasoningCompleted = reasoningCompleted
 	result.Parts = parts
 	result.Calls = ordered(calls)
+	result.Streamed = time.Now().UTC()
+	result.Completed = result.Streamed
 	logx.Info("model call finished",
 		logx.Session(sessionID),
 		logx.F("provider", target.ProviderID),

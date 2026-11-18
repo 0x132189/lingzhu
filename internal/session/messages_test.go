@@ -191,6 +191,33 @@ func TestSubagentNoticeKeepsTheChildID(t *testing.T) {
 	}
 }
 
+func TestBuildMessagesKeepsStepMetrics(t *testing.T) {
+	events := []event.Event{
+		{Type: event.AssistantMessage, Seq: 1, Data: map[string]any{
+			"text":            "answer",
+			"started":         "2026-01-01T00:00:00Z",
+			"firstToken":      "2026-01-01T00:00:02Z",
+			"streamed":        "2026-01-01T00:00:04Z",
+			"completed":       "2026-01-01T00:00:04.5Z",
+			"outputTokens":    float64(42),
+			"reasoningTokens": float64(0),
+		}},
+	}
+
+	messages := BuildMessages(events)
+	if len(messages) != 1 {
+		t.Fatalf("unexpected messages: %+v", messages)
+	}
+	message := messages[0]
+	if message.Started != "2026-01-01T00:00:00Z" || message.FirstToken != "2026-01-01T00:00:02Z" ||
+		message.Streamed != "2026-01-01T00:00:04Z" || message.Completed != "2026-01-01T00:00:04.5Z" {
+		t.Fatalf("step timing missing: %+v", message)
+	}
+	if message.OutputTokens != 42 || message.ReasoningTokens != 0 {
+		t.Fatalf("step token counts missing: %+v", message)
+	}
+}
+
 func TestBuildMessagesKeepsAssistantParts(t *testing.T) {
 	events := []event.Event{
 		{Type: event.AssistantMessage, Seq: 1, Data: map[string]any{

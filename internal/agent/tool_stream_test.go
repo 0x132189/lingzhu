@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,61 @@ func (emittingTool) Run(ctx context.Context, call tool.Call) (string, error) {
 		_ = call.Emit(event.ToolOutputEvent(call.ID, "chunk"))
 	}
 	return "done", nil
+}
+
+func TestToolOnlyStepKeepsStreamTiming(t *testing.T) {
+	fake := &fakeProvider{chunks: [][]provider.Chunk{
+		{
+			{Usage: &provider.Usage{Input: 5, Output: 7}, ToolCalls: []provider.ToolCallDelta{{Index: 0, ID: "call_1", Name: "emit", Arguments: `{}`}}},
+		},
+		{{Usage: &provider.Usage{Input: 9, Output: 3}, Text: "finished"}},
+	}}
+	a, store := newTestAgent(t, fake)
+	a.tools.Add(emittingTool{})
+
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+
+	events, err := store.Events("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolStep map[string]any
+	for _, ev := range events {
+		if ev.Type != event.AssistantMessage {
+			continue
+		}
+		if text, _ := ev.Data["text"].(string); strings.TrimSpace(text) == "" {
+			toolStep = ev.Data
+		}
+	}
+	if toolStep == nil {
+		t.Fatal("a tool-only step must still record its assistant message")
+	}
+	for _, key := range []string{"started", "firstToken", "streamed", "completed"} {
+		if value, _ := toolStep[key].(string); value == "" {
+			t.Fatalf("tool-only step is missing %s: %+v", key, toolStep)
+		}
+	}
+	if output, _ := toolStep["outputTokens"].(int); output != 7 {
+		t.Fatalf("tool-only step must carry its output tokens, got %+v", toolStep["outputTokens"])
+	}
+
+	messages, err := store.Messages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 4 {
+		t.Fatalf("unexpected messages: %+v", messages)
+	}
+	step := messages[1]
+	if step.Role != model.RoleAssistant || len(step.ToolCalls) != 1 || step.OutputTokens != 7 || step.Started == "" || step.Streamed == "" {
+		t.Fatalf("tool-only assistant step lost its metrics: %+v", step)
+	}
 }
 
 func TestToolEventsKeepCallBeforeOutputBeforeResult(t *testing.T) {
