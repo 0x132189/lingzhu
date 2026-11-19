@@ -14,7 +14,12 @@ import (
 	"lingzhu/internal/version"
 )
 
-const clientProtocolVersion = "2024-11-05"
+const (
+	clientProtocolVersion = "2024-11-05"
+	// maxCatalogPages bounds cursor loops so a broken server cannot make a
+	// catalog request run forever.
+	maxCatalogPages = 100
+)
 
 var errClosed = errors.New("mcp: server closed")
 
@@ -58,13 +63,17 @@ type CallResult struct {
 	IsError           bool            `json:"isError"`
 }
 
-// ToolContent is one content part in a tool result.
+// ToolContent is one content part in a tool result. Resource holds the nested
+// object of a "resource" part; ResourceLink fields are kept flat.
 type ToolContent struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Data     string `json:"data,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
-	URI      string `json:"uri,omitempty"`
+	Type        string           `json:"type"`
+	Text        string           `json:"text,omitempty"`
+	Data        string           `json:"data,omitempty"`
+	MimeType    string           `json:"mimeType,omitempty"`
+	URI         string           `json:"uri,omitempty"`
+	Name        string           `json:"name,omitempty"`
+	Description string           `json:"description,omitempty"`
+	Resource    *ResourceContent `json:"resource,omitempty"`
 }
 
 // Client is one connected MCP server.
@@ -87,9 +96,17 @@ type Client struct {
 	pending map[int64]chan rpc.Response
 	seq     int64
 
+	// refreshMu serializes catalog re-listing triggered by server notifications.
+	refreshMu sync.Mutex
+	// handlerMu protects the manager callbacks, which are set after the handshake.
+	handlerMu sync.RWMutex
+	onChange  func(kind string)
+	onClose   func()
+
 	done      chan struct{}
 	doneOnce  sync.Once
 	closeOnce sync.Once
+	closing   atomic.Bool
 	timeout   Timeout
 }
 
@@ -216,6 +233,43 @@ func (c *Client) Name() string { return c.name }
 // Instructions returns the server's usage guidance from the handshake.
 func (c *Client) Instructions() string { return c.instructions }
 
+// SetHandlers installs the manager callbacks used for catalog notifications and
+// unexpected disconnects. An intentional Close does not invoke onClose.
+func (c *Client) SetHandlers(onChange func(kind string), onClose func()) {
+	c.handlerMu.Lock()
+	c.onChange = onChange
+	c.onClose = onClose
+	c.handlerMu.Unlock()
+}
+
+func (c *Client) changed(kind string) {
+	c.handlerMu.RLock()
+	callback := c.onChange
+	c.handlerMu.RUnlock()
+	if callback != nil {
+		callback(kind)
+	}
+}
+
+func (c *Client) notifyClose() {
+	c.handlerMu.RLock()
+	callback := c.onClose
+	c.handlerMu.RUnlock()
+	if callback != nil {
+		callback()
+	}
+}
+
+// Closed reports whether the transport has already ended.
+func (c *Client) Closed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // ServerInstruction is one server's system-prompt guidance.
 type ServerInstruction struct {
 	Server       string
@@ -317,7 +371,7 @@ func (c *Client) enrich(params any) any {
 func (c *Client) Tools(ctx context.Context) ([]ToolInfo, error) {
 	var tools []ToolInfo
 	cursor := ""
-	for {
+	for pages := 1; ; pages++ {
 		params := map[string]any{}
 		if cursor != "" {
 			params["cursor"] = cursor
@@ -333,6 +387,9 @@ func (c *Client) Tools(ctx context.Context) ([]ToolInfo, error) {
 		if page.NextCursor == "" {
 			return tools, nil
 		}
+		if pages >= maxCatalogPages {
+			return nil, fmt.Errorf("mcp: tools/list exceeded %d pages", maxCatalogPages)
+		}
 		cursor = page.NextCursor
 	}
 }
@@ -342,7 +399,7 @@ func (c *Client) Tools(ctx context.Context) ([]ToolInfo, error) {
 func (c *Client) Prompts(ctx context.Context) ([]PromptInfo, error) {
 	var out []PromptInfo
 	cursor := ""
-	for {
+	for pages := 1; ; pages++ {
 		params := map[string]any{}
 		if cursor != "" {
 			params["cursor"] = cursor
@@ -363,6 +420,9 @@ func (c *Client) Prompts(ctx context.Context) ([]PromptInfo, error) {
 		out = append(out, page.Prompts...)
 		if page.NextCursor == "" {
 			return out, nil
+		}
+		if pages >= maxCatalogPages {
+			return nil, fmt.Errorf("mcp: prompts/list exceeded %d pages", maxCatalogPages)
 		}
 		cursor = page.NextCursor
 	}
@@ -398,31 +458,56 @@ func (c *Client) Prompt(ctx context.Context, name string, args map[string]string
 	return strings.Join(parts, "\n\n"), nil
 }
 
-// Resources reads resources/list and resources/templates/list. A server that// does not implement resources simply returns nothing.
+// Resources reads every page of resources/list and resources/templates/list.
+// A server that does not implement resources simply returns nothing.
 func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 	var out []Resource
-	var page struct {
-		Resources  []Resource `json:"resources"`
-		NextCursor string     `json:"nextCursor"`
-	}
-	if err := c.requestWithTimeout(ctx, "resources/list", map[string]any{}, &page, millis(c.timeout.Catalog)); err != nil {
-		if rpc.IsMethodNotFound(err) {
-			return nil, nil
+	cursor := ""
+	for pages := 1; ; pages++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
 		}
-		return nil, err
+		var page struct {
+			Resources  []Resource `json:"resources"`
+			NextCursor string     `json:"nextCursor"`
+		}
+		if err := c.requestWithTimeout(ctx, "resources/list", params, &page, millis(c.timeout.Catalog)); err != nil {
+			if rpc.IsMethodNotFound(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		out = append(out, page.Resources...)
+		if page.NextCursor == "" {
+			break
+		}
+		if pages >= maxCatalogPages {
+			return nil, fmt.Errorf("mcp: resources/list exceeded %d pages", maxCatalogPages)
+		}
+		cursor = page.NextCursor
 	}
-	out = append(out, page.Resources...)
 
-	var templates struct {
-		ResourceTemplates []struct {
-			Name        string `json:"name"`
-			URITemplate string `json:"uriTemplate"`
-			Description string `json:"description,omitempty"`
-			MimeType    string `json:"mimeType,omitempty"`
-		} `json:"resourceTemplates"`
-	}
-	if err := c.requestWithTimeout(ctx, "resources/templates/list", map[string]any{}, &templates, millis(c.timeout.Catalog)); err == nil {
-		for _, item := range templates.ResourceTemplates {
+	cursor = ""
+	for pages := 1; ; pages++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var page struct {
+			ResourceTemplates []struct {
+				Name        string `json:"name"`
+				URITemplate string `json:"uriTemplate"`
+				Description string `json:"description,omitempty"`
+				MimeType    string `json:"mimeType,omitempty"`
+			} `json:"resourceTemplates"`
+			NextCursor string `json:"nextCursor"`
+		}
+		if err := c.requestWithTimeout(ctx, "resources/templates/list", params, &page, millis(c.timeout.Catalog)); err != nil {
+			// Some servers declare resources without implementing templates.
+			break
+		}
+		for _, item := range page.ResourceTemplates {
 			out = append(out, Resource{
 				Name:        item.Name,
 				URITemplate: item.URITemplate,
@@ -430,6 +515,13 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 				MimeType:    item.MimeType,
 			})
 		}
+		if page.NextCursor == "" {
+			break
+		}
+		if pages >= maxCatalogPages {
+			break
+		}
+		cursor = page.NextCursor
 	}
 	return out, nil
 }
@@ -525,9 +617,9 @@ func (c *Client) send(ctx context.Context, message any, expectID int64) error {
 // receive dispatches one decoded JSON-RPC message from the transport.
 func (c *Client) receive(message rpc.Message) {
 	if message.Method != "" {
-		// Server-initiated request or notification. Only ping needs a reply;
-		// anything else is not part of the client surface we expose.
 		if len(message.ID) > 0 {
+			// Server-initiated request. Only ping needs a reply; anything else
+			// is not part of the client surface we expose.
 			reply := map[string]any{"jsonrpc": "2.0", "id": message.ID}
 			if message.Method == "ping" {
 				reply["result"] = map[string]any{}
@@ -540,6 +632,17 @@ func (c *Client) receive(message rpc.Message) {
 				_ = c.tr.Send(ctx, data, 0)
 				cancel()
 			}
+			return
+		}
+		// Servers announce catalog changes with a notification. The manager
+		// re-lists the affected catalogs and refreshes the tool registry.
+		switch message.Method {
+		case "notifications/tools/list_changed":
+			c.changed("tools")
+		case "notifications/prompts/list_changed":
+			c.changed("prompts")
+		case "notifications/resources/list_changed", "notifications/resources/updated":
+			c.changed("resources")
 		}
 		return
 	}
@@ -566,9 +669,15 @@ func (c *Client) receive(message rpc.Message) {
 	}
 }
 
-// closed is called by a transport when its stream or process ends.
+// closed is called by a transport when its stream or process ends. A close
+// initiated by Close is expected and must not mark the server failed.
 func (c *Client) closed() {
-	c.doneOnce.Do(func() { close(c.done) })
+	c.doneOnce.Do(func() {
+		close(c.done)
+		if !c.closing.Load() {
+			c.notifyClose()
+		}
+	})
 	c.failAll(errClosed)
 }
 
@@ -595,6 +704,7 @@ func (c *Client) detail() string {
 // Close ends the server session.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
+		c.closing.Store(true)
 		if c.tr != nil {
 			_ = c.tr.Close()
 		}

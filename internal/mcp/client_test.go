@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"lingzhu/internal/tool"
 )
@@ -36,6 +37,13 @@ func TestHelperMCPProcess(t *testing.T) {
 		_ = writer.WriteByte('\n')
 		_ = writer.Flush()
 	}
+	notify := func(method string) {
+		data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method})
+		_, _ = writer.Write(data)
+		_ = writer.WriteByte('\n')
+		_ = writer.Flush()
+	}
+	dynamic := false
 
 	for scanner.Scan() {
 		var message struct {
@@ -64,31 +72,44 @@ func TestHelperMCPProcess(t *testing.T) {
 			_ = json.Unmarshal(message.Params, &params)
 			if params.Cursor == "" {
 				reply(id, map[string]any{
-					"tools": []map[string]any{{
-						"name":        "echo",
-						"description": "Echo text",
-						"inputSchema": map[string]any{
-							"type":       "object",
-							"properties": map[string]any{"text": map[string]any{"type": "string"}},
-							"required":   []string{"text"},
+					"tools": []map[string]any{
+						{
+							"name":        "echo",
+							"description": "Echo text",
+							"inputSchema": map[string]any{
+								"type":       "object",
+								"properties": map[string]any{"text": map[string]any{"type": "string"}},
+								"required":   []string{"text"},
+							},
 						},
-					}},
+						{
+							"name":        "notify",
+							"description": "Announce a catalog change",
+							"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+						},
+					},
 					"nextCursor": "page-2",
 				}, nil)
 			} else {
-				reply(id, map[string]any{
-					"tools": []map[string]any{{
-						"name":        "add",
-						"description": "Add two numbers",
-						"inputSchema": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"a": map[string]any{"type": "number"},
-								"b": map[string]any{"type": "number"},
-							},
+				tools := []map[string]any{{
+					"name":        "add",
+					"description": "Add two numbers",
+					"inputSchema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"a": map[string]any{"type": "number"},
+							"b": map[string]any{"type": "number"},
 						},
-					}},
-				}, nil)
+					},
+				}}
+				if dynamic {
+					tools = append(tools, map[string]any{
+						"name":        "late",
+						"description": "A tool added after startup",
+						"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+					})
+				}
+				reply(id, map[string]any{"tools": tools}, nil)
 			}
 		case "prompts/list":
 			reply(id, map[string]any{
@@ -129,18 +150,41 @@ func TestHelperMCPProcess(t *testing.T) {
 					"content":           []map[string]any{{"type": "text", "text": fmt.Sprintf("%v", a+b)}},
 					"structuredContent": map[string]any{"sum": a + b},
 				}, nil)
+			case "notify":
+				dynamic = true
+				notify("notifications/tools/list_changed")
+				reply(id, map[string]any{
+					"content": []map[string]any{{"type": "text", "text": "notified"}},
+				}, nil)
+			case "crash":
+				os.Exit(1)
 			default:
 				reply(id, nil, &rpc.Error{Code: -32602, Message: "unknown tool"})
 			}
 		case "resources/list":
-			reply(id, map[string]any{
-				"resources": []map[string]any{{
-					"uri":         "memo://hello",
-					"name":        "Hello",
-					"description": "A greeting",
-					"mimeType":    "text/plain",
-				}},
-			}, nil)
+			var params struct {
+				Cursor string `json:"cursor"`
+			}
+			_ = json.Unmarshal(message.Params, &params)
+			if params.Cursor == "" {
+				reply(id, map[string]any{
+					"resources": []map[string]any{{
+						"uri":         "memo://hello",
+						"name":        "Hello",
+						"description": "A greeting",
+						"mimeType":    "text/plain",
+					}},
+					"nextCursor": "resources-2",
+				}, nil)
+			} else {
+				reply(id, map[string]any{
+					"resources": []map[string]any{{
+						"uri":      "memo://second",
+						"name":     "Second",
+						"mimeType": "text/plain",
+					}},
+				}, nil)
+			}
 		case "resources/templates/list":
 			reply(id, map[string]any{
 				"resourceTemplates": []map[string]any{{
@@ -203,11 +247,11 @@ func TestManagerDiscoversToolsAndResources(t *testing.T) {
 	for _, item := range manager.Tools() {
 		names[item.Name()] = true
 	}
-	if len(names) != 2 || !names["demo_echo"] || !names["demo_add"] {
+	if len(names) != 3 || !names["demo_echo"] || !names["demo_add"] || !names["demo_notify"] {
 		t.Fatalf("unexpected discovered tools: %v", names)
 	}
 	resources, ok := manager.Resources("demo")
-	if !ok || len(resources) != 2 {
+	if !ok || len(resources) != 3 {
 		t.Fatalf("unexpected resources: ok=%v items=%v", ok, resources)
 	}
 	if servers := manager.Servers(); len(servers) != 1 || servers[0] != "demo" {
@@ -242,6 +286,73 @@ func TestManagerCallsTools(t *testing.T) {
 				t.Fatalf("unexpected add output: %q", out)
 			}
 		}
+	}
+}
+
+func TestManagerRefreshesToolsOnNotification(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	var notify tool.Tool
+	for _, item := range manager.Tools() {
+		if item.Name() == "demo_notify" {
+			notify = item
+		}
+	}
+	if notify == nil {
+		t.Fatal("notify tool not discovered")
+	}
+	if _, err := notify.Run(context.Background(), call("demo_notify", `{}`)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, item := range manager.Tools() {
+			if item.Name() == "demo_late" {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("refreshed tool was not registered: %v", manager.Tools())
+}
+
+func TestManagerReportsFailedServer(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{
+		"bad": {Type: "local", Command: []string{"lingzhu-command-that-does-not-exist"}},
+	}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	status := manager.Status()
+	if len(status) != 1 || status[0].Name != "bad" || status[0].Status != StatusFailed || status[0].Error == "" {
+		t.Fatalf("unexpected failed status: %+v", status)
+	}
+}
+
+func TestManagerReportsDisabledServer(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{
+		"off": {Type: "local", Disabled: true},
+	}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+	status := manager.Status()
+	if len(status) != 1 || status[0].Status != StatusDisabled {
+		t.Fatalf("unexpected disabled status: %+v", status)
+	}
+}
+
+func TestManagerReconnectsServer(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	status, err := manager.Reconnect(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusConnected || len(status.Tools) == 0 {
+		t.Fatalf("unexpected reconnect status: %+v", status)
+	}
+	if names := manager.Servers(); len(names) != 1 || names[0] != "demo" {
+		t.Fatalf("unexpected connected servers: %v", names)
 	}
 }
 
@@ -307,6 +418,17 @@ func TestManagerDiscoversAndExpandsPrompts(t *testing.T) {
 	}
 	if text != "Review src/auth.ts" {
 		t.Fatalf("unexpected prompt text: %q", text)
+	}
+	text, ok, err = manager.ExpandPrompt(context.Background(), "demo:review", `"src/auth file.ts"`)
+	if err != nil || !ok {
+		t.Fatalf("quoted expand failed: ok=%v err=%v", ok, err)
+	}
+	if text != "Review src/auth file.ts" {
+		t.Fatalf("quoted argument was split: %q", text)
+	}
+	text, ok, err = manager.ExpandPrompt(context.Background(), "demo:review", `C:\src\auth.ts`)
+	if err != nil || !ok || text != `Review C:\src\auth.ts` {
+		t.Fatalf("windows path argument was changed: ok=%v err=%v text=%q", ok, err, text)
 	}
 	if _, ok, err := manager.ExpandPrompt(context.Background(), "demo:missing", ""); ok || err != nil {
 		t.Fatalf("unknown prompt should not match: ok=%v err=%v", ok, err)

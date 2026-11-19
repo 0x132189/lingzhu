@@ -25,6 +25,26 @@ func (s *Server) listMCP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"servers": servers})
 }
 
+// reconnectMCP retries one failed server without restarting the core.
+func (s *Server) reconnectMCP(w http.ResponseWriter, r *http.Request) {
+	manager := s.mcpFor(r)
+	if manager == nil {
+		writeError(w, http.StatusNotImplemented, errText("MCP is not available"))
+		return
+	}
+	server := r.PathValue("server")
+	status, err := manager.Reconnect(r.Context(), server)
+	if err != nil {
+		if _, ok := manager.StatusFor(server); !ok {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"server": status})
+}
+
 // callMCPTool invokes one tool on a connected server.
 func (s *Server) callMCPTool(w http.ResponseWriter, r *http.Request) {
 	if s.mcpFor(r) == nil {

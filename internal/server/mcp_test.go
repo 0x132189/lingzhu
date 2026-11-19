@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,33 @@ func TestMCPStatusEmpty(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"servers":[]`) {
 		t.Fatalf("unexpected empty MCP status: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMCPStatusReportsFailedServer(t *testing.T) {
+	manager := mcp.Start(context.Background(), mcp.Config{Servers: map[string]mcp.Server{
+		"bad": {Type: "local", Command: []string{"lingzhu-command-that-does-not-exist"}},
+	}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+	srv, _ := newSessionServer(t, func(s *Server) { s.SetMCP(manager) })
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Servers []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Servers) != 1 || payload.Servers[0].Name != "bad" ||
+		payload.Servers[0].Status != mcp.StatusFailed || payload.Servers[0].Error == "" {
+		t.Fatalf("unexpected failed status: %+v", payload.Servers)
 	}
 }
 

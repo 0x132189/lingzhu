@@ -1,6 +1,7 @@
 package location
 
 import (
+	"context"
 	"sync"
 
 	"lingzhu/internal/agent"
@@ -45,6 +46,9 @@ type Services struct {
 	Skills     *skill.Manager
 	Commands   *commands.Registry
 	Subagents  *subagent.Manager
+
+	// RefreshSkills rescans local skill roots and retries remote sources.
+	RefreshSkills func(context.Context) error
 
 	configMu sync.RWMutex
 	config   config.Config

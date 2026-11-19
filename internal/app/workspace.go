@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"lingzhu/internal/agent"
@@ -90,7 +91,11 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 		skillRoots = append(remote, skillRoots...)
 	}
 	skills := skill.Discover(skillRoots, s.log)
-	skills.Filter(func(id string) bool { return !policies.Denied("skill.use", id) })
+	skillKeep := func(id string) bool { return !policies.Denied("skill.use", id) }
+	skills.Filter(skillKeep)
+	skillState := newSkillsState(skills, skillRoots, cfg, workdir, s.log, skillKeep)
+	skillCtx, stopSkills := context.WithCancel(s.base)
+	go skillState.watch(skillCtx)
 
 	commandRegistry := customcommands.New(
 		cfg.Commands,
@@ -127,11 +132,33 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 		}
 	}
 	mcpManager := mcp.StartWithTokens(s.base, filterMCPConfig(cfg.MCP, policies, s.log), workdir, s.log, mcpTokens)
-	for _, t := range mcpManager.Tools() {
-		if _, exists := registry.Get(t.Name()); exists {
-			s.log("mcp: %s tool %q overrides an existing tool", ref.Name(), t.Name())
+	// MCP catalogs can change while the workspace is open. Keep the registry
+	// in sync without letting a remote server shadow a built-in or app tool.
+	var mcpToolsMu sync.Mutex
+	mcpToolNames := map[string]bool{}
+	syncMCPTools := func() {
+		mcpToolsMu.Lock()
+		defer mcpToolsMu.Unlock()
+		next := mcpManager.Tools()
+		nextNames := make(map[string]bool, len(next))
+		for _, item := range next {
+			nextNames[item.Name()] = true
 		}
-		registry.Add(tool.Codemode(t))
+		for name := range mcpToolNames {
+			if !nextNames[name] {
+				registry.Remove(name)
+				delete(mcpToolNames, name)
+			}
+		}
+		for _, item := range next {
+			name := item.Name()
+			if _, exists := registry.Get(name); exists && !mcpToolNames[name] {
+				s.log("mcp: %s tool %q collides with an existing tool", ref.Name(), name)
+				continue
+			}
+			registry.Add(tool.Codemode(item))
+			mcpToolNames[name] = true
+		}
 	}
 	for _, t := range mcp.ResourceTools(mcpManager) {
 		registry.Add(tool.Codemode(t))
@@ -149,6 +176,7 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 
 	catalog, err := buildCatalog(cfg)
 	if err != nil {
+		stopSkills()
 		plugins.Close()
 		mcpManager.Close()
 		return nil, err
@@ -291,6 +319,10 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 	for _, t := range apptools.Tools(s.store, worktrees, catalog) {
 		registry.Add(t)
 	}
+	// Register MCP last so a remote server cannot shadow a built-in, app or
+	// plugin tool, and keep the registry current when a catalog changes.
+	syncMCPTools()
+	mcpManager.SetOnChange(syncMCPTools)
 
 	var vcsManager *vcs.Manager
 	if manager, err := vcs.New(workdir); err == nil {
@@ -300,24 +332,26 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 	}
 
 	services := &location.Services{
-		Ref:        ref,
-		Agent:      runner,
-		Agents:     profiles,
-		Tools:      registry,
-		Permission: perm,
-		Snapshots:  snapshots,
-		Formatter:  formatters,
-		Worktrees:  worktrees,
-		PTY:        terminals,
-		VCS:        vcsManager,
-		MCP:        mcpManager,
-		Plugins:    plugins,
-		Skills:     skills,
-		Commands:   commandRegistry,
-		Subagents:  subagents,
+		Ref:           ref,
+		Agent:         runner,
+		Agents:        profiles,
+		Tools:         registry,
+		Permission:    perm,
+		Snapshots:     snapshots,
+		Formatter:     formatters,
+		Worktrees:     worktrees,
+		PTY:           terminals,
+		VCS:           vcsManager,
+		MCP:           mcpManager,
+		Plugins:       plugins,
+		Skills:        skills,
+		Commands:      commandRegistry,
+		Subagents:     subagents,
+		RefreshSkills: skillState.refresh,
 	}
 	services.SetConfig(cfg)
 	services.CloseFn = func() {
+		stopSkills()
 		plugins.Close()
 		mcpManager.Close()
 		if terminals != nil {

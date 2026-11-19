@@ -90,6 +90,39 @@ func TestPullIndexAndUpdate(t *testing.T) {
 	}
 }
 
+func TestPullBackfillsMissingFilesWithoutVersionBump(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.json":
+			fmt.Fprintf(w, `{"skills":[{"name":"demo","version":"1","files":["SKILL.md","scripts/run.sh"]}]}`)
+		case "/demo/SKILL.md":
+			fmt.Fprint(w, "---\ndescription: demo\n---\nbody")
+		case "/demo/scripts/run.sh":
+			fmt.Fprint(w, "echo run")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cache := t.TempDir()
+	urls := []string{server.URL + "/index.json"}
+	roots := Pull(context.Background(), urls, cache, t.Logf)
+	if len(roots) != 1 {
+		t.Fatalf("unexpected roots: %v", roots)
+	}
+	// Simulate a cache written before the index gained the script. The
+	// version is unchanged, so the missing file must still be filled in.
+	_ = os.Remove(filepath.Join(roots[0], "scripts", "run.sh"))
+	roots = Pull(context.Background(), urls, cache, t.Logf)
+	if len(roots) != 1 {
+		t.Fatalf("unexpected roots after backfill: %v", roots)
+	}
+	if _, err := os.Stat(filepath.Join(roots[0], "scripts", "run.sh")); err != nil {
+		t.Fatalf("missing file was not backfilled: %v", err)
+	}
+}
+
 func TestPullRejectsUnsafeEntries(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

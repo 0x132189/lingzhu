@@ -205,8 +205,13 @@ func pullIndex(ctx context.Context, indexURL string, base *url.URL, cacheRoot st
 
 		root := filepath.Join(cacheRoot, cacheKey(base.String()), name)
 		version := strings.TrimSpace(item.Version)
-		if (item.Version != "" && versionMatches(root, version) && hasSkillFile(root, name)) ||
-			(item.Version == "" && hasSkillFile(root, name)) {
+		if hasSkillFile(root, name) && (version == "" || versionMatches(root, version)) {
+			// The content version did not change, but the index may have added
+			// files since the package was cached. Fill only the missing ones;
+			// the version remains the signal for a full replacement.
+			if err := installMissing(ctx, files, root); err != nil {
+				logf("skill: update %q from %s: %v", name, indexURL, err)
+			}
 			out = append(out, root)
 			continue
 		}
@@ -251,6 +256,29 @@ func installFiles(ctx context.Context, files []remoteFile, root, version string)
 		}
 	}
 	return replaceDir(staging, root)
+}
+
+// installMissing downloads only files the cached package does not have. It
+// leaves existing content untouched, matching the version-file semantics used
+// by the reference implementation.
+func installMissing(ctx context.Context, files []remoteFile, root string) error {
+	for _, file := range files {
+		destination := filepath.Join(root, filepath.FromSlash(file.path))
+		if info, err := os.Stat(destination); err == nil && !info.IsDir() {
+			continue
+		}
+		data, err := fetch(ctx, file.url, maxRemoteFileBytes)
+		if err != nil {
+			return fmt.Errorf("%s: %w", file.url, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(destination, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func replaceDir(staging, root string) error {

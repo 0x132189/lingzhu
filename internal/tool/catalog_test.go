@@ -44,6 +44,23 @@ func catalogRegistry() *Registry {
 	return registry
 }
 
+func TestRegistryRemoveInvalidatesCatalog(t *testing.T) {
+	registry := NewRegistry()
+	registry.Add(Codemode(catalogTool{name: "remote", description: "Remote.", schema: `{"type":"object"}`}))
+	if catalog := registry.Catalog(); !strings.Contains(catalog, "remote") {
+		t.Fatalf("tool missing from catalog: %q", catalog)
+	}
+	if !registry.Remove("remote") {
+		t.Fatal("expected the tool to be removed")
+	}
+	if registry.Remove("remote") {
+		t.Fatal("removing twice should report false")
+	}
+	if catalog := registry.Catalog(); strings.Contains(catalog, "remote") {
+		t.Fatalf("removed tool still in catalog: %q", catalog)
+	}
+}
+
 func TestDefinitionsSplitDirectAndCodemode(t *testing.T) {
 	registry := NewRegistry()
 	registry.Add(Direct(catalogTool{name: "read", description: "Read.", schema: `{"type":"object"}`}))

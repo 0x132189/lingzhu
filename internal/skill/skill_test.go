@@ -164,6 +164,21 @@ func TestSkillToolLoadsAndRejects(t *testing.T) {
 	}
 }
 
+func TestReloadReplacesCatalog(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	writeFile(t, filepath.Join(first, "demo", "SKILL.md"), "---\ndescription: first\n---\none")
+	manager := Discover([]string{first}, t.Logf)
+	if item, ok := manager.Get("demo"); !ok || !strings.Contains(item.Content, "one") {
+		t.Fatalf("unexpected first catalog: %+v", item)
+	}
+	writeFile(t, filepath.Join(second, "demo", "SKILL.md"), "---\ndescription: second\n---\ntwo")
+	manager.Reload([]string{second}, t.Logf)
+	if item, ok := manager.Get("demo"); !ok || !strings.Contains(item.Content, "two") {
+		t.Fatalf("unexpected reloaded catalog: %+v", item)
+	}
+}
+
 func TestFilterRemovesBlockedSkills(t *testing.T) {
 	manager := &Manager{
 		skills: map[string]Info{"a": {ID: "a"}, "b": {ID: "b"}},

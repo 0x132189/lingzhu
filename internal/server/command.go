@@ -37,22 +37,40 @@ func (s *Server) runCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errText("command name is empty"))
 		return
 	}
-	_, hasPlugin := s.commandIn(r, name)
-	custom, hasCustom := s.customCommandIn(r, name)
-	if !hasPlugin && !hasCustom {
-		writeError(w, http.StatusNotFound, errText("command not found"))
-		return
-	}
-	if hasPlugin {
-		hasCustom = false
-	}
 	arguments := strings.TrimSpace(body.Arguments)
 	extra := strings.TrimSpace(body.Text)
 	if arguments == "" {
 		arguments = extra
 		extra = ""
 	}
-	text := s.expandIn(r, "/"+name+" "+arguments)
+	_, hasPlugin := s.commandIn(r, name)
+	custom, hasCustom := s.customCommandIn(r, name)
+	hasMCP := false
+	mcpPrompt := ""
+	if !hasPlugin && !hasCustom {
+		if manager := s.mcpFor(r); manager != nil {
+			rendered, ok, err := manager.ExpandPrompt(r.Context(), name, arguments)
+			if err != nil {
+				writeError(w, http.StatusBadGateway, err)
+				return
+			}
+			if ok {
+				hasMCP = true
+				mcpPrompt = rendered
+			}
+		}
+	}
+	if !hasPlugin && !hasCustom && !hasMCP {
+		writeError(w, http.StatusNotFound, errText("command not found"))
+		return
+	}
+	if hasPlugin {
+		hasCustom = false
+	}
+	text := mcpPrompt
+	if !hasMCP {
+		text = s.expandIn(r, "/"+name+" "+arguments)
+	}
 	if extra != "" {
 		text = strings.TrimSpace(text) + "\n\n" + extra
 	}

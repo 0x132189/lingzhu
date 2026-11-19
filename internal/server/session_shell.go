@@ -48,6 +48,20 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"skills": items})
 }
 
+// refreshSkills rescans local roots and retries remote skill sources.
+func (s *Server) refreshSkills(w http.ResponseWriter, r *http.Request) {
+	services := s.workspace(r)
+	if services == nil || services.RefreshSkills == nil {
+		writeError(w, http.StatusNotImplemented, errText("skills are not available"))
+		return
+	}
+	if err := services.RefreshSkills(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	s.listSkills(w, r)
+}
+
 // runSkill injects one skill's instructions as a user turn.
 func (s *Server) runSkill(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")

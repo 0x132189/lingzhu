@@ -8,13 +8,14 @@ import (
 
 func TestStatusGroupsToolsAndResources(t *testing.T) {
 	manager := &Manager{
+		states:  map[string]*serverState{"alpha": {status: StatusConnected}, "beta": {status: StatusConnected}},
 		clients: map[string]*Client{"alpha": {}, "beta": {}},
 		resources: map[string][]Resource{
 			"alpha": {{Name: "notes", URI: "mem://notes", Description: "notes"}},
 		},
-		tools: []tool.Tool{
-			&mcpTool{server: "alpha", rawName: "read", name: "alpha_read"},
-			&mcpTool{server: "beta", rawName: "write", name: "beta_write"},
+		serverTools: map[string][]tool.Tool{
+			"alpha": {&mcpTool{server: "alpha", rawName: "read", name: "alpha_read"}},
+			"beta":  {&mcpTool{server: "beta", rawName: "write", name: "beta_write"}},
 		},
 	}
 	status := manager.Status()

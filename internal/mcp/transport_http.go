@@ -103,6 +103,13 @@ func (t *httpTransport) Send(ctx context.Context, message []byte, expectID int64
 		t.sessionID = id
 		t.mu.Unlock()
 	}
+	// A legacy Streamable HTTP server answers 404 when it no longer knows this
+	// session. Mark the connection closed so the manager can show a failed
+	// server and the user can retry instead of every later call failing.
+	if resp.StatusCode == http.StatusNotFound && session != "" {
+		t.shutdown(false)
+		return fmt.Errorf("mcp: HTTP 404: session expired")
+	}
 
 	switch {
 	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent:
@@ -270,16 +277,56 @@ func (t *httpTransport) isClosed() bool {
 	return t.closed
 }
 
-func (t *httpTransport) Close() error {
+// shutdown marks the transport dead exactly once and notifies the client. An
+// intentional close also terminates the server session, as the Streamable HTTP
+// transport requires; an expired session is already gone.
+func (t *httpTransport) shutdown(terminate bool) {
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
 	t.closed = true
+	session := t.sessionID
+	protocol := t.protocolVersion
 	cancel := t.streamCancel
 	t.mu.Unlock()
+	if terminate && session != "" {
+		t.terminate(session, protocol)
+	}
 	if cancel != nil {
 		cancel()
 	}
 	if t.onClose != nil {
 		t.onClose()
 	}
+}
+
+func (t *httpTransport) terminate(session, protocol string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.endpoint, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Mcp-Session-Id", session)
+	if protocol != "" {
+		req.Header.Set("MCP-Protocol-Version", protocol)
+	}
+	for key, value := range t.headers {
+		req.Header.Set(key, value)
+	}
+	if err := t.authorize(ctx, req); err != nil {
+		return
+	}
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+func (t *httpTransport) Close() error {
+	t.shutdown(true)
 	return nil
 }

@@ -209,6 +209,20 @@ func (r *Registry) Add(t Tool) {
 	r.dirty = true
 }
 
+// Remove deletes one tool from the registry and reports whether it existed.
+// Tools loaded dynamically, such as MCP tools, use it when a server stops
+// advertising them.
+func (r *Registry) Remove(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.tools[name]; !ok {
+		return false
+	}
+	delete(r.tools, name)
+	r.dirty = true
+	return true
+}
+
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"lingzhu/internal/rpc"
+	"lingzhu/internal/tool"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -382,6 +383,140 @@ func TestStreamableHTTPGetStream(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("client did not answer the server ping")
 	}
+}
+
+func TestHTTPSessionTerminatesOnClose(t *testing.T) {
+	deleted := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.Error(w, "no stream", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			deleted <- r.Header.Get("Mcp-Session-Id")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var message rpc.Message
+		if err := json.Unmarshal(body, &message); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if message.Method == "initialize" {
+			w.Header().Set("Mcp-Session-Id", "sess-delete")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(rpcReply(message.ID, map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "delete", "version": "1"},
+			}))
+			return
+		}
+		if message.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		result, failure := fakeResult(t, message)
+		if failure != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(failure)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(rpcReply(message.ID, result))
+	}))
+	defer server.Close()
+
+	manager := Start(context.Background(), Config{Servers: map[string]Server{
+		"delete": {
+			Type:    "remote",
+			URL:     server.URL,
+			Timeout: Timeout{Startup: 5000, Catalog: 5000, Execution: 5000},
+		},
+	}}, t.TempDir(), t.Logf)
+	manager.Close()
+	select {
+	case session := <-deleted:
+		if session != "sess-delete" {
+			t.Fatalf("unexpected terminated session: %q", session)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("DELETE was not sent when the client closed")
+	}
+}
+
+func TestHTTPSessionExpiryMarksServerFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.Error(w, "no stream", http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var message rpc.Message
+		if err := json.Unmarshal(body, &message); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if message.Method == "initialize" {
+			w.Header().Set("Mcp-Session-Id", "sess-expire")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(rpcReply(message.ID, map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "expire", "version": "1"},
+			}))
+			return
+		}
+		if message.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if message.Method == "tools/call" {
+			http.NotFound(w, r)
+			return
+		}
+		result, failure := fakeResult(t, message)
+		if failure != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(failure)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(rpcReply(message.ID, result))
+	}))
+	defer server.Close()
+
+	manager := Start(context.Background(), Config{Servers: map[string]Server{
+		"expire": {
+			Type:    "remote",
+			URL:     server.URL,
+			Timeout: Timeout{Startup: 5000, Catalog: 5000, Execution: 5000},
+		},
+	}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	var echo tool.Tool
+	for _, item := range manager.Tools() {
+		if item.Name() == "expire_echo" {
+			echo = item
+		}
+	}
+	if echo == nil {
+		t.Fatal("echo tool not discovered")
+	}
+	if _, err := echo.Run(context.Background(), call("expire_echo", `{"text":"hi"}`)); err == nil {
+		t.Fatal("expired session call should fail")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status, ok := manager.StatusFor("expire")
+		if ok && status.Status == StatusFailed {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expired session was not marked failed: %+v", manager.Status())
 }
 
 func TestRemoteOAuthToken(t *testing.T) {

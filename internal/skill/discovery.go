@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -76,8 +77,11 @@ func Roots(configured []string, configPath, workdir string) []string {
 	return roots
 }
 
-// Manager holds discovered skills keyed by id.
+// Manager holds discovered skills keyed by id. Reload replaces the catalog in
+// place so the skill tool and prompt builder see filesystem changes without a
+// workspace restart.
 type Manager struct {
+	mu     sync.RWMutex
 	skills map[string]Info
 	list   []Info
 }
@@ -118,6 +122,8 @@ func (m *Manager) Get(id string) (Info, bool) {
 	if m == nil {
 		return Info{}, false
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	item, ok := m.skills[id]
 	return item, ok
 }
@@ -127,7 +133,22 @@ func (m *Manager) List() []Info {
 	if m == nil {
 		return nil
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return append([]Info(nil), m.list...)
+}
+
+// Reload replaces the catalog with a fresh scan of roots. Existing skills that
+// disappeared are removed; later roots still win on duplicate ids.
+func (m *Manager) Reload(roots []string, logf func(string, ...any)) {
+	if m == nil {
+		return
+	}
+	next := Discover(roots, logf)
+	m.mu.Lock()
+	m.skills = next.skills
+	m.list = next.list
+	m.mu.Unlock()
 }
 
 // Filter removes skills whose id is rejected and rebuilds the ordered list.
@@ -135,6 +156,8 @@ func (m *Manager) Filter(keep func(id string) bool) {
 	if m == nil || keep == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for id := range m.skills {
 		if !keep(id) {
 			delete(m.skills, id)
@@ -152,6 +175,8 @@ func (m *Manager) Summaries() []Summary {
 	if m == nil {
 		return nil
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return Summaries(m.list)
 }
 

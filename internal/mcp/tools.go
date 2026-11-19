@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"strings"
 
+	"lingzhu/internal/model"
 	"lingzhu/internal/tool"
 )
+
+// maxAttachmentBytes bounds one inline MCP media attachment.
+const maxAttachmentBytes = 20 * 1024 * 1024
 
 type mcpTool struct {
 	client      *Client
@@ -57,19 +61,70 @@ func (t *mcpTool) Run(ctx context.Context, call tool.Call) (string, error) {
 		}
 		return "", errors.New(text)
 	}
+	attachResultMedia(call, result)
 	return text, nil
 }
 
-func formatCallResult(result *CallResult) string {
-	if len(result.StructuredContent) > 0 {
-		var value any
-		if err := json.Unmarshal(result.StructuredContent, &value); err == nil {
-			if pretty, err := json.MarshalIndent(value, "", "  "); err == nil {
-				return string(pretty)
+// attachResultMedia gives images and PDFs returned by a tool to the model as
+// inline attachments. Other binary content remains a text placeholder.
+func attachResultMedia(call tool.Call, result *CallResult) {
+	if result == nil || !call.CanAttach {
+		return
+	}
+	for _, content := range result.Content {
+		switch content.Type {
+		case "image":
+			if content.Data == "" || !attachableMime(content.MimeType) {
+				continue
 			}
+			if base64Size(content.Data) > maxAttachmentBytes {
+				continue
+			}
+			call.SetAttachment(model.Attachment{
+				Mime: content.MimeType,
+				Name: content.Name,
+				Data: content.Data,
+			})
+		case "resource":
+			resource := content.Resource
+			if resource == nil || resource.Blob == "" || !attachableMime(resource.MimeType) {
+				continue
+			}
+			if base64Size(resource.Blob) > maxAttachmentBytes {
+				continue
+			}
+			call.SetAttachment(model.Attachment{
+				Mime: resource.MimeType,
+				Name: content.Name,
+				Data: resource.Blob,
+			})
 		}
 	}
-	var parts []string
+}
+
+func attachableMime(mime string) bool {
+	mime = strings.ToLower(strings.TrimSpace(strings.Split(mime, ";")[0]))
+	return strings.HasPrefix(mime, "image/") || mime == "application/pdf"
+}
+
+func attachResourceContents(call tool.Call, contents []ResourceContent) {
+	if !call.CanAttach {
+		return
+	}
+	for _, content := range contents {
+		if content.Blob == "" || !attachableMime(content.MimeType) || base64Size(content.Blob) > maxAttachmentBytes {
+			continue
+		}
+		call.SetAttachment(model.Attachment{
+			Mime: content.MimeType,
+			Name: content.URI,
+			Data: content.Blob,
+		})
+	}
+}
+
+func formatCallResult(result *CallResult) string {
+	parts := make([]string, 0, len(result.Content))
 	for _, content := range result.Content {
 		switch content.Type {
 		case "text":
@@ -79,10 +134,20 @@ func formatCallResult(result *CallResult) string {
 		case "image", "audio":
 			parts = append(parts, fmt.Sprintf("[%s %s, %d bytes]", content.Type, content.MimeType, base64Size(content.Data)))
 		case "resource":
-			if content.Text != "" {
+			if content.Resource != nil {
+				parts = append(parts, formatResourceContent(*content.Resource))
+			} else if content.Text != "" {
 				parts = append(parts, content.Text)
 			} else if content.URI != "" {
 				parts = append(parts, fmt.Sprintf("[resource %s]", content.URI))
+			}
+		case "resource_link":
+			label := content.URI
+			if content.Name != "" {
+				label = content.Name + " (" + content.URI + ")"
+			}
+			if label != "" {
+				parts = append(parts, fmt.Sprintf("[resource link %s]", label))
 			}
 		default:
 			if content.Text != "" {
@@ -90,7 +155,22 @@ func formatCallResult(result *CallResult) string {
 			}
 		}
 	}
-	return strings.Join(parts, "\n")
+	structured := ""
+	if len(result.StructuredContent) > 0 {
+		var value any
+		if err := json.Unmarshal(result.StructuredContent, &value); err == nil {
+			if pretty, err := json.MarshalIndent(value, "", "  "); err == nil {
+				structured = string(pretty)
+			}
+		}
+	}
+	if structured == "" {
+		return strings.Join(parts, "\n")
+	}
+	if len(parts) == 0 {
+		return structured
+	}
+	return strings.Join(parts, "\n") + "\n\n" + structured
 }
 
 func base64Size(data string) int {
@@ -225,6 +305,7 @@ func (t *readResource) Run(ctx context.Context, call tool.Call) (string, error) 
 	if len(contents) == 0 {
 		return "", nil
 	}
+	attachResourceContents(call, contents)
 	parts := make([]string, 0, len(contents))
 	for _, content := range contents {
 		parts = append(parts, formatResourceContent(content))
