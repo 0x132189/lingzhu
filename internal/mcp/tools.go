@@ -52,6 +52,10 @@ func (t *mcpTool) Schema() json.RawMessage {
 }
 
 func (t *mcpTool) Run(ctx context.Context, call tool.Call) (string, error) {
+	if call.Metadata != nil {
+		call.Metadata["mcpServer"] = t.server
+		call.Metadata["mcpTool"] = t.rawName
+	}
 	if err := call.Allow(ctx, t.name, []string{"*"}, ""); err != nil {
 		return "", err
 	}
@@ -214,16 +218,15 @@ type listEvents struct {
 func (t *listEvents) Name() string { return "lingzhu_list_mcp_events" }
 
 func (t *listEvents) Description() string {
-	return "List the event types an MCP server sends. Only servers that declare the MCP Events extension appear here."
+	return "List the event types an MCP server sends. Only servers that declare the MCP Events extension appear here. Omit server to list every connected server."
 }
 
 func (t *listEvents) Schema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"server": {"type": "string", "description": "MCP server name as configured"}
-		},
-		"required": ["server"]
+			"server": {"type": "string", "description": "MCP server name as configured. Omit to list every server."}
+		}
 	}`)
 }
 
@@ -235,21 +238,65 @@ func (t *listEvents) Run(ctx context.Context, call tool.Call) (string, error) {
 		return "", fmt.Errorf("lingzhu_list_mcp_events: %w", err)
 	}
 	args.Server = strings.TrimSpace(args.Server)
-	if args.Server == "" {
-		return "", errors.New("lingzhu_list_mcp_events: server is required")
+	if args.Server != "" {
+		return t.listServer(ctx, call, args.Server)
 	}
-	if err := call.Allow(ctx, "lingzhu_list_mcp_events", []string{args.Server}, ""); err != nil {
+	servers := t.manager.Servers()
+	if len(servers) == 0 {
+		return "No MCP events found", nil
+	}
+	if err := call.Allow(ctx, "lingzhu_list_mcp_events", servers, ""); err != nil {
 		return "", err
 	}
-	if !t.manager.EventsSupported(args.Server) {
-		return "", fmt.Errorf("MCP server %q is not connected or sends no events", args.Server)
+	var b strings.Builder
+	for _, server := range servers {
+		if !t.manager.EventsSupported(server) {
+			continue
+		}
+		text, err := t.formatServer(ctx, server)
+		if err != nil {
+			return "", err
+		}
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(server + ":\n")
+		b.WriteString(text)
+		b.WriteString("\n")
 	}
-	events, err := t.manager.EventTypes(ctx, args.Server)
+	if b.Len() == 0 {
+		return "No MCP events found", nil
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func (t *listEvents) listServer(ctx context.Context, call tool.Call, server string) (string, error) {
+	if err := call.Allow(ctx, "lingzhu_list_mcp_events", []string{server}, ""); err != nil {
+		return "", err
+	}
+	if !t.manager.EventsSupported(server) {
+		status, ok := t.manager.StatusFor(server)
+		if !ok {
+			return "", fmt.Errorf("MCP server %q is not configured", server)
+		}
+		if status.Status != StatusConnected {
+			return "", fmt.Errorf("MCP server %q is not connected (status: %s)", server, status.Status)
+		}
+		return "", fmt.Errorf("MCP server %q is connected but does not advertise the MCP Events extension", server)
+	}
+	return t.formatServer(ctx, server)
+}
+
+func (t *listEvents) formatServer(ctx context.Context, server string) (string, error) {
+	events, err := t.manager.EventTypes(ctx, server)
 	if err != nil {
 		return "", fmt.Errorf("lingzhu_list_mcp_events: %w", err)
 	}
 	if len(events) == 0 {
-		return "No MCP events found", nil
+		return "", nil
 	}
 	push := make([]EventType, 0, len(events))
 	for _, item := range events {
@@ -261,11 +308,10 @@ func (t *listEvents) Run(ctx context.Context, call tool.Call) (string, error) {
 		}
 	}
 	if len(push) == 0 {
-		return "No MCP events found", nil
+		return "", nil
 	}
-	events = push
 	var b strings.Builder
-	for _, item := range events {
+	for _, item := range push {
 		fmt.Fprintf(&b, "%s", item.Name)
 		if item.Description != "" {
 			b.WriteString(" - " + item.Description)

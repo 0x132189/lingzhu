@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"lingzhu/internal/location"
@@ -17,11 +18,16 @@ func TestSkillsRefreshEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
+	source := ""
 	services := &location.Services{
 		Ref:    ref,
 		Skills: skill.Discover(nil, nil),
 		RefreshSkills: func(context.Context) error {
 			called = true
+			return nil
+		},
+		RefreshSkillSource: func(_ context.Context, url string) error {
+			source = url
 			return nil
 		},
 	}
@@ -36,5 +42,14 @@ func TestSkillsRefreshEndpoint(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("refresh callback was not invoked")
+	}
+
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/skills/refresh", strings.NewReader(`{"url":"https://example.com/skills"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected source refresh status: %d %s", rec.Code, rec.Body.String())
+	}
+	if source != "https://example.com/skills" {
+		t.Fatalf("source refresh callback got %q", source)
 	}
 }

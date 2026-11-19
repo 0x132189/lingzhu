@@ -28,6 +28,7 @@ type elicitationProp struct {
 	Type        string            `json:"type"`
 	Title       string            `json:"title"`
 	Description string            `json:"description"`
+	Format      string            `json:"format"`
 	Enum        []any             `json:"enum"`
 	Items       *elicitationProp  `json:"items"`
 	EnumNames   []string          `json:"enumNames"`
@@ -37,13 +38,17 @@ type elicitationProp struct {
 }
 
 func elicitationHandler(runner *agent.Agent) func(ctx context.Context, server, sessionID string, params json.RawMessage) (any, error) {
-	return func(ctx context.Context, _ string, sessionID string, params json.RawMessage) (any, error) {
+	return func(ctx context.Context, server, sessionID string, params json.RawMessage) (any, error) {
 		var request elicitationParams
 		if err := json.Unmarshal(params, &request); err != nil {
 			return map[string]any{"action": "decline"}, nil
 		}
-		// URL elicitation needs a browser handoff. Show the URL in a question so
-		// the user can complete it manually, then retry through the normal flow.
+		title := "MCP"
+		if name := strings.TrimSpace(server); name != "" {
+			title = "MCP · " + name
+		}
+		// URL elicitation needs a browser handoff. The dock renders the URL and
+		// an open action; submitting acceptance continues the normal flow.
 		if strings.EqualFold(strings.TrimSpace(request.Mode), "url") {
 			url := strings.TrimSpace(request.URL)
 			if url == "" {
@@ -55,19 +60,16 @@ func elicitationHandler(runner *agent.Agent) func(ctx context.Context, server, s
 			}
 			response, err := runner.Ask(ctx, sessionID, []question.Prompt{{
 				Header:   "Authorization",
-				Question: message + "\n" + url,
-				Options: []question.Option{
-					{Label: "Done", Description: "I completed the authorization."},
-					{Label: "Cancel", Description: "Cancel the request."},
-				},
+				Title:    title,
+				Question: message,
+				Options:  []question.Option{},
+				Kind:     "external",
+				URL:      url,
 			}})
 			if err != nil {
 				return map[string]any{"action": "decline"}, nil
 			}
-			if response.Cancelled || len(response.Answers) == 0 || len(response.Answers[0]) == 0 {
-				return map[string]any{"action": "cancel"}, nil
-			}
-			if strings.EqualFold(strings.TrimSpace(response.Answers[0][0]), "Cancel") {
+			if response.Cancelled {
 				return map[string]any{"action": "cancel"}, nil
 			}
 			return map[string]any{"action": "accept"}, nil
@@ -77,6 +79,10 @@ func elicitationHandler(runner *agent.Agent) func(ctx context.Context, server, s
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
+		required := make(map[string]bool, len(request.RequestedSchema.Required))
+		for _, key := range request.RequestedSchema.Required {
+			required[key] = true
+		}
 		prompts := make([]question.Prompt, 0, len(keys))
 		for _, key := range keys {
 			property := request.RequestedSchema.Properties[key]
@@ -91,21 +97,35 @@ func elicitationHandler(runner *agent.Agent) func(ctx context.Context, server, s
 			if text == "" {
 				text = label
 			}
+			kind := elicitationKind(property)
 			prompt := question.Prompt{
 				Header:   label,
+				Title:    title,
 				Question: text,
-				Options:  elicitationOptions(property),
+				Options:  []question.Option{},
+				Kind:     kind,
+				Format:   property.Format,
+				Required: required[key],
 			}
-			if property.Type == "array" {
-				prompt.Multiple = true
+			switch kind {
+			case "boolean":
+				prompt.Options = []question.Option{
+					{Label: "true", Description: "Accept"},
+					{Label: "false", Description: "Decline"},
+				}
+			case "select", "multiselect":
+				prompt.Options = elicitationOptions(property)
+				prompt.Multiple = kind == "multiselect"
 			}
 			prompts = append(prompts, prompt)
 		}
 		if len(prompts) == 0 {
 			prompts = append(prompts, question.Prompt{
 				Header:   "Input",
+				Title:    title,
 				Question: request.Message,
-				Options:  []question.Option{{Label: "Continue", Description: "Accept the request."}},
+				Options:  []question.Option{},
+				Kind:     "text",
 			})
 		}
 		response, err := runner.Ask(ctx, sessionID, prompts)
@@ -128,6 +148,30 @@ func elicitationHandler(runner *agent.Agent) func(ctx context.Context, server, s
 			content[key] = elicitationValue(property, answers)
 		}
 		return map[string]any{"action": "accept", "content": content}, nil
+	}
+}
+
+// elicitationKind maps one requested-schema property to the dock control.
+func elicitationKind(property elicitationProp) string {
+	switch property.Type {
+	case "boolean":
+		return "boolean"
+	case "number":
+		return "number"
+	case "integer":
+		return "integer"
+	case "array":
+		if property.Items != nil && len(property.Items.Enum) > 0 {
+			return "multiselect"
+		}
+		return "text"
+	case "string":
+		if len(property.OneOf) > 0 || len(property.Enum) > 0 {
+			return "select"
+		}
+		return "text"
+	default:
+		return "text"
 	}
 }
 

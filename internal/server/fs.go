@@ -281,12 +281,22 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// readFile returns a bounded text preview of one workspace file.
+// readFile returns a bounded text preview of one workspace file. Skill files
+// outside the workspace are readable when they belong to a discovered skill.
 func (s *Server) readFile(w http.ResponseWriter, r *http.Request) {
-	abs, rel, err := resolveWorkspacePath(s.rootFor(r), r.URL.Query().Get("path"))
+	raw := r.URL.Query().Get("path")
+	abs, rel, err := resolveWorkspacePath(s.rootFor(r), raw)
 	if err != nil {
-		writeFileError(w, err)
-		return
+		if !s.skillFileAllowed(r, raw) {
+			writeFileError(w, err)
+			return
+		}
+		abs, err = filepath.Abs(strings.TrimSpace(raw))
+		if err != nil {
+			writeFileError(w, err)
+			return
+		}
+		rel = filepath.ToSlash(abs)
 	}
 	info, err := os.Lstat(abs)
 	if err != nil {
@@ -509,6 +519,32 @@ func (s *Server) moveFile(w http.ResponseWriter, r *http.Request) {
 
 // resolveWorkspacePath confines a relative or absolute request path to the
 // workspace root. The second result is the slash-separated relative path.
+// skillFileAllowed reports whether a path belongs to the skill catalog of the
+// request's workspace. It keeps read-only previews for global and cached
+// skills working without widening the writable workspace sandbox.
+func (s *Server) skillFileAllowed(r *http.Request, raw string) bool {
+	manager := s.skillsFor(r)
+	if manager == nil {
+		return false
+	}
+	target, err := filepath.Abs(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	target = filepath.Clean(target)
+	for _, info := range manager.List() {
+		if filepath.Clean(info.Path) == target {
+			return true
+		}
+		directory := filepath.Clean(info.Directory)
+		relative, err := filepath.Rel(directory, target)
+		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveWorkspacePath(workspace, raw string) (string, string, error) {
 	if strings.TrimSpace(workspace) == "" {
 		return "", "", errors.New("workspace is not configured")

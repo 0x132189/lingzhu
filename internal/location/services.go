@@ -49,6 +49,8 @@ type Services struct {
 
 	// RefreshSkills rescans local skill roots and retries remote sources.
 	RefreshSkills func(context.Context) error
+	// RefreshSkillSource retries one remote skill source.
+	RefreshSkillSource func(context.Context, string) error
 	// CreateSkill writes a new skill under a local root.
 	CreateSkill func(context.Context, string, string, string, string) error
 	// DeleteSkill removes one skill from a local root.

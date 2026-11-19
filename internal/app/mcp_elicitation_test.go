@@ -57,6 +57,28 @@ func TestElicitationValueMapsEnumsAndTypes(t *testing.T) {
 	}
 }
 
+func TestElicitationKindMapsSchemaTypes(t *testing.T) {
+	cases := []struct {
+		property elicitationProp
+		want     string
+	}{
+		{elicitationProp{Type: "boolean"}, "boolean"},
+		{elicitationProp{Type: "number"}, "number"},
+		{elicitationProp{Type: "integer"}, "integer"},
+		{elicitationProp{Type: "string", Enum: []any{"a"}}, "select"},
+		{elicitationProp{Type: "string", OneOf: []elicitationProp{{Const: "a"}}}, "select"},
+		{elicitationProp{Type: "string", Format: "uri"}, "text"},
+		{elicitationProp{Type: "array", Items: &elicitationProp{Type: "string", Enum: []any{"a"}}}, "multiselect"},
+		{elicitationProp{Type: "array", Items: &elicitationProp{Type: "string"}}, "text"},
+		{elicitationProp{Type: "object"}, "text"},
+	}
+	for _, tc := range cases {
+		if got := elicitationKind(tc.property); got != tc.want {
+			t.Fatalf("%+v: got %q, want %q", tc.property, got, tc.want)
+		}
+	}
+}
+
 func TestSamplingTextCollectsContentParts(t *testing.T) {
 	single, _ := json.Marshal(map[string]any{"type": "text", "text": "one"})
 	if got := samplingText(single); got != "one" {

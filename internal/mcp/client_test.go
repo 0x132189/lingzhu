@@ -393,8 +393,13 @@ func TestEventToolsListCatalog(t *testing.T) {
 	if !strings.Contains(out, "job.finished") || !strings.Contains(out, "job.failed") {
 		t.Fatalf("unexpected event list: %q", out)
 	}
+	if out, err := toolItem.Run(context.Background(), tool.Call{Name: toolItem.Name(), Input: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(out, "demo:") || !strings.Contains(out, "job.finished") {
+		t.Fatalf("unexpected all-server event list: %q", out)
+	}
 	if _, err := toolItem.Run(context.Background(), tool.Call{Name: toolItem.Name(), Input: json.RawMessage(`{"server":"missing"}`)}); err == nil ||
-		!strings.Contains(err.Error(), "not connected") {
+		!strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("want missing-server error, got %v", err)
 	}
 }
@@ -602,6 +607,9 @@ func TestRootsResultUsesWorkspace(t *testing.T) {
 func TestToolName(t *testing.T) {
 	if got := ToolName("my.server", "my tool"); got != "my_server_my_tool" {
 		t.Fatalf("unexpected tool name: %q", got)
+	}
+	if got := ToolName("fixture-echo", "add"); got != "fixture_echo_add" {
+		t.Fatalf("hyphens should become underscores: %q", got)
 	}
 }
 

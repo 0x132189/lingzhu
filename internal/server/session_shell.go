@@ -7,12 +7,14 @@ import (
 	"errors"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"lingzhu/internal/agent"
 	"lingzhu/internal/config"
 	"lingzhu/internal/event"
+	"lingzhu/internal/global"
 	"lingzhu/internal/job"
 	"lingzhu/internal/proc"
 	"lingzhu/internal/provider"
@@ -36,17 +38,52 @@ type skillSummary struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	Directory   string `json:"directory,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Autoinvoke  bool   `json:"autoinvoke"`
+	Source      string `json:"source,omitempty"`
 }
 
 // listSkills returns the discovered skill catalog without file contents.
 func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 	items := []skillSummary{}
 	if manager := s.skillsFor(r); manager != nil {
+		root := s.rootFor(r)
 		for _, info := range manager.List() {
-			items = append(items, skillSummary{ID: info.ID, Name: info.Name, Description: info.Description})
+			items = append(items, skillSummary{
+				ID:          info.ID,
+				Name:        info.Name,
+				Description: info.Description,
+				Directory:   info.Directory,
+				Path:        info.Path,
+				Autoinvoke:  info.Autoinvoke,
+				Source:      skillSource(info.Directory, root),
+			})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"skills": items})
+}
+
+// skillSource labels where a discovered skill came from: the workspace, the
+// remote cache, or a shared global root.
+func skillSource(directory, workspace string) string {
+	inside := func(root string) bool {
+		if root == "" {
+			return false
+		}
+		relative, err := filepath.Rel(root, directory)
+		if err != nil {
+			return false
+		}
+		return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+	}
+	if inside(workspace) {
+		return "project"
+	}
+	if inside(filepath.Join(global.Cache(), "skills")) {
+		return "remote"
+	}
+	return "global"
 }
 
 type skillDetail struct {
@@ -147,7 +184,17 @@ func (s *Server) refreshSkills(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, errText("skills are not available"))
 		return
 	}
-	if err := services.RefreshSkills(r.Context()); err != nil {
+	var body struct {
+		URL string `json:"url"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	var err error
+	if strings.TrimSpace(body.URL) != "" && services.RefreshSkillSource != nil {
+		err = services.RefreshSkillSource(r.Context(), body.URL)
+	} else {
+		err = services.RefreshSkills(r.Context())
+	}
+	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}

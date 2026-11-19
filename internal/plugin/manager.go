@@ -33,6 +33,7 @@ type Command struct {
 // commands they expose.
 type Manager struct {
 	clients    map[string]*Client
+	failed     map[string]string
 	permission []*Client
 	hooks      []*Client
 	tools      []tool.Tool
@@ -51,6 +52,7 @@ func Start(ctx context.Context, cfg Config, workdir string, logf func(string, ..
 	}
 	m := &Manager{
 		clients: map[string]*Client{},
+		failed:  map[string]string{},
 		panels:  map[string][]PanelInfo{},
 		byName:  map[string]Command{},
 		logf:    logf,
@@ -63,6 +65,7 @@ func Start(ctx context.Context, cfg Config, workdir string, logf func(string, ..
 
 	type started struct {
 		name     string
+		err      error
 		client   *Client
 		tools    []ToolInfo
 		commands []CommandInfo
@@ -81,7 +84,7 @@ func Start(ctx context.Context, cfg Config, workdir string, logf func(string, ..
 			client, err := connect(ctx, name, server, workdir)
 			if err != nil {
 				logf("%v", err)
-				results <- started{name: name}
+				results <- started{name: name, err: err}
 				return
 			}
 			item := started{name: name, client: client}
@@ -111,6 +114,9 @@ func Start(ctx context.Context, cfg Config, workdir string, logf func(string, ..
 
 	for item := range results {
 		if item.client == nil {
+			if item.err != nil {
+				m.failed[item.name] = item.err.Error()
+			}
 			continue
 		}
 		m.clients[item.name] = item.client
@@ -363,7 +369,7 @@ func (m *Manager) Close() {
 	}
 }
 
-var toolNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+var toolNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 // ToolName flattens a plugin and tool pair into one registry name.
 func ToolName(pluginName, name string) string {

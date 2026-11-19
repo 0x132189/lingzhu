@@ -105,6 +105,72 @@ func (s *skillsState) refresh(ctx context.Context) error {
 	return pullErr
 }
 
+// refreshSource retries one remote URL and rebuilds the catalog with the new
+// roots for that source, keeping every other root in place.
+func (s *skillsState) refreshSource(ctx context.Context, sourceURL string) error {
+	if s == nil {
+		return fmt.Errorf("skills are not available")
+	}
+	sourceURL = strings.TrimSpace(sourceURL)
+	if sourceURL == "" {
+		return s.refresh(ctx)
+	}
+	local := skill.Roots(s.cfg.Skills.Paths, s.cfg.Path, s.workdir)
+	cacheRoot := filepath.Join(global.Cache(), "skills")
+	result := skill.PullStatus(ctx, []string{sourceURL}, global.Cache(), s.logf)
+
+	// One source owns every root under its cache key, so the refreshed roots
+	// replace exactly the previous roots of that key.
+	refreshed := map[string]bool{}
+	for _, root := range result.Roots {
+		relative, err := filepath.Rel(cacheRoot, root)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			continue
+		}
+		refreshed[strings.Split(relative, string(filepath.Separator))[0]] = true
+	}
+	roots := append([]string(nil), result.Roots...)
+	for _, root := range s.Roots() {
+		relative, err := filepath.Rel(cacheRoot, root)
+		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			if refreshed[strings.Split(relative, string(filepath.Separator))[0]] {
+				continue
+			}
+		}
+		roots = append(roots, root)
+	}
+	for _, root := range local {
+		if !containsRoot(roots, root) {
+			roots = append(roots, root)
+		}
+	}
+	s.manager.Reload(roots, s.logf)
+	s.manager.Filter(s.keep)
+	s.mu.Lock()
+	s.roots = roots
+	s.localRoots = local
+	kept := s.errors[:0]
+	for _, item := range s.errors {
+		if item.URL != sourceURL {
+			kept = append(kept, item)
+		}
+	}
+	s.errors = append(kept, result.Errors...)
+	s.mu.Unlock()
+	if len(result.Errors) > 0 {
+		parts := make([]string, 0, len(result.Errors))
+		for _, item := range result.Errors {
+			if item.URL == "" {
+				parts = append(parts, item.Error)
+			} else {
+				parts = append(parts, item.URL+": "+item.Error)
+			}
+		}
+		return fmt.Errorf("skill source: %s", strings.Join(parts, "; "))
+	}
+	return nil
+}
+
 // SourceErrors returns the last per-source pull failures.
 func (s *skillsState) SourceErrors() []skill.SourceError {
 	if s == nil {

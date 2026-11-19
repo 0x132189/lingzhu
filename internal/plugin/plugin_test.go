@@ -239,6 +239,9 @@ func TestPluginToolName(t *testing.T) {
 	if got := ToolName("my.plugin", "my tool"); got != "my_plugin_my_tool" {
 		t.Fatalf("unexpected tool name: %q", got)
 	}
+	if got := ToolName("my-plugin", "run-task"); got != "my_plugin_run_task" {
+		t.Fatalf("hyphens should become underscores: %q", got)
+	}
 }
 
 func TestPluginConfigForms(t *testing.T) {

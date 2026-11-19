@@ -17,6 +17,8 @@ type PluginTool struct {
 // PluginStatus is the public view of one connected plugin.
 type PluginStatus struct {
 	Name         string       `json:"name"`
+	Status       string       `json:"status,omitempty"`
+	Error        string       `json:"error,omitempty"`
 	Capabilities Capabilities `json:"capabilities"`
 	Tools        []PluginTool `json:"tools"`
 	Commands     []string     `json:"commands"`
@@ -68,11 +70,23 @@ func (m *Manager) Status() []PluginStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	byName := make(map[string]*PluginStatus, len(m.clients))
+	byName := make(map[string]*PluginStatus, len(m.clients)+len(m.failed))
 	for name, client := range m.clients {
 		byName[name] = &PluginStatus{
 			Name:         name,
+			Status:       "connected",
 			Capabilities: client.Capabilities(),
+			Tools:        []PluginTool{},
+			Commands:     []string{},
+			Panels:       []PanelInfo{},
+		}
+	}
+	for name, message := range m.failed {
+		byName[name] = &PluginStatus{
+			Name:         name,
+			Status:       "failed",
+			Error:        message,
+			Capabilities: Capabilities{},
 			Tools:        []PluginTool{},
 			Commands:     []string{},
 			Panels:       []PanelInfo{},

@@ -27,8 +27,16 @@ type Option struct {
 type Prompt struct {
 	Question string   `json:"question"`
 	Header   string   `json:"header"`
+	Title    string   `json:"title,omitempty"`
 	Options  []Option `json:"options"`
 	Multiple bool     `json:"multiple,omitempty"`
+	// Kind selects the control for an MCP elicitation field. An empty kind
+	// keeps the model-facing question card.
+	Kind        string `json:"kind,omitempty"`
+	Placeholder string `json:"placeholder,omitempty"`
+	Format      string `json:"format,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Required    bool   `json:"required,omitempty"`
 }
 
 // Request is a pending question set.

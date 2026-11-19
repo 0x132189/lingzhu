@@ -384,10 +384,11 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 		Skills:        skills,
 		Commands:      commandRegistry,
 		Subagents:     subagents,
-		RefreshSkills: skillState.refresh,
-		CreateSkill:   skillState.CreateSkill,
-		DeleteSkill:   skillState.DeleteSkill,
-		SkillErrors:   skillState.SourceErrors,
+		RefreshSkills:      skillState.refresh,
+		RefreshSkillSource: skillState.refreshSource,
+		CreateSkill:        skillState.CreateSkill,
+		DeleteSkill:        skillState.DeleteSkill,
+		SkillErrors:        skillState.SourceErrors,
 	}
 	services.SetConfig(cfg)
 	services.CloseFn = func() {

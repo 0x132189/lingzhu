@@ -21,13 +21,20 @@ func TestStatusGroupsToolsAndCommands(t *testing.T) {
 			{Name: "review", Plugin: "alpha"},
 			{Name: "deploy", Plugin: "beta"},
 		},
+		failed: map[string]string{"broken": "boom"},
 	}
 	status := manager.Status()
-	if len(status) != 2 || status[0].Name != "alpha" || status[1].Name != "beta" {
+	if len(status) != 3 || status[0].Name != "alpha" || status[1].Name != "beta" {
 		t.Fatalf("unexpected plugins: %+v", status)
+	}
+	if status[2].Name != "broken" || status[2].Status != "failed" || status[2].Error != "boom" {
+		t.Fatalf("failed plugin missing from status: %+v", status[2])
 	}
 	if len(status[0].Tools) != 1 || status[0].Tools[0].Name != "read" || status[0].Tools[0].Effective != "alpha_read" {
 		t.Fatalf("unexpected alpha tools: %+v", status[0].Tools)
+	}
+	if status[0].Status != "connected" {
+		t.Fatalf("connected plugin missing status: %+v", status[0])
 	}
 	if len(status[0].Commands) != 1 || status[0].Commands[0] != "review" {
 		t.Fatalf("unexpected alpha commands: %+v", status[0].Commands)

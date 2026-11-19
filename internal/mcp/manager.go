@@ -1255,7 +1255,7 @@ func poolKey(server Server) string {
 	return string(payload)
 }
 
-var toolNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+var toolNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 // ToolName flattens a server and tool pair into one registry name, matching the
 // reference implementation's namespace_tool convention.
