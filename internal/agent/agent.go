@@ -2950,6 +2950,9 @@ func (b *toolBatch) execute(run *toolRun, reason string) {
 		CanAttach:  b.target.Attachment,
 		Metadata:   metadata,
 		Unattended: b.unattended,
+		OnProgress: func(update map[string]any) {
+			b.publish(event.ToolProgressEvent(run.call.ID, update))
+		},
 		ToolFilter: func(name string) bool {
 			return b.profile.AllowsTool(name)
 		},

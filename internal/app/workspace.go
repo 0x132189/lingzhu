@@ -190,6 +190,8 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 	}
 	execTool := tool.NewExecute(registry, workdir)
 	execTool.AllTools = cfg.CodemodeOnly
+	execTool.FullCodemode = cfg.FullCodemode
+	registry.SetFullCodemode(cfg.FullCodemode)
 	registry.Add(execTool)
 
 	catalog, err := buildCatalog(cfg)
@@ -369,21 +371,21 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 	}
 
 	services := &location.Services{
-		Ref:           ref,
-		Agent:         runner,
-		Agents:        profiles,
-		Tools:         registry,
-		Permission:    perm,
-		Snapshots:     snapshots,
-		Formatter:     formatters,
-		Worktrees:     worktrees,
-		PTY:           terminals,
-		VCS:           vcsManager,
-		MCP:           mcpManager,
-		Plugins:       plugins,
-		Skills:        skills,
-		Commands:      commandRegistry,
-		Subagents:     subagents,
+		Ref:                ref,
+		Agent:              runner,
+		Agents:             profiles,
+		Tools:              registry,
+		Permission:         perm,
+		Snapshots:          snapshots,
+		Formatter:          formatters,
+		Worktrees:          worktrees,
+		PTY:                terminals,
+		VCS:                vcsManager,
+		MCP:                mcpManager,
+		Plugins:            plugins,
+		Skills:             skills,
+		Commands:           commandRegistry,
+		Subagents:          subagents,
 		RefreshSkills:      skillState.refresh,
 		RefreshSkillSource: skillState.refreshSource,
 		CreateSkill:        skillState.CreateSkill,

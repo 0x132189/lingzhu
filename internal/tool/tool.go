@@ -47,6 +47,9 @@ type Call struct {
 	// Metadata carries UI-only result fields such as counts, providers,
 	// diagnostics and nested calls. Providers never receive it.
 	Metadata map[string]any
+	// OnProgress publishes a live UI-only metadata snapshot while a tool runs.
+	// The final result still carries the complete Metadata map.
+	OnProgress func(map[string]any)
 	// ToolFilter limits nested Code Mode calls to the tools an agent allows.
 	// Nil means every registered tool is available.
 	ToolFilter func(string) bool
@@ -70,6 +73,12 @@ func (c Call) SetMetadata(key string, value any) {
 		return
 	}
 	c.Metadata[key] = value
+}
+
+// rawInputTool opts out of the object-schema check for a tool that can also
+// accept raw text, such as a freeform Code Mode program.
+type rawInputTool interface {
+	AcceptsRawInput() bool
 }
 
 // FormatFile runs the configured formatter for a just-written file.
@@ -174,6 +183,33 @@ func (d directTool) Codemode() bool { return false }
 // Direct marks a tool as callable only directly, never inside execute.
 func Direct(t Tool) Tool { return directTool{Tool: t} }
 
+// fullCodemodeDirect lists the built-in tools the reference moves into Code
+// Mode when full_codemode is enabled. Other direct tools stay direct.
+var fullCodemodeDirect = map[string]struct{}{
+	"shell": {},
+	"read":  {},
+	"write": {},
+	"edit":  {},
+	"patch": {},
+}
+
+func promotedByFullCodemode(name string) bool {
+	_, ok := fullCodemodeDirect[name]
+	return ok
+}
+
+// SetFullCodemode toggles the reference's full Code Mode layout. Built-in file
+// and shell tools become callable inside execute and leave the direct list.
+func (r *Registry) SetFullCodemode(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fullCodemode == enabled {
+		return
+	}
+	r.fullCodemode = enabled
+	r.dirty = true
+}
+
 type codeTool struct{ Tool }
 
 func (c codeTool) Codemode() bool { return true }
@@ -184,6 +220,11 @@ func Codemode(t Tool) Tool { return codeTool{Tool: t} }
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
+
+	// fullCodemode moves the base file and shell tools into Code Mode while
+	// leaving them out of the direct tool list, matching the reference's
+	// full_codemode mode.
+	fullCodemode bool
 
 	// defs and catalogs are rebuilt only when the tool set changes. The agent
 	// asks for them on every model step, and re-rendering every schema each
@@ -266,10 +307,13 @@ func (r *Registry) CodemodeGet(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	t, ok := r.tools[name]
-	if !ok || name == "execute" || !callableInCodemode(t) {
+	if !ok || name == "execute" {
 		return nil, false
 	}
-	return t, true
+	if callableInCodemode(t) || (r.fullCodemode && promotedByFullCodemode(name)) {
+		return t, true
+	}
+	return nil, false
 }
 
 // CatalogFor renders the Code Mode prompt section for a filtered tool set.
@@ -348,9 +392,11 @@ func (r *Registry) refreshLocked() {
 			continue
 		}
 		all = append(all, def)
-		if callableInCodemode(t) {
+		promoted := r.fullCodemode && promotedByFullCodemode(def.Name)
+		if callableInCodemode(t) || promoted {
 			code = append(code, def)
-		} else {
+		}
+		if !callableInCodemode(t) && !promoted {
 			direct = append(direct, def)
 		}
 	}
@@ -378,9 +424,11 @@ func (r *Registry) Run(ctx context.Context, call Call) (string, error) {
 	}
 	// Arguments are checked against the tool's own schema before it runs, so a
 	// malformed call fails with a field list the model can correct instead of a
-	// tool-specific decode error.
-	if err := Validate(call.Name, t.Schema(), call.Input); err != nil {
-		return "", err
+	// tool-specific decode error. Freeform tools validate their own input.
+	if raw, ok := t.(rawInputTool); !ok || !raw.AcceptsRawInput() {
+		if err := Validate(call.Name, t.Schema(), call.Input); err != nil {
+			return "", err
+		}
 	}
 	return t.Run(ctx, call)
 }

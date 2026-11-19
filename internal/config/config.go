@@ -51,6 +51,10 @@ type Config struct {
 	// CodemodeOnly exposes only the execute tool directly and keeps every other
 	// tool behind Code Mode, matching the reference harness.
 	CodemodeOnly bool
+	// FullCodemode enables the experimental path and Bun file globals inside
+	// execute. It is off by default, matching released builds of the reference
+	// harness.
+	FullCodemode bool
 	Shell        []string
 	Permission   []Rule
 	// PermissionAlways holds the allows learned from "always" answers. They are
@@ -202,6 +206,7 @@ type File struct {
 	MaxSteps      int                 `json:"max_steps"`
 	SubagentDepth int                 `json:"subagent_depth"`
 	CodemodeOnly  *bool               `json:"codemode_only"`
+	FullCodemode  *bool               `json:"full_codemode"`
 	Shell         []string            `json:"shell"`
 	Permission    []Rule              `json:"permission"`
 	// PermissionAlways keeps approvals separate from configured rules, so a
@@ -432,6 +437,9 @@ func applyFile(cfg *Config, file File, dir string) {
 	}
 	if file.CodemodeOnly != nil {
 		cfg.CodemodeOnly = *file.CodemodeOnly
+	}
+	if file.FullCodemode != nil {
+		cfg.FullCodemode = *file.FullCodemode
 	}
 	if file.ModelPrompts != nil {
 		cfg.ModelPrompts = *file.ModelPrompts

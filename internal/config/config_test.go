@@ -634,6 +634,20 @@ func TestLoadCodemodeOnly(t *testing.T) {
 	}
 }
 
+func TestLoadFullCodemode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"full_codemode":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FullCodemode {
+		t.Fatal("full_codemode was not loaded")
+	}
+}
+
 func TestForDirMergesGlobalAndProjectSkills(t *testing.T) {
 	root := t.TempDir()
 	global := filepath.Join(root, "config.json")

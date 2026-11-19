@@ -44,6 +44,52 @@ func catalogRegistry() *Registry {
 	return registry
 }
 
+func TestFullCodemodePromotesBuiltins(t *testing.T) {
+	registry := NewRegistry()
+	registry.Add(catalogTool{name: "shell", description: "Shell.", schema: `{"type":"object"}`})
+	registry.Add(catalogTool{name: "read", description: "Read.", schema: `{"type":"object"}`})
+	registry.Add(catalogTool{name: "glob", description: "Glob.", schema: `{"type":"object"}`})
+	registry.Add(Codemode(catalogTool{name: "remote", description: "Remote.", schema: `{"type":"object"}`}))
+	registry.Add(catalogTool{name: "execute", description: "Code Mode.", schema: `{"type":"object"}`})
+
+	registry.SetFullCodemode(true)
+
+	defs := registry.Definitions()
+	names := make([]string, 0, len(defs))
+	for _, def := range defs {
+		names = append(names, def.Name)
+	}
+	if strings.Contains(strings.Join(names, ","), "shell") || strings.Contains(strings.Join(names, ","), "read") {
+		t.Fatalf("promoted tools should leave the direct list: %v", names)
+	}
+	if !strings.Contains(strings.Join(names, ","), "glob") {
+		t.Fatalf("glob should stay direct: %v", names)
+	}
+
+	code := registry.CodemodeDefinitions()
+	codeNames := make([]string, 0, len(code))
+	for _, def := range code {
+		codeNames = append(codeNames, def.Name)
+	}
+	if !strings.Contains(strings.Join(codeNames, ","), "shell") || !strings.Contains(strings.Join(codeNames, ","), "read") {
+		t.Fatalf("promoted tools missing from Code Mode: %v", codeNames)
+	}
+	if _, ok := registry.CodemodeGet("shell"); !ok {
+		t.Fatal("promoted shell should be callable inside execute")
+	}
+	if _, ok := registry.CodemodeGet("glob"); ok {
+		t.Fatal("glob should stay direct-only")
+	}
+	if catalog := registry.Catalog(); !strings.Contains(catalog, "tools.shell") || !strings.Contains(catalog, "tools.remote") {
+		t.Fatalf("promoted tools missing from catalog: %q", catalog)
+	}
+
+	registry.SetFullCodemode(false)
+	if _, ok := registry.CodemodeGet("shell"); ok {
+		t.Fatal("shell should be direct-only again")
+	}
+}
+
 func TestRegistryRemoveInvalidatesCatalog(t *testing.T) {
 	registry := NewRegistry()
 	registry.Add(Codemode(catalogTool{name: "remote", description: "Remote.", schema: `{"type":"object"}`}))

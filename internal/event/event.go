@@ -21,6 +21,7 @@ const (
 	ToolCall          Type = "tool.call"
 	ToolResult        Type = "tool.result"
 	ToolOutput        Type = "tool.output"
+	ToolProgress      Type = "tool.progress"
 	ReasoningDelta    Type = "reasoning.delta"
 	PermissionAsked   Type = "permission.asked"
 	PermissionReplied Type = "permission.replied"
@@ -242,6 +243,12 @@ func ToolCallEvent(id, name, arguments string) Event {
 // the client; the final tool.result replaces them with the complete output.
 func ToolOutputEvent(id, output string) Event {
 	return New(ToolOutput, map[string]any{"id": id, "output": output})
+}
+
+// ToolProgressEvent replaces UI-only metadata while a tool is running. It is
+// live-only; the final tool.result carries the durable copy.
+func ToolProgressEvent(id string, metadata map[string]any) Event {
+	return New(ToolProgress, map[string]any{"id": id, "metadata": metadata})
 }
 
 func ToolResultEvent(id, name, output string, failed bool) Event {
