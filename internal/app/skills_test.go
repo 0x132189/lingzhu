@@ -99,6 +99,27 @@ func TestSkillsStateRefreshReloadsLocalRoot(t *testing.T) {
 	}
 }
 
+func TestSkillsStateCreateAndDelete(t *testing.T) {
+	root := t.TempDir()
+	manager := skill.DiscoverWithFiles([]string{root}, t.Logf, 10)
+	cfg := config.Config{Skills: skill.Config{Paths: []string{root}}}
+	state := newSkillsState(manager, []string{root}, cfg, root, t.Logf, func(string) bool { return true })
+
+	if err := state.CreateSkill(context.Background(), "demo", "Demo", "created", "body"); err != nil {
+		t.Fatal(err)
+	}
+	item, ok := manager.Get("demo")
+	if !ok || item.Content != "body" {
+		t.Fatalf("created skill missing: %+v", item)
+	}
+	if err := state.DeleteSkill("demo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.Get("demo"); ok {
+		t.Fatal("deleted skill is still listed")
+	}
+}
+
 func TestSkillSignatureTracksMissingRoots(t *testing.T) {
 	root := t.TempDir()
 	missing := filepath.Join(root, "missing")
@@ -113,5 +134,24 @@ func TestSkillSignatureTracksMissingRoots(t *testing.T) {
 	}
 	if strings.Contains(skillSignature([]string{missing}), "missing\n") {
 		t.Fatal("created root should not be marked missing")
+	}
+}
+
+func TestSkillsStateDeletesFlatMarkdownSkill(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "loose.md")
+	if err := os.WriteFile(path, []byte("---\ndescription: loose\n---\nbody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manager := skill.Discover([]string{root}, t.Logf)
+	if _, ok := manager.Get("loose"); !ok {
+		t.Fatalf("flat skill was not discovered: %+v", manager.List())
+	}
+	state := newSkillsState(manager, []string{root}, config.Config{Skills: skill.Config{Paths: []string{root}}}, root, t.Logf, func(string) bool { return true })
+	if err := state.DeleteSkill("loose"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("flat skill file still exists: %v", err)
 	}
 }

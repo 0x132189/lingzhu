@@ -84,13 +84,16 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 
 	skillRoots := skill.Roots(cfg.Skills.Paths, cfg.Path, workdir)
 	if len(cfg.Skills.URLs) > 0 {
-		remote := skill.Pull(s.base, cfg.Skills.URLs, global.Cache(), s.log)
-		if len(remote) > 0 {
-			s.log("skills: %s pulled %d remote", ref.Name(), len(remote))
+		result := skill.PullStatus(s.base, cfg.Skills.URLs, global.Cache(), s.log)
+		if len(result.Roots) > 0 {
+			s.log("skills: %s pulled %d remote", ref.Name(), len(result.Roots))
 		}
-		skillRoots = append(remote, skillRoots...)
+		for _, item := range result.Errors {
+			s.log("skills: %s source %s: %s", ref.Name(), item.URL, item.Error)
+		}
+		skillRoots = append(result.Roots, skillRoots...)
 	}
-	skills := skill.Discover(skillRoots, s.log)
+	skills := skill.DiscoverWithFiles(skillRoots, s.log, cfg.Skills.MaxFiles)
 	skillKeep := func(id string) bool { return !policies.Denied("skill.use", id) }
 	skills.Filter(skillKeep)
 	skillState := newSkillsState(skills, skillRoots, cfg, workdir, s.log, skillKeep)
@@ -127,11 +130,19 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 
 	var mcpTokens mcp.TokenFunc
 	if s.oauth != nil {
-		mcpTokens = func(ctx context.Context, endpoint string) (string, error) {
-			return s.oauth.AccessToken(ctx, endpoint)
+		mcpTokens = func(ctx context.Context, endpoint string, force bool) (string, error) {
+			if force {
+				token, err := s.oauth.Refresh(ctx, endpoint)
+				return token.AccessToken, err
+			}
+			token, _, err := s.oauth.AccessTokenOptional(ctx, endpoint)
+			return token, err
 		}
 	}
-	mcpManager := mcp.StartWithTokens(s.base, filterMCPConfig(cfg.MCP, policies, s.log), workdir, s.log, mcpTokens)
+	mcpManager := mcp.StartBackground(s.base, filterMCPConfig(cfg.MCP, policies, s.log), workdir, s.log, mcpTokens)
+	if s.oauth != nil {
+		mcpManager.SetOAuth(s.oauth, oauthRedirect(cfg.Addr))
+	}
 	// MCP catalogs can change while the workspace is open. Keep the registry
 	// in sync without letting a remote server shadow a built-in or app tool.
 	var mcpToolsMu sync.Mutex
@@ -156,11 +167,18 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 				s.log("mcp: %s tool %q collides with an existing tool", ref.Name(), name)
 				continue
 			}
-			registry.Add(tool.Codemode(item))
+			if aware, ok := item.(interface{ Codemode() bool }); ok && !aware.Codemode() {
+				registry.Add(item)
+			} else {
+				registry.Add(tool.Codemode(item))
+			}
 			mcpToolNames[name] = true
 		}
 	}
 	for _, t := range mcp.ResourceTools(mcpManager) {
+		registry.Add(tool.Codemode(t))
+	}
+	for _, t := range mcp.EventTools(mcpManager) {
 		registry.Add(tool.Codemode(t))
 	}
 	plugins := plugin.Start(s.base, filterPluginConfig(cfg.Plugins, policies, s.log), workdir, s.log)
@@ -253,8 +271,19 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 				catalogForPrompt = registry.CatalogExecuteOnlyFor(allowed)
 			}
 			var servers []prompt.MCPServer
+			mcpTools := mcpManager.Tools()
 			for _, item := range mcpManager.Instructions() {
-				servers = append(servers, prompt.MCPServer{Name: item.Server, Instructions: item.Instructions})
+				visible := false
+				for _, candidate := range mcpTools {
+					owner, ok := candidate.(interface{ MCPServer() string })
+					if ok && owner.MCPServer() == item.Server && profile.AllowsTool(candidate.Name()) {
+						visible = true
+						break
+					}
+				}
+				if visible {
+					servers = append(servers, prompt.MCPServer{Name: item.Server, Instructions: item.Instructions})
+				}
 			}
 			var references []prompt.Reference
 			for _, item := range cfg.References {
@@ -271,10 +300,16 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 				agentSystem = profile.System
 			}
 			availableSkills := skills.Summaries()
-			if len(profile.Permissions) > 0 {
+			rules := append(permission.Rules(nil), profile.Permissions...)
+			if sessionID != "" {
+				if extra, err := s.store.Permissions(sessionID); err == nil {
+					rules = append(rules, extra...)
+				}
+			}
+			if len(rules) > 0 {
 				filtered := availableSkills[:0]
 				for _, item := range availableSkills {
-					if profile.Permissions.Evaluate("skill", item.ID) != permission.Deny {
+					if rules.Evaluate("skill", item.ID) != permission.Deny {
 						filtered = append(filtered, item)
 					}
 				}
@@ -312,6 +347,8 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 		Base:         s.base,
 	})
 
+	mcpManager.SetSampling(samplingHandler(runner))
+	mcpManager.SetElicitation(elicitationHandler(runner))
 	subagents := subagent.New(runner, s.store, s.log)
 	subagents.SetAgents(profiles)
 	subagents.SetDepth(cfg.SubagentDepth)
@@ -348,6 +385,9 @@ func (s *shared) openWorkspace(ref location.Ref, cfg config.Config) (*location.S
 		Commands:      commandRegistry,
 		Subagents:     subagents,
 		RefreshSkills: skillState.refresh,
+		CreateSkill:   skillState.CreateSkill,
+		DeleteSkill:   skillState.DeleteSkill,
+		SkillErrors:   skillState.SourceErrors,
 	}
 	services.SetConfig(cfg)
 	services.CloseFn = func() {

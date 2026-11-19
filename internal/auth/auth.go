@@ -90,6 +90,9 @@ func PublicPath(method, path string) bool {
 	if method == http.MethodGet && path == "/healthz" {
 		return true
 	}
+	if method == http.MethodGet && path == "/oauth/callback" {
+		return true
+	}
 	return method == http.MethodGet && strings.HasPrefix(path, "/share/")
 }
 

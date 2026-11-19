@@ -1,6 +1,8 @@
 package skill
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -72,14 +74,10 @@ func TestPullIndexAndUpdate(t *testing.T) {
 		t.Fatalf("unexpected files: %v", item.Files)
 	}
 
-	mu.Lock()
-	first := counts["/demo/SKILL.md"]
-	mu.Unlock()
+	// The same version is refreshed in place so edits made without a version
+	// bump still reach the cache.
 	Pull(context.Background(), urls, cache, t.Logf)
 	mu.Lock()
-	if counts["/demo/SKILL.md"] != first {
-		t.Fatalf("cached skill was downloaded again: %d -> %d", first, counts["/demo/SKILL.md"])
-	}
 	version = "2"
 	mu.Unlock()
 
@@ -120,6 +118,52 @@ func TestPullBackfillsMissingFilesWithoutVersionBump(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(roots[0], "scripts", "run.sh")); err != nil {
 		t.Fatalf("missing file was not backfilled: %v", err)
+	}
+}
+
+func TestPullZipArchive(t *testing.T) {
+	var archive bytes.Buffer
+	writer := zip.NewWriter(&archive)
+	for name, body := range map[string]string{
+		"demo/SKILL.md":       "---\ndescription: zip demo\n---\nZIP_MARKER",
+		"demo/scripts/run.sh": "echo run",
+	} {
+		file, err := writer.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write(archive.Bytes())
+	}))
+	defer server.Close()
+
+	roots := Pull(context.Background(), []string{server.URL + "/skills.zip"}, t.TempDir(), t.Logf)
+	if len(roots) != 1 {
+		t.Fatalf("unexpected archive roots: %v", roots)
+	}
+	item, ok := Discover(roots, t.Logf).Get("demo")
+	if !ok || !strings.Contains(item.Content, "ZIP_MARKER") {
+		t.Fatalf("unexpected archive skill: %+v", item)
+	}
+}
+
+func TestPullStatusReportsFailedSource(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	result := PullStatus(context.Background(), []string{server.URL + "/index.json"}, t.TempDir(), t.Logf)
+	if len(result.Roots) != 0 || len(result.Errors) != 1 || result.Errors[0].URL == "" {
+		t.Fatalf("unexpected pull status: %+v", result)
 	}
 }
 

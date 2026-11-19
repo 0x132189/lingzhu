@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,7 +18,7 @@ import (
 )
 
 const (
-	clientProtocolVersion = "2024-11-05"
+	clientProtocolVersion = "2025-11-25"
 	// maxCatalogPages bounds cursor loops so a broken server cannot make a
 	// catalog request run forever.
 	maxCatalogPages = 100
@@ -34,9 +37,13 @@ type transport interface {
 // ToolInfo is one tool advertised by an MCP server.
 type ToolInfo struct {
 	Name         string          `json:"name"`
+	Title        string          `json:"title,omitempty"`
 	Description  string          `json:"description"`
 	InputSchema  json.RawMessage `json:"inputSchema"`
 	OutputSchema json.RawMessage `json:"outputSchema"`
+	Annotations  map[string]any  `json:"annotations,omitempty"`
+	Execution    map[string]any  `json:"execution,omitempty"`
+	Meta         map[string]any  `json:"_meta,omitempty"`
 }
 
 // Resource is one resource or resource template advertised by a server.
@@ -46,6 +53,13 @@ type Resource struct {
 	URITemplate string `json:"uriTemplate,omitempty"`
 	Description string `json:"description,omitempty"`
 	MimeType    string `json:"mimeType,omitempty"`
+}
+
+// Completion is one completion/complete answer.
+type Completion struct {
+	Values  []string `json:"values"`
+	Total   int      `json:"total,omitempty"`
+	HasMore bool     `json:"hasMore,omitempty"`
 }
 
 // ResourceContent is one part returned by resources/read.
@@ -58,9 +72,12 @@ type ResourceContent struct {
 
 // CallResult is the response to tools/call.
 type CallResult struct {
-	Content           []ToolContent   `json:"content"`
-	StructuredContent json.RawMessage `json:"structuredContent"`
-	IsError           bool            `json:"isError"`
+	Content           []ToolContent              `json:"content"`
+	StructuredContent json.RawMessage            `json:"structuredContent"`
+	IsError           bool                       `json:"isError"`
+	ResultType        string                     `json:"resultType,omitempty"`
+	InputRequests     map[string]json.RawMessage `json:"inputRequests,omitempty"`
+	RequestState      string                     `json:"requestState,omitempty"`
 }
 
 // ToolContent is one content part in a tool result. Resource holds the nested
@@ -84,6 +101,8 @@ type Client struct {
 
 	modern   bool
 	protocol string
+	// title is the server's own display name from the handshake.
+	title string
 	// instructions is the server's own usage guidance from the handshake. It
 	// is injected into the system prompt like the reference harness does.
 	instructions string
@@ -96,17 +115,35 @@ type Client struct {
 	pending map[int64]chan rpc.Response
 	seq     int64
 
+	workdir             string
+	shared              bool
+	logger              func(string, ...any)
+	resourcesCapability bool
+	toolsCapability     bool
+	eventsCapability    bool
+
 	// refreshMu serializes catalog re-listing triggered by server notifications.
-	refreshMu sync.Mutex
+	refreshMu   sync.Mutex
+	subscribeMu sync.Mutex
+	subscribed  map[string]bool
 	// handlerMu protects the manager callbacks, which are set after the handshake.
-	handlerMu sync.RWMutex
-	onChange  func(kind string)
-	onClose   func()
+	handlerMu   sync.RWMutex
+	listeners   map[int64]clientListener
+	listenerSeq int64
+	onSample    func(ctx context.Context, params json.RawMessage) (any, error)
+	onElicit    func(ctx context.Context, params json.RawMessage) (any, error)
+
+	sessionMu sync.Mutex
+	sessions  []string
+
+	streamMu sync.Mutex
+	streams  map[string]*eventStream
 
 	done      chan struct{}
 	doneOnce  sync.Once
 	closeOnce sync.Once
 	closing   atomic.Bool
+	reinit    atomic.Bool
 	timeout   Timeout
 }
 
@@ -118,18 +155,15 @@ func Connect(ctx context.Context, name string, cfg Server, workdir string) (*Cli
 
 // connect is Connect with an optional OAuth token resolver.
 func connect(ctx context.Context, name string, cfg Server, workdir string, tokens TokenFunc) (*Client, error) {
-	var token func(context.Context) (string, error)
-	if cfg.OAuth.Name != "" && tokens != nil {
+	var token func(context.Context, bool) (string, error)
+	if tokens != nil && cfg.Kind() != "local" && !cfg.OAuth.Disabled {
 		endpoint := cfg.OAuth.Name
-		token = func(c context.Context) (string, error) { return tokens(c, endpoint) }
+		if endpoint == "" {
+			endpoint = "mcp:" + name
+		}
+		token = func(c context.Context, force bool) (string, error) { return tokens(c, endpoint, force) }
 	}
-	c := &Client{
-		name:    name,
-		cfg:     cfg,
-		pending: map[int64]chan rpc.Response{},
-		done:    make(chan struct{}),
-		timeout: cfg.timeouts(),
-	}
+	c := newClient(name, cfg, workdir)
 
 	var tr transport
 	var err error
@@ -173,6 +207,7 @@ func connect(ctx context.Context, name string, cfg Server, workdir string, token
 			if starter, ok := tr.(interface{ StartStream(context.Context) }); ok {
 				starter.StartStream(context.Background())
 			}
+			c.startSubscriptions()
 			return c, nil
 		}
 		if mode == "2026-07-28" {
@@ -195,6 +230,19 @@ func connect(ctx context.Context, name string, cfg Server, workdir string, token
 	return c, nil
 }
 
+func newClient(name string, cfg Server, workdir string) *Client {
+	return &Client{
+		name:       name,
+		cfg:        cfg,
+		workdir:    workdir,
+		pending:    map[int64]chan rpc.Response{},
+		subscribed: map[string]bool{},
+		streams:    map[string]*eventStream{},
+		done:       make(chan struct{}),
+		timeout:    cfg.timeouts(),
+	}
+}
+
 func (c *Client) initialize(ctx context.Context) error {
 	var result struct {
 		ProtocolVersion string         `json:"protocolVersion"`
@@ -202,12 +250,13 @@ func (c *Client) initialize(ctx context.Context) error {
 		Instructions    string         `json:"instructions"`
 		ServerInfo      struct {
 			Name    string `json:"name"`
+			Title   string `json:"title"`
 			Version string `json:"version"`
 		} `json:"serverInfo"`
 	}
 	err := c.request(ctx, "initialize", map[string]any{
 		"protocolVersion": clientProtocolVersion,
-		"capabilities":    map[string]any{},
+		"capabilities":    c.capabilities(),
 		"clientInfo": map[string]any{
 			"name":    "lingzhu",
 			"version": version.Version,
@@ -217,6 +266,13 @@ func (c *Client) initialize(ctx context.Context) error {
 		return err
 	}
 	c.instructions = strings.TrimSpace(result.Instructions)
+	c.title = strings.TrimSpace(result.ServerInfo.Title)
+	if c.title == "" {
+		c.title = strings.TrimSpace(result.ServerInfo.Name)
+	}
+	c.resourcesCapability = result.Capabilities["resources"] != nil
+	c.toolsCapability = result.Capabilities["tools"] != nil
+	c.eventsCapability = hasExtension(result.Capabilities, eventsExtension)
 	if setter, ok := c.tr.(interface{ SetProtocolVersion(string) }); ok {
 		protocol := result.ProtocolVersion
 		if protocol == "" {
@@ -233,29 +289,166 @@ func (c *Client) Name() string { return c.name }
 // Instructions returns the server's usage guidance from the handshake.
 func (c *Client) Instructions() string { return c.instructions }
 
-// SetHandlers installs the manager callbacks used for catalog notifications and
-// unexpected disconnects. An intentional Close does not invoke onClose.
-func (c *Client) SetHandlers(onChange func(kind string), onClose func()) {
+// Title returns the server's own display name from the handshake.
+func (c *Client) Title() string { return c.title }
+
+// SetLogger installs the destination for server log notifications.
+func (c *Client) SetLogger(logger func(string, ...any)) {
 	c.handlerMu.Lock()
-	c.onChange = onChange
-	c.onClose = onClose
+	c.logger = logger
 	c.handlerMu.Unlock()
+}
+
+type clientListener struct {
+	onChange func(kind string)
+	onClose  func()
+}
+
+// AddHandlers adds one observer and returns a function that removes it. A
+// shared client can have several managers watching it at once.
+func (c *Client) AddHandlers(onChange func(kind string), onClose func()) func() {
+	c.handlerMu.Lock()
+	if c.listeners == nil {
+		c.listeners = map[int64]clientListener{}
+	}
+	id := c.listenerSeq
+	c.listenerSeq++
+	c.listeners[id] = clientListener{onChange: onChange, onClose: onClose}
+	c.handlerMu.Unlock()
+	return func() {
+		c.handlerMu.Lock()
+		delete(c.listeners, id)
+		c.handlerMu.Unlock()
+	}
+}
+
+// SetSampling installs the handler for server-initiated sampling requests.
+func (c *Client) SetSampling(handler func(ctx context.Context, params json.RawMessage) (any, error)) {
+	c.handlerMu.Lock()
+	c.onSample = handler
+	c.handlerMu.Unlock()
+}
+
+// SetElicitation installs the handler for server-initiated user input.
+func (c *Client) SetElicitation(handler func(ctx context.Context, params json.RawMessage) (any, error)) {
+	c.handlerMu.Lock()
+	c.onElicit = handler
+	c.handlerMu.Unlock()
+}
+
+func (c *Client) elicitCall(ctx context.Context, params json.RawMessage) (any, error) {
+	c.handlerMu.RLock()
+	handler := c.onElicit
+	c.handlerMu.RUnlock()
+	if handler == nil {
+		return map[string]any{"action": "decline"}, nil
+	}
+	return handler(ctx, params)
+}
+
+func (c *Client) elicitRequest(id json.RawMessage, params json.RawMessage) {
+	reply := map[string]any{"jsonrpc": "2.0", "id": id}
+	ctx, cancel := context.WithTimeout(context.Background(), millis(c.timeout.Execution))
+	result, err := c.elicitCall(ctx, params)
+	cancel()
+	if err != nil {
+		reply["result"] = map[string]any{"action": "decline"}
+	} else {
+		reply["result"] = result
+	}
+	data, err := json.Marshal(reply)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), millis(c.timeout.Execution))
+		_ = c.tr.Send(ctx, data, 0)
+		cancel()
+	}
+}
+
+// ActiveSession is the session owning the most recent tool call on this
+// connection. Elicitation and sampling use it to attach UI and context.
+func (c *Client) ActiveSession() string {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if len(c.sessions) == 0 {
+		return ""
+	}
+	return c.sessions[len(c.sessions)-1]
+}
+
+// CallToolSession is CallTool with the owning session recorded for requests
+// the server starts while the tool call is running.
+func (c *Client) CallToolSession(ctx context.Context, name string, args map[string]any, sessionID string) (*CallResult, error) {
+	if sessionID != "" {
+		c.sessionMu.Lock()
+		c.sessions = append(c.sessions, sessionID)
+		c.sessionMu.Unlock()
+		defer func() {
+			c.sessionMu.Lock()
+			for index := len(c.sessions) - 1; index >= 0; index-- {
+				if c.sessions[index] == sessionID {
+					c.sessions = append(c.sessions[:index], c.sessions[index+1:]...)
+					break
+				}
+			}
+			c.sessionMu.Unlock()
+		}()
+	}
+	return c.callTool(ctx, name, args, sessionID)
+}
+
+// sample runs the installed sampling handler.
+func (c *Client) sample(ctx context.Context, params json.RawMessage) (any, error) {
+	c.handlerMu.RLock()
+	handler := c.onSample
+	c.handlerMu.RUnlock()
+	if handler == nil {
+		return nil, errors.New("sampling is not enabled")
+	}
+	return handler(ctx, params)
+}
+
+func (c *Client) sampleRequest(id json.RawMessage, params json.RawMessage) {
+	reply := map[string]any{"jsonrpc": "2.0", "id": id}
+	ctx, cancel := context.WithTimeout(context.Background(), millis(c.timeout.Execution))
+	result, err := c.sample(ctx, params)
+	cancel()
+	if err != nil {
+		reply["error"] = rpc.Error{Code: -32603, Message: err.Error()}
+	} else {
+		reply["result"] = result
+	}
+	data, err := json.Marshal(reply)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), millis(c.timeout.Execution))
+		_ = c.tr.Send(ctx, data, 0)
+		cancel()
+	}
 }
 
 func (c *Client) changed(kind string) {
 	c.handlerMu.RLock()
-	callback := c.onChange
+	callbacks := make([]func(string), 0, len(c.listeners))
+	for _, listener := range c.listeners {
+		if listener.onChange != nil {
+			callbacks = append(callbacks, listener.onChange)
+		}
+	}
 	c.handlerMu.RUnlock()
-	if callback != nil {
+	for _, callback := range callbacks {
 		callback(kind)
 	}
 }
 
 func (c *Client) notifyClose() {
 	c.handlerMu.RLock()
-	callback := c.onClose
+	callbacks := make([]func(), 0, len(c.listeners))
+	for _, listener := range c.listeners {
+		if listener.onClose != nil {
+			callbacks = append(callbacks, listener.onClose)
+		}
+	}
 	c.handlerMu.RUnlock()
-	if callback != nil {
+	for _, callback := range callbacks {
 		callback()
 	}
 }
@@ -298,15 +491,34 @@ const (
 	clientCapsMetaKey     = "io.modelcontextprotocol/clientCapabilities"
 )
 
-func modernEnvelope() map[string]any {
+func (c *Client) modernEnvelope() map[string]any {
 	return map[string]any{
 		protocolMetaKey: modernProtocolVersion,
 		clientInfoMetaKey: map[string]any{
 			"name":    "lingzhu",
 			"version": version.Version,
 		},
-		clientCapsMetaKey: map[string]any{},
+		clientCapsMetaKey: c.capabilities(),
 	}
+}
+
+func (c *Client) capabilities() map[string]any {
+	capabilities := map[string]any{
+		"roots": map[string]any{"listChanged": false},
+		"extensions": map[string]any{
+			eventsExtension: map[string]any{},
+		},
+	}
+	if c.cfg.Sampling {
+		capabilities["sampling"] = map[string]any{}
+	}
+	if c.cfg.Elicitation {
+		capabilities["elicitation"] = map[string]any{
+			"form": map[string]any{},
+			"url":  map[string]any{},
+		}
+	}
+	return capabilities
 }
 
 // discover probes for the 2026-07-28 revision with server/discover. A false
@@ -316,8 +528,13 @@ func (c *Client) discover(ctx context.Context) (bool, error) {
 		SupportedVersions []string       `json:"supportedVersions"`
 		Capabilities      map[string]any `json:"capabilities"`
 		Instructions      string         `json:"instructions"`
+		ServerInfo        struct {
+			Name    string `json:"name"`
+			Title   string `json:"title"`
+			Version string `json:"version"`
+		} `json:"serverInfo"`
 	}
-	if err := c.request(ctx, "server/discover", map[string]any{"_meta": modernEnvelope()}, &result); err != nil {
+	if err := c.request(ctx, "server/discover", map[string]any{"_meta": c.modernEnvelope()}, &result); err != nil {
 		return false, err
 	}
 	found := false
@@ -333,6 +550,13 @@ func (c *Client) discover(ctx context.Context) (bool, error) {
 	c.modern = true
 	c.protocol = modernProtocolVersion
 	c.instructions = strings.TrimSpace(result.Instructions)
+	c.title = strings.TrimSpace(result.ServerInfo.Title)
+	if c.title == "" {
+		c.title = strings.TrimSpace(result.ServerInfo.Name)
+	}
+	c.resourcesCapability = result.Capabilities["resources"] != nil
+	c.toolsCapability = result.Capabilities["tools"] != nil
+	c.eventsCapability = hasExtension(result.Capabilities, eventsExtension)
 	if setter, ok := c.tr.(interface{ SetProtocolVersion(string) }); ok {
 		setter.SetProtocolVersion(modernProtocolVersion)
 	}
@@ -352,7 +576,7 @@ func (c *Client) enrich(params any) any {
 		}
 		base = map[string]any{}
 	}
-	merged := modernEnvelope()
+	merged := c.modernEnvelope()
 	merged[protocolMetaKey] = c.protocol
 	if meta, ok := base["_meta"].(map[string]any); ok {
 		for key, value := range meta {
@@ -369,6 +593,9 @@ func (c *Client) enrich(params any) any {
 
 // Tools reads every page of tools/list.
 func (c *Client) Tools(ctx context.Context) ([]ToolInfo, error) {
+	if !c.toolsCapability {
+		return nil, nil
+	}
 	var tools []ToolInfo
 	cursor := ""
 	for pages := 1; ; pages++ {
@@ -377,13 +604,20 @@ func (c *Client) Tools(ctx context.Context) ([]ToolInfo, error) {
 			params["cursor"] = cursor
 		}
 		var page struct {
-			Tools      []ToolInfo `json:"tools"`
-			NextCursor string     `json:"nextCursor"`
+			Tools      []json.RawMessage `json:"tools"`
+			NextCursor string            `json:"nextCursor"`
 		}
-		if err := c.requestWithTimeout(ctx, "tools/list", params, &page, millis(c.timeout.Catalog)); err != nil {
+		if err := c.requestCatalog(ctx, "tools/list", params, &page, millis(c.timeout.Catalog)); err != nil {
 			return nil, err
 		}
-		tools = append(tools, page.Tools...)
+		for _, raw := range page.Tools {
+			info, ok := parseToolInfo(raw)
+			if !ok {
+				c.logf("mcp[%s] skipping invalid tool", c.name)
+				continue
+			}
+			tools = append(tools, info)
+		}
 		if page.NextCursor == "" {
 			return tools, nil
 		}
@@ -392,6 +626,88 @@ func (c *Client) Tools(ctx context.Context) ([]ToolInfo, error) {
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// parseToolInfo validates one listed tool before it reaches a provider. A
+// malformed entry is skipped instead of failing the whole catalog.
+func parseToolInfo(raw json.RawMessage) (ToolInfo, bool) {
+	var item struct {
+		Name         string          `json:"name"`
+		Title        string          `json:"title"`
+		Description  string          `json:"description"`
+		InputSchema  json.RawMessage `json:"inputSchema"`
+		OutputSchema json.RawMessage `json:"outputSchema"`
+		Annotations  json.RawMessage `json:"annotations"`
+		Execution    json.RawMessage `json:"execution"`
+		Meta         json.RawMessage `json:"_meta"`
+	}
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return ToolInfo{}, false
+	}
+	name := strings.TrimSpace(item.Name)
+	if name == "" {
+		return ToolInfo{}, false
+	}
+	schema, ok := normalizeToolSchema(item.InputSchema)
+	if !ok {
+		return ToolInfo{}, false
+	}
+	return ToolInfo{
+		Name:         name,
+		Title:        item.Title,
+		Description:  item.Description,
+		InputSchema:  schema,
+		OutputSchema: objectJSON(item.OutputSchema),
+		Annotations:  objectMap(item.Annotations),
+		Execution:    objectMap(item.Execution),
+		Meta:         objectMap(item.Meta),
+	}, true
+}
+
+// normalizeToolSchema keeps the top level valid for provider checks while
+// leaving nested property schemas exactly as the server sent them.
+func normalizeToolSchema(raw json.RawMessage) (json.RawMessage, bool) {
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
+		return nil, false
+	}
+	if kind, ok := schema["type"]; ok && kind != "object" {
+		return nil, false
+	}
+	schema["type"] = "object"
+	if _, ok := schema["properties"].(map[string]any); !ok {
+		delete(schema, "properties")
+	}
+	if required, ok := schema["required"].([]any); ok {
+		for _, value := range required {
+			if _, ok := value.(string); !ok {
+				delete(schema, "required")
+				break
+			}
+		}
+	} else if _, ok := schema["required"]; ok {
+		delete(schema, "required")
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func objectMap(raw json.RawMessage) map[string]any {
+	var value map[string]any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil
+	}
+	return value
+}
+
+func objectJSON(raw json.RawMessage) json.RawMessage {
+	if objectMap(raw) == nil {
+		return nil
+	}
+	return raw
 }
 
 // Prompts reads prompts/list with cursor pagination. A server that does not
@@ -408,7 +724,7 @@ func (c *Client) Prompts(ctx context.Context) ([]PromptInfo, error) {
 			Prompts    []PromptInfo `json:"prompts"`
 			NextCursor string       `json:"nextCursor"`
 		}
-		if err := c.requestWithTimeout(ctx, "prompts/list", params, &page, millis(c.timeout.Catalog)); err != nil {
+		if err := c.requestCatalog(ctx, "prompts/list", params, &page, millis(c.timeout.Catalog)); err != nil {
 			if rpc.IsMethodNotFound(err) {
 				return nil, nil
 			}
@@ -440,7 +756,7 @@ func (c *Client) Prompt(ctx context.Context, name string, args map[string]string
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
-	if err := c.requestWithTimeout(ctx, "prompts/get", params, &result, millis(c.timeout.Execution)); err != nil {
+	if err := c.requestCatalog(ctx, "prompts/get", params, &result, millis(c.timeout.Execution)); err != nil {
 		return "", err
 	}
 	parts := make([]string, 0, len(result.Messages))
@@ -472,7 +788,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 			Resources  []Resource `json:"resources"`
 			NextCursor string     `json:"nextCursor"`
 		}
-		if err := c.requestWithTimeout(ctx, "resources/list", params, &page, millis(c.timeout.Catalog)); err != nil {
+		if err := c.requestCatalog(ctx, "resources/list", params, &page, millis(c.timeout.Catalog)); err != nil {
 			if rpc.IsMethodNotFound(err) {
 				return nil, nil
 			}
@@ -503,7 +819,7 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 			} `json:"resourceTemplates"`
 			NextCursor string `json:"nextCursor"`
 		}
-		if err := c.requestWithTimeout(ctx, "resources/templates/list", params, &page, millis(c.timeout.Catalog)); err != nil {
+		if err := c.requestCatalog(ctx, "resources/templates/list", params, &page, millis(c.timeout.Catalog)); err != nil {
 			// Some servers declare resources without implementing templates.
 			break
 		}
@@ -523,15 +839,69 @@ func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
 		}
 		cursor = page.NextCursor
 	}
+	c.subscribeResources(ctx, out)
 	return out, nil
+}
+
+// subscribeResources asks a server that advertises resources to push changes
+// for every listed URI. Failures are ignored because a server may advertise
+// the capability without implementing subscriptions.
+func (c *Client) subscribeResources(ctx context.Context, resources []Resource) {
+	if !c.resourcesCapability {
+		return
+	}
+	for _, item := range resources {
+		uri := strings.TrimSpace(item.URI)
+		if uri == "" {
+			continue
+		}
+		c.subscribeMu.Lock()
+		if c.subscribed[uri] {
+			c.subscribeMu.Unlock()
+			continue
+		}
+		c.subscribeMu.Unlock()
+		if err := c.requestWithTimeout(ctx, "resources/subscribe", map[string]any{"uri": uri}, nil, millis(c.timeout.Execution)); err != nil {
+			c.logf("mcp[%s] subscribe %s: %v", c.name, uri, err)
+			continue
+		}
+		c.subscribeMu.Lock()
+		c.subscribed[uri] = true
+		c.subscribeMu.Unlock()
+	}
+}
+
+func (c *Client) logf(format string, args ...any) {
+	c.handlerMu.RLock()
+	logger := c.logger
+	c.handlerMu.RUnlock()
+	if logger != nil {
+		logger(format, args...)
+	}
+}
+
+// Complete asks a server for prompt or resource argument completions.
+func (c *Client) Complete(ctx context.Context, ref map[string]any, argument, value string) (Completion, error) {
+	var result struct {
+		Completion Completion `json:"completion"`
+	}
+	params := map[string]any{
+		"ref":      ref,
+		"argument": map[string]string{"name": argument, "value": value},
+	}
+	err := c.requestCatalog(ctx, "completion/complete", params, &result, millis(c.timeout.Execution))
+	return result.Completion, err
 }
 
 // ReadResource reads one resource by URI.
 func (c *Client) ReadResource(ctx context.Context, uri string) ([]ResourceContent, error) {
+	if !c.resourcesCapability {
+		return nil, nil
+	}
 	var result struct {
 		Contents []ResourceContent `json:"contents"`
 	}
-	err := c.requestWithTimeout(ctx, "resources/read", map[string]any{"uri": uri}, &result, millis(c.timeout.Execution))
+	err := c.requestCatalog(ctx, "resources/read", map[string]any{"uri": uri}, &result, millis(c.timeout.Execution))
 	if err != nil {
 		return nil, err
 	}
@@ -540,23 +910,145 @@ func (c *Client) ReadResource(ctx context.Context, uri string) ([]ResourceConten
 
 // CallTool invokes one tool with JSON arguments.
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (*CallResult, error) {
+	return c.callTool(ctx, name, args, "")
+}
+
+func (c *Client) callTool(ctx context.Context, name string, args map[string]any, sessionID string) (*CallResult, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
-	var result CallResult
+	params := map[string]any{
+		"name":      name,
+		"arguments": args,
+	}
+	if sessionID != "" {
+		params["_meta"] = map[string]any{"lingzhu/sessionID": sessionID}
+	}
 	callCtx, cancel := context.WithTimeout(ctx, millis(c.timeout.Execution))
 	defer cancel()
-	if err := c.request(callCtx, "tools/call", map[string]any{"name": name, "arguments": args}, &result); err != nil {
-		return nil, err
+	for round := 0; round < 10; round++ {
+		var result CallResult
+		if err := c.request(callCtx, "tools/call", params, &result); err != nil {
+			return nil, err
+		}
+		if result.ResultType != "input_required" {
+			return &result, nil
+		}
+		if len(result.InputRequests) == 0 {
+			return nil, fmt.Errorf("mcp: tool %q requires input but sent no requests", name)
+		}
+		responses := make(map[string]any, len(result.InputRequests))
+		for key, raw := range result.InputRequests {
+			var request struct {
+				Method string          `json:"method"`
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal(raw, &request); err != nil || request.Method == "" {
+				return nil, fmt.Errorf("mcp: tool %q sent an invalid input request", name)
+			}
+			switch request.Method {
+			case "elicitation/create":
+				value, err := c.elicitCall(callCtx, request.Params)
+				if err != nil {
+					return nil, err
+				}
+				responses[key] = value
+			case "sampling/createMessage":
+				value, err := c.sample(callCtx, request.Params)
+				if err != nil {
+					return nil, err
+				}
+				responses[key] = value
+			case "roots/list":
+				responses[key] = c.rootsResult()
+			default:
+				return nil, fmt.Errorf("mcp: tool %q requested unsupported input %q", name, request.Method)
+			}
+		}
+		params = map[string]any{
+			"name":           name,
+			"arguments":      args,
+			"inputResponses": responses,
+		}
+		if result.RequestState != "" {
+			params["requestState"] = result.RequestState
+		}
+		if sessionID != "" {
+			params["_meta"] = map[string]any{"lingzhu/sessionID": sessionID}
+		}
 	}
-	return &result, nil
+	return nil, fmt.Errorf("mcp: tool %q exceeded the input round limit", name)
 }
 
 func (c *Client) request(ctx context.Context, method string, params any, out any) error {
 	return c.requestWithTimeout(ctx, method, params, out, 0)
 }
 
+// requestCatalog retries transient catalog/read failures twice, matching the
+// reference client's short backoff. Tool calls are excluded because a retry can
+// duplicate a side effect.
+func (c *Client) requestCatalog(ctx context.Context, method string, params any, out any, timeout time.Duration) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = c.requestWithTimeout(ctx, method, params, out, timeout)
+		if err == nil || !retryableError(err) {
+			return err
+		}
+		if attempt == 2 {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(250*(1<<attempt)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-c.done:
+			timer.Stop()
+			return errClosed
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func retryableError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"http 408", "http 429", "http 500", "http 502", "http 503", "http 504",
+		"connection reset", "broken pipe", "unexpected eof", "temporarily unavailable",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) requestWithTimeout(ctx context.Context, method string, params any, out any, timeout time.Duration) error {
+	for attempt := 0; ; attempt++ {
+		err := c.requestOnce(ctx, method, params, out, timeout)
+		if !errors.Is(err, errSessionExpired) || attempt > 0 || method == "initialize" {
+			return err
+		}
+		if !c.reinit.CompareAndSwap(false, true) {
+			return err
+		}
+		reinitErr := c.initialize(ctx)
+		c.reinit.Store(false)
+		if reinitErr != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) requestOnce(ctx context.Context, method string, params any, out any, timeout time.Duration) error {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -596,6 +1088,25 @@ func (c *Client) requestWithTimeout(ctx context.Context, method string, params a
 	}
 }
 
+// startSubscriptions opens the modern long-lived catalog-change channel. The
+// server may keep the request open until shutdown, so it runs in the
+// background; list_changed notifications feed the existing refresh path.
+func (c *Client) startSubscriptions() {
+	if !c.modern {
+		return
+	}
+	go func() {
+		params := map[string]any{
+			"notifications": map[string]any{
+				"toolsListChanged":     true,
+				"promptsListChanged":   true,
+				"resourcesListChanged": true,
+			},
+		}
+		_ = c.request(context.Background(), "subscriptions/listen", params, nil)
+	}()
+}
+
 func (c *Client) notify(method string, params any) error {
 	message := map[string]any{"jsonrpc": "2.0", "method": method}
 	if params = c.enrich(params); params != nil {
@@ -618,12 +1129,21 @@ func (c *Client) send(ctx context.Context, message any, expectID int64) error {
 func (c *Client) receive(message rpc.Message) {
 	if message.Method != "" {
 		if len(message.ID) > 0 {
-			// Server-initiated request. Only ping needs a reply; anything else
-			// is not part of the client surface we expose.
+			switch message.Method {
+			case "sampling/createMessage":
+				go c.sampleRequest(message.ID, message.Params)
+				return
+			case "elicitation/create":
+				go c.elicitRequest(message.ID, message.Params)
+				return
+			}
 			reply := map[string]any{"jsonrpc": "2.0", "id": message.ID}
-			if message.Method == "ping" {
+			switch message.Method {
+			case "ping":
 				reply["result"] = map[string]any{}
-			} else {
+			case "roots/list":
+				reply["result"] = c.rootsResult()
+			default:
 				reply["error"] = rpc.Error{Code: -32601, Message: "method not supported"}
 			}
 			data, err := json.Marshal(reply)
@@ -637,12 +1157,22 @@ func (c *Client) receive(message rpc.Message) {
 		// Servers announce catalog changes with a notification. The manager
 		// re-lists the affected catalogs and refreshes the tool registry.
 		switch message.Method {
+		case "notifications/message":
+			c.logNotification(message.Params)
+		case "notifications/progress":
+			c.logProgress(message.Params)
 		case "notifications/tools/list_changed":
 			c.changed("tools")
 		case "notifications/prompts/list_changed":
 			c.changed("prompts")
 		case "notifications/resources/list_changed", "notifications/resources/updated":
 			c.changed("resources")
+		case "notifications/elicitation/complete":
+			c.logf("mcp[%s] elicitation completed", c.name)
+		default:
+			if strings.HasPrefix(message.Method, "notifications/events/") {
+				c.routeEventNotification(message.Method, message.Params)
+			}
 		}
 		return
 	}
@@ -669,11 +1199,73 @@ func (c *Client) receive(message rpc.Message) {
 	}
 }
 
+func (c *Client) rootsResult() map[string]any {
+	if c.shared || strings.TrimSpace(c.workdir) == "" {
+		return map[string]any{"roots": []any{}}
+	}
+	root := map[string]string{
+		"uri":  fileURL(c.workdir),
+		"name": filepath.Base(c.workdir),
+	}
+	return map[string]any{"roots": []any{root}}
+}
+
+func fileURL(path string) string {
+	slashed := filepath.ToSlash(path)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	return (&url.URL{Scheme: "file", Path: slashed}).String()
+}
+
+func (c *Client) logNotification(params json.RawMessage) {
+	c.handlerMu.RLock()
+	logger := c.logger
+	c.handlerMu.RUnlock()
+	if logger == nil {
+		return
+	}
+	var payload struct {
+		Level  string `json:"level"`
+		Logger string `json:"logger"`
+		Data   any    `json:"data"`
+	}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return
+	}
+	label := strings.TrimSpace(payload.Logger)
+	if label == "" {
+		label = "server"
+	}
+	logger("mcp[%s] %s %s: %v", c.name, payload.Level, label, payload.Data)
+}
+
+func (c *Client) logProgress(params json.RawMessage) {
+	c.handlerMu.RLock()
+	logger := c.logger
+	c.handlerMu.RUnlock()
+	if logger == nil {
+		return
+	}
+	var payload struct {
+		Progress float64 `json:"progress"`
+		Total    float64 `json:"total"`
+		Message  string  `json:"message"`
+	}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return
+	}
+	if payload.Message != "" {
+		logger("mcp[%s] progress %v/%v: %s", c.name, payload.Progress, payload.Total, payload.Message)
+	}
+}
+
 // closed is called by a transport when its stream or process ends. A close
 // initiated by Close is expected and must not mark the server failed.
 func (c *Client) closed() {
 	c.doneOnce.Do(func() {
 		close(c.done)
+		c.closeEventStreams()
 		if !c.closing.Load() {
 			c.notifyClose()
 		}

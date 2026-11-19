@@ -55,8 +55,21 @@ Loose body.
 	if demo.Name != "Demo Skill" || demo.Description != "Does demo work" || !strings.Contains(demo.Content, "Run the demo.") {
 		t.Fatalf("unexpected demo skill: %+v", demo)
 	}
-	if len(demo.Files) != 1 || !strings.HasSuffix(filepath.ToSlash(demo.Files[0]), "scripts/run.sh") {
+	if len(demo.Files) != 2 {
 		t.Fatalf("unexpected resource list: %+v", demo.Files)
+	}
+	foundScript := false
+	foundHidden := false
+	for _, file := range demo.Files {
+		switch {
+		case strings.HasSuffix(filepath.ToSlash(file), "scripts/run.sh"):
+			foundScript = true
+		case strings.HasSuffix(filepath.ToSlash(file), ".hidden.txt"):
+			foundHidden = true
+		}
+	}
+	if !foundScript || !foundHidden {
+		t.Fatalf("expected the script and dot file resources: %+v", demo.Files)
 	}
 	loaded := demo.Loaded()
 	for _, want := range []string{"<skill_content name=\"Demo Skill\">", "# Skill: Demo Skill", "Run the demo.", "Base directory", "<skill_files>"} {
@@ -72,6 +85,29 @@ Loose body.
 	}
 	if _, ok := manager.Get("deep"); !ok {
 		t.Fatal("nested skill missing")
+	}
+}
+
+func TestAllowedTools(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "demo", "SKILL.md"), `---
+name: Demo
+description: demo
+allowed-tools:
+  - read
+  - grep
+---
+body
+`)
+	item, ok := Discover([]string{root}, t.Logf).Get("demo")
+	if !ok {
+		t.Fatal("skill not discovered")
+	}
+	if len(item.AllowedTools) != 2 || item.AllowedTools[0] != "read" || item.AllowedTools[1] != "grep" {
+		t.Fatalf("unexpected allowed tools: %+v", item.AllowedTools)
+	}
+	if !strings.Contains(item.Loaded(), "Allowed tools for this skill: read, grep") {
+		t.Fatalf("allowed tools missing from loaded skill: %s", item.Loaded())
 	}
 }
 
@@ -95,6 +131,39 @@ func TestSkillAutoinvokeFlags(t *testing.T) {
 	}
 }
 
+func TestFrontmatterYAMLShapes(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "shapes", "SKILL.md"), `---
+name: "Quoted Skill"
+description: >
+  A folded
+  description.
+allowed-tools: [read, "grep", bash]
+metadata:
+  lingzhu/autoinvoke: false
+  owner:
+    team: docs
+  tags:
+    - one
+    - two
+---
+body
+`)
+	item, ok := Discover([]string{root}, t.Logf).Get("shapes")
+	if !ok {
+		t.Fatal("skill not discovered")
+	}
+	if item.Name != "Quoted Skill" || item.Description != "A folded description." {
+		t.Fatalf("unexpected scalar values: %+v", item)
+	}
+	if len(item.AllowedTools) != 3 || item.AllowedTools[0] != "read" || item.AllowedTools[2] != "bash" {
+		t.Fatalf("unexpected inline list: %+v", item.AllowedTools)
+	}
+	if item.Autoinvoke {
+		t.Fatal("nested YAML boolean should disable auto-invoke")
+	}
+}
+
 func TestLaterRootOverrides(t *testing.T) {
 	first := t.TempDir()
 	second := t.TempDir()
@@ -113,17 +182,20 @@ func TestLaterRootOverrides(t *testing.T) {
 
 func TestConfigAcceptsBothForms(t *testing.T) {
 	var list Config
-	if err := json.Unmarshal([]byte(`["a","b"]`), &list); err != nil {
+	if err := json.Unmarshal([]byte(`["a","b","https://example.com/skills"]`), &list); err != nil {
 		t.Fatal(err)
 	}
 	if len(list.Paths) != 2 {
 		t.Fatalf("unexpected list config: %+v", list)
 	}
+	if len(list.URLs) != 1 || list.URLs[0] != "https://example.com/skills" {
+		t.Fatalf("array URL was not split from paths: %+v", list)
+	}
 	var object Config
-	if err := json.Unmarshal([]byte(`{"paths":["c"],"urls":["https://example.com"]}`), &object); err != nil {
+	if err := json.Unmarshal([]byte(`{"paths":["c","https://example.com/d"],"urls":["https://example.com"]}`), &object); err != nil {
 		t.Fatal(err)
 	}
-	if len(object.Paths) != 1 || len(object.URLs) != 1 {
+	if len(object.Paths) != 1 || len(object.URLs) != 2 {
 		t.Fatalf("unexpected object config: %+v", object)
 	}
 }
@@ -190,5 +262,78 @@ func TestFilterRemovesBlockedSkills(t *testing.T) {
 	}
 	if _, ok := manager.Get("b"); ok {
 		t.Fatal("blocked skill should be removed")
+	}
+}
+
+func TestAncestorSkillRoots(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "nested", "work")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(parent, ".lingzhu", "skills", "repo", "SKILL.md"), "---\ndescription: repo\n---\nbody")
+
+	wanted := filepath.Join(parent, ".lingzhu", "skills")
+	found := false
+	for _, root := range Roots(nil, "", child) {
+		if filepath.Clean(root) == filepath.Clean(wanted) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ancestor skill root missing from %v", Roots(nil, "", child))
+	}
+	if _, ok := Discover([]string{wanted}, t.Logf).Get("repo"); !ok {
+		t.Fatal("ancestor skill was not discovered")
+	}
+}
+
+func TestFrontmatterSanitizesPlainValues(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "loose", "SKILL.md"), `---
+name: [Draft] Guide
+description: 10:30 lesson
+---
+body
+`)
+	item, ok := Discover([]string{root}, t.Logf).Get("loose")
+	if !ok {
+		t.Fatal("skill not discovered")
+	}
+	if item.Name != "[Draft] Guide" || item.Description != "10:30 lesson" {
+		t.Fatalf("loose frontmatter was not recovered: %+v", item)
+	}
+}
+
+func TestAutoinvokeMetadataWinsOverDisable(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "meta", "SKILL.md"), `---
+description: meta
+metadata:
+  vendor/autoinvoke: true
+disable-model-invocation: true
+---
+body
+`)
+	item, ok := Discover([]string{root}, t.Logf).Get("meta")
+	if !ok {
+		t.Fatal("skill not discovered")
+	}
+	if !item.Autoinvoke {
+		t.Fatal("explicit metadata autoinvoke should win over disable-model-invocation")
+	}
+}
+
+func TestSymlinkedSkillDirectory(t *testing.T) {
+	root := t.TempDir()
+	target := t.TempDir()
+	writeFile(t, filepath.Join(target, "demo", "SKILL.md"), "---\ndescription: linked\n---\nbody")
+	if err := os.Symlink(filepath.Join(target, "demo"), filepath.Join(root, "linked")); err != nil {
+		t.Skipf("symlinks are not available: %v", err)
+	}
+	item, ok := Discover([]string{root}, t.Logf).Get("linked")
+	if !ok || item.Description != "linked" {
+		t.Fatalf("symlinked skill was not discovered: %+v", item)
 	}
 }

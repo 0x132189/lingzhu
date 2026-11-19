@@ -43,6 +43,12 @@ func TestHelperMCPProcess(t *testing.T) {
 		_ = writer.WriteByte('\n')
 		_ = writer.Flush()
 	}
+	notifyParams := func(method string, params map[string]any) {
+		data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+		_, _ = writer.Write(data)
+		_ = writer.WriteByte('\n')
+		_ = writer.Flush()
+	}
 	dynamic := false
 
 	for scanner.Scan() {
@@ -59,9 +65,15 @@ func TestHelperMCPProcess(t *testing.T) {
 		case "initialize":
 			reply(id, map[string]any{
 				"protocolVersion": "2024-11-05",
-				"capabilities":    map[string]any{"tools": map[string]any{}, "resources": map[string]any{}},
-				"serverInfo":      map[string]any{"name": "fake", "version": "1.0.0"},
-				"instructions":    "Use echo for text.",
+				"capabilities": map[string]any{
+					"tools":     map[string]any{},
+					"resources": map[string]any{},
+					"extensions": map[string]any{
+						"io.modelcontextprotocol/events": map[string]any{},
+					},
+				},
+				"serverInfo":   map[string]any{"name": "fake", "version": "1.0.0"},
+				"instructions": "Use echo for text.",
 			}, nil)
 		case "notifications/initialized":
 			// Notification, no response.
@@ -214,6 +226,46 @@ func TestHelperMCPProcess(t *testing.T) {
 					"text":     "hello resource",
 				}},
 			}, nil)
+		case "events/list":
+			var params struct {
+				Cursor string `json:"cursor"`
+			}
+			_ = json.Unmarshal(message.Params, &params)
+			if params.Cursor == "" {
+				reply(id, map[string]any{
+					"events": []map[string]any{{
+						"name":        "job.finished",
+						"description": "A job ended",
+						"delivery":    []string{"push"},
+						"inputSchema": map[string]any{"type": "object"},
+					}},
+					"nextCursor": "events-2",
+				}, nil)
+				continue
+			}
+			reply(id, map[string]any{
+				"events": []map[string]any{{"name": "job.failed", "delivery": []string{"push"}}},
+			}, nil)
+		case "events/stream":
+			meta := map[string]any{"io.modelcontextprotocol/subscriptionId": json.RawMessage(id)}
+			notifyParams("notifications/events/active", map[string]any{
+				"cursor":    "c0",
+				"truncated": true,
+				"_meta":     meta,
+			})
+			notifyParams("notifications/events/event", map[string]any{
+				"eventId":   "e1",
+				"name":      "job.finished",
+				"timestamp": "2026-11-10T00:00:00Z",
+				"data":      map[string]any{"ok": true},
+				"cursor":    "c1",
+				"_meta":     meta,
+			})
+			notifyParams("notifications/events/heartbeat", map[string]any{
+				"cursor": "c2",
+				"_meta":  meta,
+			})
+			reply(id, map[string]any{}, nil)
 		case "ping":
 			reply(id, map[string]any{}, nil)
 		default:
@@ -257,9 +309,93 @@ func TestManagerDiscoversToolsAndResources(t *testing.T) {
 	if servers := manager.Servers(); len(servers) != 1 || servers[0] != "demo" {
 		t.Fatalf("unexpected servers: %v", servers)
 	}
+	status := manager.Status()
+	if len(status) != 1 || status[0].Title != "fake" {
+		t.Fatalf("server title was not captured: %+v", status)
+	}
 	instructions := manager.Instructions()
 	if len(instructions) != 1 || instructions[0].Server != "demo" || instructions[0].Instructions != "Use echo for text." {
 		t.Fatalf("server instructions were not captured: %+v", instructions)
+	}
+}
+
+func TestManagerListsAndStreamsEvents(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	if !manager.EventsSupported("demo") {
+		t.Fatal("events capability was not detected")
+	}
+	events, err := manager.EventTypes(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Name != "job.finished" || events[1].Name != "job.failed" {
+		t.Fatalf("unexpected event catalog: %+v", events)
+	}
+	if len(events[0].Delivery) != 1 || events[0].Delivery[0] != "push" {
+		t.Fatalf("delivery was not kept: %+v", events[0])
+	}
+
+	cursor := "c0"
+	stream, stop, err := manager.StreamEvents(context.Background(), "demo", "job.finished", map[string]any{"job": "j1"}, &cursor, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	var messages []EventMessage
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case message, ok := <-stream:
+			if !ok {
+				if len(messages) != 3 {
+					t.Fatalf("unexpected event messages: %+v", messages)
+				}
+				if messages[0].Type != "active" || !messages[0].Truncated {
+					t.Fatalf("unexpected active message: %+v", messages[0])
+				}
+				if messages[1].Type != "event" || messages[1].EventID != "e1" || messages[1].Name != "job.finished" {
+					t.Fatalf("unexpected event message: %+v", messages[1])
+				}
+				if messages[1].Cursor == nil || *messages[1].Cursor != "c1" {
+					t.Fatalf("event cursor missing: %+v", messages[1])
+				}
+				if messages[2].Type != "heartbeat" {
+					t.Fatalf("unexpected heartbeat: %+v", messages[2])
+				}
+				return
+			}
+			messages = append(messages, message)
+		case <-deadline:
+			t.Fatalf("event stream did not finish: %+v", messages)
+		}
+	}
+}
+
+func TestEventToolsListCatalog(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	var toolItem tool.Tool
+	for _, item := range EventTools(manager) {
+		if item.Name() == "lingzhu_list_mcp_events" {
+			toolItem = item
+		}
+	}
+	if toolItem == nil {
+		t.Fatal("event tool not registered")
+	}
+	out, err := toolItem.Run(context.Background(), tool.Call{Name: toolItem.Name(), Input: json.RawMessage(`{"server":"demo"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "job.finished") || !strings.Contains(out, "job.failed") {
+		t.Fatalf("unexpected event list: %q", out)
+	}
+	if _, err := toolItem.Run(context.Background(), tool.Call{Name: toolItem.Name(), Input: json.RawMessage(`{"server":"missing"}`)}); err == nil ||
+		!strings.Contains(err.Error(), "not connected") {
+		t.Fatalf("want missing-server error, got %v", err)
 	}
 }
 
@@ -286,6 +422,37 @@ func TestManagerCallsTools(t *testing.T) {
 				t.Fatalf("unexpected add output: %q", out)
 			}
 		}
+	}
+}
+
+func TestManagerBackgroundStart(t *testing.T) {
+	manager := StartBackground(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf, nil)
+	defer manager.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, item := range manager.Tools() {
+			if item.Name() == "demo_echo" {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("background manager did not register tools: %+v", manager.Status())
+}
+
+func TestManagerAwaitStartup(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	done := make(chan struct{})
+	go func() {
+		manager.AwaitStartup(context.Background(), time.Second)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AwaitStartup did not return after startup settled")
 	}
 }
 
@@ -356,6 +523,29 @@ func TestManagerReconnectsServer(t *testing.T) {
 	}
 }
 
+func TestManagerDisconnectAndReconnect(t *testing.T) {
+	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
+	defer manager.Close()
+
+	status, err := manager.Disconnect("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusDisabled || len(status.Tools) != 0 {
+		t.Fatalf("unexpected disconnect status: %+v", status)
+	}
+	if names := manager.Servers(); len(names) != 0 {
+		t.Fatalf("disconnected server still connected: %v", names)
+	}
+	status, err = manager.Reconnect(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusConnected || len(status.Tools) == 0 {
+		t.Fatalf("reconnect after disconnect failed: %+v", status)
+	}
+}
+
 func TestResourceTools(t *testing.T) {
 	manager := Start(context.Background(), Config{Servers: map[string]Server{"demo": helperServer(t)}}, t.TempDir(), t.Logf)
 	defer manager.Close()
@@ -392,6 +582,20 @@ func TestResourceTools(t *testing.T) {
 func TestConnectRejectsMissingCommand(t *testing.T) {
 	if _, err := Connect(context.Background(), "bad", Server{Type: "local"}, t.TempDir()); err == nil {
 		t.Fatal("want missing command error")
+	}
+}
+
+func TestRootsResultUsesWorkspace(t *testing.T) {
+	root := t.TempDir()
+	client := &Client{workdir: root}
+	result := client.rootsResult()
+	roots, ok := result["roots"].([]any)
+	if !ok || len(roots) != 1 {
+		t.Fatalf("unexpected roots: %+v", result)
+	}
+	item, _ := roots[0].(map[string]string)
+	if !strings.HasPrefix(item["uri"], "file://") || item["name"] == "" {
+		t.Fatalf("unexpected root entry: %+v", item)
 	}
 }
 

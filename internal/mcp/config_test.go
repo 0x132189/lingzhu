@@ -43,6 +43,24 @@ func TestTimeoutDefaults(t *testing.T) {
 	}
 }
 
+func TestGlobalMCPTimeout(t *testing.T) {
+	var cfg Config
+	body := `{"timeout":{"startup":700,"catalog":800,"execution":900},"servers":{"a":{"type":"remote","url":"https://example.com/mcp"},"b":{"type":"remote","url":"https://example.com/mcp","timeout":{"startup":100}}}}`
+	if err := json.Unmarshal([]byte(body), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timeout.Startup != 700 {
+		t.Fatalf("global timeout was not parsed: %+v", cfg.Timeout)
+	}
+	manager := newManager(cfg, t.TempDir(), t.Logf, nil)
+	if manager.states["a"].config.Timeout != (Timeout{Startup: 700, Catalog: 800, Execution: 900}) {
+		t.Fatalf("server did not inherit global timeout: %+v", manager.states["a"].config.Timeout)
+	}
+	if manager.states["b"].config.Timeout.Startup != 100 || manager.states["b"].config.Timeout.Catalog != 800 {
+		t.Fatalf("per-server timeout should override only its field: %+v", manager.states["b"].config.Timeout)
+	}
+}
+
 func TestOAuthRefForms(t *testing.T) {
 	cases := []struct {
 		body string
@@ -62,9 +80,21 @@ func TestOAuthRefForms(t *testing.T) {
 			t.Fatalf("%s: want %q, got %q", tc.body, tc.want, got)
 		}
 	}
+	var options Config
+	body := `{"remote":{"type":"remote","url":"https://example.com/mcp","oauth":{"clientId":"id","clientSecret":"secret","scope":"read write","callbackPort":19876}}}`
+	if err := json.Unmarshal([]byte(body), &options); err != nil {
+		t.Fatal(err)
+	}
+	ref := options.Servers["remote"].OAuth
+	if ref.Name != "" || ref.ClientID != "id" || ref.ClientSecret != "secret" || ref.Scope != "read write" || ref.CallbackPort != 19876 || !ref.Configured() {
+		t.Fatalf("unexpected oauth options: %+v", ref)
+	}
 	var invalid Config
 	if err := json.Unmarshal([]byte(`{"remote":{"type":"remote","url":"x","oauth":123}}`), &invalid); err == nil {
 		t.Fatal("numeric oauth should be rejected")
+	}
+	if err := json.Unmarshal([]byte(`{"remote":{"type":"remote","url":"x","oauth":{"callbackPort":70000}}}`), &invalid); err == nil {
+		t.Fatal("out-of-range callbackPort should be rejected")
 	}
 }
 

@@ -20,11 +20,22 @@ type mcpTool struct {
 	server      string
 	rawName     string
 	name        string
+	title       string
 	description string
 	schema      json.RawMessage
+	annotations map[string]any
+	output      json.RawMessage
+	codemode    bool
 }
 
 func (t *mcpTool) Name() string { return t.name }
+
+// MCPServer names the server that owns this tool.
+func (t *mcpTool) MCPServer() string { return t.server }
+
+// Codemode reports whether this server's tools should only be reachable
+// through execute.
+func (t *mcpTool) Codemode() bool { return t.codemode }
 
 func (t *mcpTool) Description() string {
 	if t.description != "" {
@@ -50,7 +61,7 @@ func (t *mcpTool) Run(ctx context.Context, call tool.Call) (string, error) {
 			return "", fmt.Errorf("mcp: %s: invalid arguments: %w", t.name, err)
 		}
 	}
-	result, err := t.client.CallTool(ctx, t.rawName, args)
+	result, err := t.client.CallToolSession(ctx, t.rawName, args, call.SessionID)
 	if err != nil {
 		return "", fmt.Errorf("mcp: %s: %w", t.name, err)
 	}
@@ -188,6 +199,101 @@ func ResourceTools(manager *Manager) []tool.Tool {
 		&listResources{manager: manager},
 		&readResource{manager: manager},
 	}
+}
+
+// EventTools returns lingzhu_list_mcp_events, the discovery entry point for
+// servers that implement the draft MCP Events extension.
+func EventTools(manager *Manager) []tool.Tool {
+	return []tool.Tool{&listEvents{manager: manager}}
+}
+
+type listEvents struct {
+	manager *Manager
+}
+
+func (t *listEvents) Name() string { return "lingzhu_list_mcp_events" }
+
+func (t *listEvents) Description() string {
+	return "List the event types an MCP server sends. Only servers that declare the MCP Events extension appear here."
+}
+
+func (t *listEvents) Schema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"server": {"type": "string", "description": "MCP server name as configured"}
+		},
+		"required": ["server"]
+	}`)
+}
+
+func (t *listEvents) Run(ctx context.Context, call tool.Call) (string, error) {
+	var args struct {
+		Server string `json:"server"`
+	}
+	if err := json.Unmarshal(call.Input, &args); err != nil {
+		return "", fmt.Errorf("lingzhu_list_mcp_events: %w", err)
+	}
+	args.Server = strings.TrimSpace(args.Server)
+	if args.Server == "" {
+		return "", errors.New("lingzhu_list_mcp_events: server is required")
+	}
+	if err := call.Allow(ctx, "lingzhu_list_mcp_events", []string{args.Server}, ""); err != nil {
+		return "", err
+	}
+	if !t.manager.EventsSupported(args.Server) {
+		return "", fmt.Errorf("MCP server %q is not connected or sends no events", args.Server)
+	}
+	events, err := t.manager.EventTypes(ctx, args.Server)
+	if err != nil {
+		return "", fmt.Errorf("lingzhu_list_mcp_events: %w", err)
+	}
+	if len(events) == 0 {
+		return "No MCP events found", nil
+	}
+	push := make([]EventType, 0, len(events))
+	for _, item := range events {
+		for _, delivery := range item.Delivery {
+			if delivery == "push" {
+				push = append(push, item)
+				break
+			}
+		}
+	}
+	if len(push) == 0 {
+		return "No MCP events found", nil
+	}
+	events = push
+	var b strings.Builder
+	for _, item := range events {
+		fmt.Fprintf(&b, "%s", item.Name)
+		if item.Description != "" {
+			b.WriteString(" - " + item.Description)
+		}
+		if len(item.Delivery) > 0 {
+			b.WriteString(" [" + strings.Join(item.Delivery, ", ") + "]")
+		}
+		if len(item.InputSchema) > 0 && string(item.InputSchema) != "null" {
+			b.WriteString("\n  args: " + compactJSON(item.InputSchema))
+		}
+		if len(item.PayloadSchema) > 0 && string(item.PayloadSchema) != "null" {
+			b.WriteString("\n  data: " + compactJSON(item.PayloadSchema))
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func compactJSON(raw json.RawMessage) string {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return string(raw)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return string(raw)
+	}
+	return string(data)
 }
 
 type listResources struct {

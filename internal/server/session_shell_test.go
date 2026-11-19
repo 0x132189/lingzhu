@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,6 +38,46 @@ func seedSession(t *testing.T, store *session.Store, id string) {
 	if _, err := store.Append(id, event.User("seed")); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPromptExpandsSkillMention(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "demo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\nname: Demo\ndescription: demo skill\n---\nMENTION_SKILL_MARKER\n"
+	if err := os.WriteFile(filepath.Join(root, "demo", "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, store := newSessionServer(t, func(s *Server) {
+		s.SetSkills(skill.Discover([]string{root}, nil))
+	})
+	seedSession(t, store, "s1")
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	resp, err := http.Post(httpSrv.URL+"/sessions/s1/prompt", "application/json", strings.NewReader(`{"text":"@demo explain this"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected prompt status: %d %s", resp.StatusCode, payload)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		messages, err := store.Messages("s1")
+		if err == nil {
+			for _, message := range messages {
+				if strings.Contains(message.Content, "MENTION_SKILL_MARKER") && strings.Contains(message.Content, "@demo explain this") {
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("skill mention was not expanded into the prompt")
 }
 
 func TestSkillEndpointStartsTurn(t *testing.T) {

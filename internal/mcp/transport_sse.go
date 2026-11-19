@@ -23,7 +23,7 @@ type sseTransport struct {
 	client    *http.Client
 	onMessage func(rpc.Message)
 	onClose   func()
-	token     func(context.Context) (string, error)
+	token     func(context.Context, bool) (string, error)
 
 	mu        sync.Mutex
 	endpoint  string
@@ -35,7 +35,7 @@ type sseTransport struct {
 	closeOnce sync.Once
 }
 
-func startSSE(ctx context.Context, name string, cfg Server, token func(context.Context) (string, error), onMessage func(rpc.Message), onClose func()) (*sseTransport, error) {
+func startSSE(ctx context.Context, name string, cfg Server, token func(context.Context, bool) (string, error), onMessage func(rpc.Message), onClose func()) (*sseTransport, error) {
 	raw := strings.TrimSpace(expandEnv(cfg.URL))
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -231,5 +231,5 @@ func (t *sseTransport) Close() error {
 }
 
 func (t *sseTransport) authorize(ctx context.Context, req *http.Request) error {
-	return authorizeRequest(ctx, req, t.headers, t.token)
+	return authorizeRequest(ctx, req, t.headers, t.token, false)
 }

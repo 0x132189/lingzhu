@@ -290,6 +290,43 @@ func TestHTTPTransportRejectsBadURL(t *testing.T) {
 	}
 }
 
+func TestModernRequestHeaders(t *testing.T) {
+	var gotMethod, gotName, gotProtocol string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Header.Get("Mcp-Method")
+		gotName = r.Header.Get("Mcp-Name")
+		gotProtocol = r.Header.Get("MCP-Protocol-Version")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	transport, err := startHTTP("demo", Server{Type: "remote", URL: server.URL}, nil, func(rpc.Message) {}, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.SetProtocolVersion(modernProtocolVersion)
+	message := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}`)
+	if err := transport.Send(context.Background(), message, 0); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != "tools/call" || gotName != "echo" || gotProtocol != modernProtocolVersion {
+		t.Fatalf("unexpected modern headers: method=%q name=%q protocol=%q", gotMethod, gotName, gotProtocol)
+	}
+}
+
+func TestRetryableErrors(t *testing.T) {
+	for _, text := range []string{"mcp: HTTP 503", "mcp: HTTP 429", "read: connection reset by peer"} {
+		if !retryableError(errors.New(text)) {
+			t.Fatalf("%q should be retryable", text)
+		}
+	}
+	for _, text := range []string{"mcp: HTTP 404", "rpc error -32602: bad params", "context canceled"} {
+		if retryableError(errors.New(text)) {
+			t.Fatalf("%q should not be retryable", text)
+		}
+	}
+}
+
 func TestExpandEnv(t *testing.T) {
 	t.Setenv("MCP_TEST_VALUE", "value")
 	if got := expandEnv("https://{env:MCP_TEST_VALUE}/${MCP_TEST_VALUE}"); got != "https://value/value" {
@@ -446,7 +483,8 @@ func TestHTTPSessionTerminatesOnClose(t *testing.T) {
 	}
 }
 
-func TestHTTPSessionExpiryMarksServerFailed(t *testing.T) {
+func TestHTTPSessionExpiryReconnectsAndRetries(t *testing.T) {
+	expired := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			http.Error(w, "no stream", http.StatusMethodNotAllowed)
@@ -459,7 +497,11 @@ func TestHTTPSessionExpiryMarksServerFailed(t *testing.T) {
 			return
 		}
 		if message.Method == "initialize" {
-			w.Header().Set("Mcp-Session-Id", "sess-expire")
+			session := "sess-expire"
+			if expired {
+				session = "sess-new"
+			}
+			w.Header().Set("Mcp-Session-Id", session)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(rpcReply(message.ID, map[string]any{
 				"protocolVersion": "2024-11-05",
@@ -472,7 +514,8 @@ func TestHTTPSessionExpiryMarksServerFailed(t *testing.T) {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		if message.Method == "tools/call" {
+		if message.Method == "tools/call" && !expired {
+			expired = true
 			http.NotFound(w, r)
 			return
 		}
@@ -505,18 +548,17 @@ func TestHTTPSessionExpiryMarksServerFailed(t *testing.T) {
 	if echo == nil {
 		t.Fatal("echo tool not discovered")
 	}
-	if _, err := echo.Run(context.Background(), call("expire_echo", `{"text":"hi"}`)); err == nil {
-		t.Fatal("expired session call should fail")
+	out, err := echo.Run(context.Background(), call("expire_echo", `{"text":"hi"}`))
+	if err != nil {
+		t.Fatalf("expired session should recover: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		status, ok := manager.StatusFor("expire")
-		if ok && status.Status == StatusFailed {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	if out == "" {
+		t.Fatal("recovered tool returned no output")
 	}
-	t.Fatalf("expired session was not marked failed: %+v", manager.Status())
+	status, ok := manager.StatusFor("expire")
+	if !ok || status.Status != StatusConnected {
+		t.Fatalf("recovered server should stay connected: %+v", manager.Status())
+	}
 }
 
 func TestRemoteOAuthToken(t *testing.T) {
@@ -557,9 +599,12 @@ func TestRemoteOAuthToken(t *testing.T) {
 			OAuth:   OAuthRef{Name: "work"},
 			Timeout: Timeout{Startup: 5000, Catalog: 5000, Execution: 5000},
 		},
-	}}, t.TempDir(), t.Logf, func(_ context.Context, endpoint string) (string, error) {
+	}}, t.TempDir(), t.Logf, func(_ context.Context, endpoint string, force bool) (string, error) {
 		if endpoint != "work" {
 			t.Errorf("unexpected oauth endpoint %q", endpoint)
+		}
+		if force {
+			t.Error("initial connection must not force a refresh")
 		}
 		return "oauth-token", nil
 	})
@@ -584,11 +629,174 @@ func TestRemoteOAuthToken(t *testing.T) {
 			OAuth:   OAuthRef{Name: "work"},
 			Timeout: Timeout{Startup: 2000, Catalog: 2000, Execution: 2000},
 		},
-	}}, t.TempDir(), t.Logf, func(context.Context, string) (string, error) {
+	}}, t.TempDir(), t.Logf, func(context.Context, string, bool) (string, error) {
 		return "", errors.New("no token")
 	})
 	defer failing.Close()
 	if got := failing.Servers(); len(got) != 0 {
 		t.Fatalf("token failure should skip the server: %v", got)
+	}
+}
+
+func TestRemoteOAuthRefreshesOnUnauthorized(t *testing.T) {
+	var mu sync.Mutex
+	token := "stale"
+	forced := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var message rpc.Message
+		if err := json.Unmarshal(body, &message); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		current := token
+		mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer "+current {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if message.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if message.Method == "tools/call" {
+			mu.Lock()
+			expired := token == "stale"
+			if expired {
+				token = "fresh"
+			}
+			mu.Unlock()
+			if expired {
+				w.Header().Set("WWW-Authenticate", "Bearer")
+				http.Error(w, "token expired", http.StatusUnauthorized)
+				return
+			}
+		}
+		result, failure := fakeResult(t, message)
+		if failure != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(failure)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(rpcReply(message.ID, result))
+	}))
+	defer server.Close()
+
+	manager := StartWithTokens(context.Background(), Config{Servers: map[string]Server{
+		"remote": {
+			Type:    "remote",
+			URL:     server.URL,
+			OAuth:   OAuthRef{Name: "work"},
+			Timeout: Timeout{Startup: 5000, Catalog: 5000, Execution: 5000},
+		},
+	}}, t.TempDir(), t.Logf, func(_ context.Context, endpoint string, force bool) (string, error) {
+		if endpoint != "work" {
+			t.Errorf("unexpected oauth endpoint %q", endpoint)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if force {
+			forced++
+			return "fresh", nil
+		}
+		return token, nil
+	})
+	defer manager.Close()
+	if got := manager.Servers(); len(got) != 1 {
+		t.Fatalf("oauth server did not connect: %v", got)
+	}
+	for _, item := range manager.Tools() {
+		if item.Name() != "remote_echo" {
+			continue
+		}
+		out, err := item.Run(context.Background(), call("remote_echo", `{"text":"hi"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out, "hi") {
+			t.Fatalf("unexpected tool output: %q", out)
+		}
+		mu.Lock()
+		got := forced
+		mu.Unlock()
+		if got != 1 {
+			t.Fatalf("expected one forced refresh, got %d", got)
+		}
+		return
+	}
+	t.Fatalf("oauth tool missing: %v", manager.Tools())
+}
+
+func TestInvalidToolsSkipped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var message rpc.Message
+		if err := json.Unmarshal(body, &message); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if message.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		var result any
+		switch message.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "filter"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []any{
+				map[string]any{
+					"name":        "good",
+					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}, "required": []any{"text"}},
+				},
+				map[string]any{"name": "", "inputSchema": map[string]any{"type": "object"}},
+				map[string]any{"name": "array-schema", "inputSchema": []any{}},
+				map[string]any{"name": "wrong-type", "inputSchema": map[string]any{"type": "array"}},
+			}}
+		default:
+			result = map[string]any{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(rpcReply(message.ID, result))
+	}))
+	defer server.Close()
+
+	client, err := Connect(context.Background(), "filter", Server{
+		Type:    "remote",
+		URL:     server.URL,
+		Timeout: Timeout{Startup: 5000, Catalog: 5000, Execution: 5000},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	tools, err := client.Tools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "good" {
+		t.Fatalf("unexpected tools: %+v", tools)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(tools[0].InputSchema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if schema["type"] != "object" {
+		t.Fatalf("input schema was not normalized: %s", tools[0].InputSchema)
 	}
 }

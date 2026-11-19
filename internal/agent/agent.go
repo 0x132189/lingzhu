@@ -554,6 +554,25 @@ func (a *Agent) warmOnce(ctx context.Context, sessionID string, target provider.
 	}
 }
 
+// Ask presents one question set and waits for the user's answer. Unlike the
+// model-facing question tool, it has no permission request of its own; callers
+// such as MCP elicitation already gate the operation.
+func (a *Agent) Ask(ctx context.Context, sessionID string, prompts []question.Prompt) (question.Response, error) {
+	if a.questions == nil {
+		return question.Response{}, errors.New("questions are not configured")
+	}
+	var request question.Request
+	response, err := a.questions.Ask(ctx, sessionID, prompts, func(req question.Request) error {
+		request = req
+		return a.emit(sessionID, event.QuestionAskedEvent(req.ID, req.SessionID, req.Questions))
+	})
+	if err != nil {
+		return question.Response{}, err
+	}
+	_ = a.emit(sessionID, event.QuestionRepliedEvent(request.ID, request.SessionID, response.Answers, response.Cancelled, response.Message))
+	return response, nil
+}
+
 // PendingQuestions lists question sets waiting for this session.
 func (a *Agent) PendingQuestions(sessionID string) []question.Request {
 	if a.questions == nil {
@@ -1500,6 +1519,41 @@ func (a *Agent) Resolve(selection provider.Selection) (provider.Target, error) {
 
 // DefaultTarget is the configured default provider/model.
 func (a *Agent) DefaultTarget() provider.Target { return a.catalog.Default() }
+
+// Sample runs one transient model call for an MCP server's sampling request.
+// Nothing is written to a session or the event log.
+func (a *Agent) Sample(ctx context.Context, system string, messages []model.Message) (string, string, error) {
+	target := a.catalog.Default()
+	wire := target.RequestModel
+	if wire == "" {
+		wire = target.Model
+	}
+	if strings.TrimSpace(system) != "" {
+		messages = append([]model.Message{{Role: model.RoleSystem, Content: strings.TrimSpace(system)}}, messages...)
+	}
+	stream, err := target.Provider.Stream(ctx, model.Request{
+		Model:    wire,
+		Messages: messages,
+		Headers:  target.Headers,
+		Options:  target.Options,
+	})
+	if err != nil {
+		return "", target.Model, err
+	}
+	defer stream.Close()
+	var b strings.Builder
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", target.Model, err
+		}
+		b.WriteString(chunk.Text)
+	}
+	return b.String(), target.Model, nil
+}
 
 // Providers returns the sanitized provider catalog for clients.
 func (a *Agent) Providers() []provider.ProviderInfo { return a.catalog.Providers() }

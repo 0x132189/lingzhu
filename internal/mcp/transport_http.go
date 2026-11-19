@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,21 +17,26 @@ import (
 
 // errStreamUnsupported marks a server that does not offer the standalone SSE
 // stream the Streamable HTTP transport may open after initialize.
-var errStreamUnsupported = errors.New("mcp: server does not offer a GET stream")
+var (
+	errStreamUnsupported = errors.New("mcp: server does not offer a GET stream")
+	errSessionExpired    = errors.New("mcp: HTTP 404: session expired")
+)
 
-// TokenFunc returns a bearer token for one configured oauth endpoint.
-type TokenFunc func(ctx context.Context, endpoint string) (string, error)
+// TokenFunc returns a bearer token for one configured oauth endpoint. Force
+// asks the resolver to refresh a token the server has already rejected.
+type TokenFunc func(ctx context.Context, endpoint string, force bool) (string, error)
 
 // httpTransport speaks the Streamable HTTP transport: every JSON-RPC message is
 // one POST, the answer arrives as a JSON body or an SSE stream on the same
 // response, and a standalone GET stream carries server-initiated messages.
 type httpTransport struct {
+	name      string
 	endpoint  string
 	headers   map[string]string
 	client    *http.Client
 	onMessage func(rpc.Message)
 	onClose   func()
-	token     func(context.Context) (string, error)
+	token     func(context.Context, bool) (string, error)
 
 	mu              sync.Mutex
 	sessionID       string
@@ -40,13 +46,14 @@ type httpTransport struct {
 	streamOnce      sync.Once
 }
 
-func startHTTP(name string, cfg Server, token func(context.Context) (string, error), onMessage func(rpc.Message), onClose func()) (*httpTransport, error) {
+func startHTTP(name string, cfg Server, token func(context.Context, bool) (string, error), onMessage func(rpc.Message), onClose func()) (*httpTransport, error) {
 	endpoint := strings.TrimSpace(expandEnv(cfg.URL))
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("mcp: server %q needs an http(s) url", name)
 	}
 	return &httpTransport{
+		name:      name,
 		endpoint:  endpoint,
 		headers:   expandHeaders(cfg.Headers),
 		client:    &http.Client{},
@@ -64,7 +71,36 @@ func (t *httpTransport) SetProtocolVersion(version string) {
 	t.mu.Unlock()
 }
 
+// modernRequestHeaders mirrors the method and name headers required by the
+// 2026-07-28 revision so servers can validate the request before parsing it.
+func modernRequestHeaders(message []byte) (string, string) {
+	var frame struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(message, &frame); err != nil {
+		return "", ""
+	}
+	return frame.Method, frame.Params.Name
+}
+
 func (t *httpTransport) Send(ctx context.Context, message []byte, expectID int64) error {
+	err := t.send(ctx, message, expectID, false)
+	var authErr *AuthRequiredError
+	if t.token == nil || !errors.As(err, &authErr) || hasAuthHeader(t.headers) {
+		return err
+	}
+	// The cached token was rejected before the request ran, so replaying the
+	// same message once after a forced refresh cannot duplicate side effects.
+	if retryErr := t.send(ctx, message, expectID, true); retryErr == nil {
+		return nil
+	}
+	return err
+}
+
+func (t *httpTransport) send(ctx context.Context, message []byte, expectID int64, force bool) error {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -86,10 +122,18 @@ func (t *httpTransport) Send(ctx context.Context, message []byte, expectID int64
 	if protocol != "" {
 		req.Header.Set("MCP-Protocol-Version", protocol)
 	}
+	if protocol == modernProtocolVersion {
+		if method, name := modernRequestHeaders(message); method != "" {
+			req.Header.Set("Mcp-Method", method)
+			if name != "" {
+				req.Header.Set("Mcp-Name", name)
+			}
+		}
+	}
 	for key, value := range t.headers {
 		req.Header.Set(key, value)
 	}
-	if err := t.authorize(ctx, req); err != nil {
+	if err := t.authorize(ctx, req, force); err != nil {
 		return err
 	}
 
@@ -107,8 +151,15 @@ func (t *httpTransport) Send(ctx context.Context, message []byte, expectID int64
 	// session. Mark the connection closed so the manager can show a failed
 	// server and the user can retry instead of every later call failing.
 	if resp.StatusCode == http.StatusNotFound && session != "" {
-		t.shutdown(false)
-		return fmt.Errorf("mcp: HTTP 404: session expired")
+		t.mu.Lock()
+		if t.sessionID == session {
+			t.sessionID = ""
+		}
+		t.mu.Unlock()
+		return errSessionExpired
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return authRequired(t.name, resp.Header.Get("WWW-Authenticate"))
 	}
 
 	switch {
@@ -170,7 +221,8 @@ func (t *httpTransport) streamLoop(ctx context.Context) {
 	delay := 500 * time.Millisecond
 	for {
 		err := t.openStream(ctx)
-		if ctx.Err() != nil || t.isClosed() || errors.Is(err, errStreamUnsupported) {
+		var authErr *AuthRequiredError
+		if ctx.Err() != nil || t.isClosed() || errors.Is(err, errStreamUnsupported) || errors.As(err, &authErr) {
 			return
 		}
 		timer := time.NewTimer(delay)
@@ -211,7 +263,7 @@ func (t *httpTransport) openStream(ctx context.Context) error {
 	for key, value := range t.headers {
 		req.Header.Set(key, value)
 	}
-	if err := t.authorize(ctx, req); err != nil {
+	if err := t.authorize(ctx, req, false); err != nil {
 		return err
 	}
 	resp, err := t.client.Do(req)
@@ -224,7 +276,7 @@ func (t *httpTransport) openStream(ctx context.Context) error {
 		return errStreamUnsupported
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("mcp: stream HTTP %d", resp.StatusCode)
+		return authRequired(t.name, resp.Header.Get("WWW-Authenticate"))
 	}
 	if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError {
 		return errStreamUnsupported
@@ -243,19 +295,14 @@ func (t *httpTransport) openStream(ctx context.Context) error {
 
 // authorizeRequest adds the OAuth bearer token unless a configured header
 // already supplies an Authorization value. Both HTTP transports share it.
-func authorizeRequest(ctx context.Context, req *http.Request, headers map[string]string, token func(context.Context) (string, error)) error {
-	if req.Header.Get("Authorization") != "" {
+func authorizeRequest(ctx context.Context, req *http.Request, headers map[string]string, token func(context.Context, bool) (string, error), force bool) error {
+	if req.Header.Get("Authorization") != "" || hasAuthHeader(headers) {
 		return nil
-	}
-	for key := range headers {
-		if strings.EqualFold(key, "Authorization") {
-			return nil
-		}
 	}
 	if token == nil {
 		return nil
 	}
-	value, err := token(ctx)
+	value, err := token(ctx, force)
 	if err != nil {
 		return fmt.Errorf("mcp: oauth: %w", err)
 	}
@@ -265,10 +312,19 @@ func authorizeRequest(ctx context.Context, req *http.Request, headers map[string
 	return nil
 }
 
+func hasAuthHeader(headers map[string]string) bool {
+	for key := range headers {
+		if strings.EqualFold(key, "Authorization") {
+			return true
+		}
+	}
+	return false
+}
+
 // authorize adds the OAuth bearer token unless a configured header already
 // supplies an Authorization value.
-func (t *httpTransport) authorize(ctx context.Context, req *http.Request) error {
-	return authorizeRequest(ctx, req, t.headers, t.token)
+func (t *httpTransport) authorize(ctx context.Context, req *http.Request, force bool) error {
+	return authorizeRequest(ctx, req, t.headers, t.token, force)
 }
 
 func (t *httpTransport) isClosed() bool {
@@ -316,7 +372,7 @@ func (t *httpTransport) terminate(session, protocol string) {
 	for key, value := range t.headers {
 		req.Header.Set(key, value)
 	}
-	if err := t.authorize(ctx, req); err != nil {
+	if err := t.authorize(ctx, req, false); err != nil {
 		return
 	}
 	resp, err := t.client.Do(req)

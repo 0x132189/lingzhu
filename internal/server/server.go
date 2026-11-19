@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -425,11 +426,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sessions/{id}/form/{formID}", s.replyForm)
 	mux.HandleFunc("POST /sessions/{id}/synthetic", s.synthetic)
 	mux.HandleFunc("GET /skills", s.listSkills)
+	mux.HandleFunc("GET /skills/errors", s.skillErrors)
+	mux.HandleFunc("GET /skills/{id}", s.getSkill)
+	mux.HandleFunc("POST /skills", s.createSkill)
+	mux.HandleFunc("DELETE /skills/{id}", s.deleteSkill)
 	mux.HandleFunc("POST /skills/refresh", s.refreshSkills)
 	mux.HandleFunc("GET /mcp", s.listMCP)
 	mux.HandleFunc("POST /mcp/{server}/reconnect", s.reconnectMCP)
+	mux.HandleFunc("POST /mcp/{server}/disconnect", s.disconnectMCP)
+	mux.HandleFunc("POST /mcp/{server}/auth", s.startMCPAuth)
+	mux.HandleFunc("POST /mcp/{server}/auth/exchange", s.exchangeMCPAuth)
+	mux.HandleFunc("GET /oauth/callback", s.mcpOAuthCallback)
+	mux.HandleFunc("POST /mcp/{server}/complete", s.completeMCP)
 	mux.HandleFunc("POST /mcp/{server}/tool", s.callMCPTool)
 	mux.HandleFunc("POST /mcp/{server}/resource", s.readMCPResource)
+	mux.HandleFunc("GET /mcp/{server}/events", s.listMCPEvents)
+	mux.HandleFunc("GET /mcp/{server}/events/stream", s.streamMCPEvents)
 	mux.HandleFunc("POST /sessions/{id}/skill", s.runSkill)
 	mux.HandleFunc("POST /sessions/{id}/shell", s.runSessionShell)
 	mux.HandleFunc("GET /sessions/{id}/shell", s.listSessionJobs)
@@ -1176,6 +1188,35 @@ func (s *Server) replyPermission(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+var skillMentionPattern = regexp.MustCompile(`(^|[\s])@([A-Za-z0-9][A-Za-z0-9._-]*)`)
+
+// expandSkillMentions turns @id tokens that match a discovered skill into the
+// same <skill_content> block the skill tool returns.
+func (s *Server) expandSkillMentions(r *http.Request, text string) string {
+	manager := s.skillsFor(r)
+	if manager == nil {
+		return text
+	}
+	seen := map[string]bool{}
+	var blocks []string
+	for _, match := range skillMentionPattern.FindAllStringSubmatch(text, -1) {
+		id := match[2]
+		if seen[id] {
+			continue
+		}
+		item, ok := manager.Get(id)
+		if !ok {
+			continue
+		}
+		seen[id] = true
+		blocks = append(blocks, item.Loaded())
+	}
+	if len(blocks) == 0 {
+		return text
+	}
+	return strings.Join(blocks, "\n\n") + "\n\n" + text
+}
+
 // prompt starts one conversation turn and streams its events as SSE. The turn
 // is owned by the session, so closing the connection does not stop it; use the
 // interrupt endpoint for that.
@@ -1197,6 +1238,11 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := s.workspace(r)
+	if manager := s.mcpFor(r); manager != nil {
+		// Servers connect in the background. Give a turn that arrives during
+		// startup a short grace window so its first model call sees their tools.
+		manager.AwaitStartup(r.Context(), 2*time.Second)
+	}
 	if name := slashName(body.Text); name != "" {
 		if command, ok := s.customCommandIn(r, name); ok {
 			if body.Agent == "" {
@@ -1220,7 +1266,7 @@ func (s *Server) prompt(w http.ResponseWriter, r *http.Request) {
 		s.handleGoalPrompt(w, r, objective, body.Provider, body.Model)
 		return
 	}
-	body.Text = s.expandIn(r, body.Text)
+	body.Text = s.expandSkillMentions(r, s.expandIn(r, body.Text))
 	if body.Text == "" {
 		writeError(w, http.StatusBadRequest, errText("text is empty"))
 		return
@@ -1360,7 +1406,7 @@ func (s *Server) input(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	body.Text = s.expandIn(r, body.Text)
+	body.Text = s.expandSkillMentions(r, s.expandIn(r, body.Text))
 	if strings.TrimSpace(body.Text) == "" {
 		writeError(w, http.StatusBadRequest, errText("text is empty"))
 		return

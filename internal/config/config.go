@@ -268,14 +268,41 @@ func DefaultPathFor(directory string) string {
 func ForDir(directory, fallbackPath string) (Config, error) {
 	path := filepath.Join(directory, "lingzhu.json")
 	if _, err := os.Stat(path); err != nil {
-		path = fallbackPath
+		cfg, err := Load(fallbackPath)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Workdir = directory
+		return cfg, nil
 	}
 	cfg, err := Load(path)
 	if err != nil {
 		return Config{}, err
 	}
+	if strings.TrimSpace(fallbackPath) != "" && filepath.Clean(fallbackPath) != filepath.Clean(path) {
+		if base, err := Load(fallbackPath); err == nil {
+			cfg.Skills = mergeSkillSources(base.Skills, cfg.Skills)
+		}
+	}
 	cfg.Workdir = directory
 	return cfg, nil
+}
+
+// mergeSkillSources keeps global skill roots available when a project config
+// also defines skills. Project entries come last, so their ids win on conflict.
+func mergeSkillSources(base, project skill.Config) skill.Config {
+	if len(project.Paths) == 0 && len(project.URLs) == 0 && project.MaxFiles == 0 {
+		return base
+	}
+	merged := skill.Config{
+		Paths:    append(append([]string(nil), base.Paths...), project.Paths...),
+		URLs:     append(append([]string(nil), base.URLs...), project.URLs...),
+		MaxFiles: project.MaxFiles,
+	}
+	if merged.MaxFiles == 0 {
+		merged.MaxFiles = base.MaxFiles
+	}
+	return merged
 }
 
 // Load reads a config document and fills in defaults for missing fields.

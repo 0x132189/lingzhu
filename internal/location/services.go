@@ -49,6 +49,12 @@ type Services struct {
 
 	// RefreshSkills rescans local skill roots and retries remote sources.
 	RefreshSkills func(context.Context) error
+	// CreateSkill writes a new skill under a local root.
+	CreateSkill func(context.Context, string, string, string, string) error
+	// DeleteSkill removes one skill from a local root.
+	DeleteSkill func(string) error
+	// SkillErrors returns per-source remote pull failures.
+	SkillErrors func() []skill.SourceError
 
 	configMu sync.RWMutex
 	config   config.Config

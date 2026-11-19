@@ -184,3 +184,112 @@ func TestConfigAcceptsMap(t *testing.T) {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
+
+func TestEnsureClientOptions(t *testing.T) {
+	var base string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mcp/.well-known/oauth-protected-resource":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"authorization_servers": []string{base},
+				"scopes_supported":      []string{"read"},
+			})
+		case r.URL.Path == "/.well-known/oauth-authorization-server":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer":                 base,
+				"authorization_endpoint": base + "/authorize",
+				"token_endpoint":         base + "/token",
+				"scopes_supported":       []string{"read", "write"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	base = server.URL
+
+	manager, err := New(t.TempDir(), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := manager.EnsureClient(context.Background(), "demo", base+"/mcp", "http://127.0.0.1:8787/oauth/callback", "", Options{
+		ClientID:     "configured-id",
+		ClientSecret: "configured-secret",
+		Scope:        "read write",
+		RedirectURI:  "http://127.0.0.1:19876/oauth/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.ClientID != "configured-id" || client.ClientSecret != "configured-secret" {
+		t.Fatalf("configured credentials were not used: %+v", client)
+	}
+	if client.RedirectURI != "http://127.0.0.1:19876/oauth/callback" {
+		t.Fatalf("redirect override was not applied: %+v", client)
+	}
+	if strings.Join(client.Scopes, " ") != "read write" {
+		t.Fatalf("scope override was not applied: %+v", client)
+	}
+}
+
+func TestEnsureClientDiscoversAndRegisters(t *testing.T) {
+	var base string
+	var registerBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mcp/.well-known/oauth-protected-resource":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"authorization_servers": []string{base},
+				"scopes_supported":      []string{"read"},
+			})
+		case r.URL.Path == "/.well-known/oauth-authorization-server":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer":                 base,
+				"authorization_endpoint": base + "/authorize",
+				"token_endpoint":         base + "/token",
+				"registration_endpoint":  base + "/register",
+				"scopes_supported":       []string{"read", "write"},
+			})
+		case r.URL.Path == "/register" && r.Method == http.MethodPost:
+			_ = json.NewDecoder(r.Body).Decode(&registerBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{"client_id": "dynamic-id"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	base = server.URL
+
+	dir := t.TempDir()
+	manager, err := New(dir, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := "http://127.0.0.1:19876/oauth/callback"
+	client, err := manager.EnsureClient(context.Background(), "demo", base+"/mcp", callback, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.ClientID != "dynamic-id" || client.AuthorizationURL != base+"/authorize" || client.TokenURL != base+"/token" {
+		t.Fatalf("unexpected dynamic client: %+v", client)
+	}
+	if client.RedirectURI != callback || client.AuthMethod != "none" {
+		t.Fatalf("dynamic client did not keep the loopback redirect: %+v", client)
+	}
+	redirects, _ := registerBody["redirect_uris"].([]any)
+	if len(redirects) != 1 || redirects[0] != callback {
+		t.Fatalf("registration did not send the redirect: %#v", registerBody)
+	}
+	if tokenMethod := registerBody["token_endpoint_auth_method"]; tokenMethod != "none" {
+		t.Fatalf("registration should be a public client: %#v", registerBody)
+	}
+
+	reopened, err := New(dir, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok := reopened.Client("demo")
+	if !ok || persisted.ClientID != "dynamic-id" || persisted.RedirectURI != callback {
+		t.Fatalf("dynamic client did not persist: %+v", persisted)
+	}
+}

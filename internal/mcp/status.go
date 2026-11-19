@@ -4,8 +4,12 @@ import "sort"
 
 // ServerTool is one tool advertised by a server.
 type ServerTool struct {
-	Name      string `json:"name"`
-	Effective string `json:"effective"`
+	Name        string `json:"name"`
+	Effective   string `json:"effective"`
+	Title       string `json:"title,omitempty"`
+	ReadOnly    bool   `json:"readOnly,omitempty"`
+	Destructive bool   `json:"destructive,omitempty"`
+	Idempotent  bool   `json:"idempotent,omitempty"`
 }
 
 // ServerResource is one resource or resource template of a server.
@@ -22,8 +26,10 @@ type ServerResource struct {
 // are unavailable so the client can offer a retry.
 type ServerStatus struct {
 	Name      string           `json:"name"`
+	Title     string           `json:"title,omitempty"`
 	Status    string           `json:"status"`
 	Error     string           `json:"error,omitempty"`
+	Events    bool             `json:"events,omitempty"`
 	Tools     []ServerTool     `json:"tools"`
 	Resources []ServerResource `json:"resources"`
 }
@@ -77,6 +83,10 @@ func (m *Manager) statusLocked(name string) ServerStatus {
 		status.Status = state.status
 		status.Error = state.err
 	}
+	if client := m.clients[name]; client != nil {
+		status.Title = client.Title()
+		status.Events = client.EventsSupported()
+	}
 	if status.Status != StatusConnected {
 		return status
 	}
@@ -85,7 +95,17 @@ func (m *Manager) statusLocked(name string) ServerStatus {
 		if !ok {
 			continue
 		}
-		status.Tools = append(status.Tools, ServerTool{Name: raw.rawName, Effective: raw.name})
+		readOnly, _ := raw.annotations["readOnlyHint"].(bool)
+		destructive, _ := raw.annotations["destructiveHint"].(bool)
+		idempotent, _ := raw.annotations["idempotentHint"].(bool)
+		status.Tools = append(status.Tools, ServerTool{
+			Name:        raw.rawName,
+			Effective:   raw.name,
+			Title:       raw.title,
+			ReadOnly:    readOnly,
+			Destructive: destructive,
+			Idempotent:  idempotent,
+		})
 	}
 	for _, resource := range m.resources[name] {
 		status.Resources = append(status.Resources, ServerResource{

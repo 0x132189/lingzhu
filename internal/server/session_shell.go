@@ -16,6 +16,7 @@ import (
 	"lingzhu/internal/job"
 	"lingzhu/internal/proc"
 	"lingzhu/internal/provider"
+	"lingzhu/internal/skill"
 )
 
 const (
@@ -46,6 +47,97 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"skills": items})
+}
+
+type skillDetail struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Directory   string   `json:"directory"`
+	Path        string   `json:"path"`
+	Content     string   `json:"content"`
+	Files       []string `json:"files,omitempty"`
+	Autoinvoke  bool     `json:"autoinvoke"`
+}
+
+// skillErrors returns per-source remote pull failures.
+func (s *Server) skillErrors(w http.ResponseWriter, r *http.Request) {
+	items := []skill.SourceError{}
+	if services := s.workspace(r); services != nil && services.SkillErrors != nil {
+		items = services.SkillErrors()
+	}
+	if items == nil {
+		items = []skill.SourceError{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"errors": items})
+}
+
+// getSkill returns one skill's instructions and sampled files.
+func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
+	manager := s.skillsFor(r)
+	if manager == nil {
+		writeError(w, http.StatusNotImplemented, errText("skills are not available"))
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	item, ok := manager.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, errText("skill not found"))
+		return
+	}
+	files := append([]string(nil), item.Files...)
+	writeJSON(w, http.StatusOK, map[string]any{"skill": skillDetail{
+		ID:          item.ID,
+		Name:        item.Name,
+		Description: item.Description,
+		Directory:   item.Directory,
+		Path:        item.Path,
+		Content:     item.Content,
+		Files:       files,
+		Autoinvoke:  item.Autoinvoke,
+	}})
+}
+
+// createSkill writes a new SKILL.md under a local skill root.
+func (s *Server) createSkill(w http.ResponseWriter, r *http.Request) {
+	services := s.workspace(r)
+	if services == nil || services.CreateSkill == nil {
+		writeError(w, http.StatusNotImplemented, errText("skills are not available"))
+		return
+	}
+	var body struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Content     string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(body.ID) == "" {
+		writeError(w, http.StatusBadRequest, errText("skill id is empty"))
+		return
+	}
+	if err := services.CreateSkill(r.Context(), body.ID, body.Name, body.Description, body.Content); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.listSkills(w, r)
+}
+
+// deleteSkill removes one local skill directory.
+func (s *Server) deleteSkill(w http.ResponseWriter, r *http.Request) {
+	services := s.workspace(r)
+	if services == nil || services.DeleteSkill == nil {
+		writeError(w, http.StatusNotImplemented, errText("skills are not available"))
+		return
+	}
+	if err := services.DeleteSkill(r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.listSkills(w, r)
 }
 
 // refreshSkills rescans local roots and retries remote skill sources.

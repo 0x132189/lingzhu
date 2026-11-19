@@ -4,6 +4,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -43,6 +44,7 @@ type Client struct {
 	Grant            string            `json:"grant,omitempty"`
 	RedirectURI      string            `json:"redirect_uri,omitempty"`
 	Audience         string            `json:"audience,omitempty"`
+	Resource         string            `json:"resource,omitempty"`
 	AuthMethod       string            `json:"auth_method,omitempty"`
 	ExtraParams      map[string]string `json:"extra_params,omitempty"`
 }
@@ -104,11 +106,13 @@ type Status struct {
 
 // Manager owns the token file and configured clients.
 type Manager struct {
-	file   string
-	cfg    Config
-	client *http.Client
+	file       string
+	clientFile string
+	cfg        Config
+	client     *http.Client
 
 	mu      sync.Mutex
+	dynamic map[string]Client
 	tokens  map[string]Token
 	pending map[string]pendingAuth
 }
@@ -125,16 +129,235 @@ func New(dataDir string, cfg Config) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		file:    filepath.Join(dataDir, "oauth.json"),
-		cfg:     cfg,
-		client:  &http.Client{Timeout: httpTimeout},
-		tokens:  map[string]Token{},
-		pending: map[string]pendingAuth{},
+		file:       filepath.Join(dataDir, "oauth.json"),
+		clientFile: filepath.Join(dataDir, "oauth-clients.json"),
+		cfg:        cfg,
+		client:     &http.Client{Timeout: httpTimeout},
+		dynamic:    map[string]Client{},
+		tokens:     map[string]Token{},
+		pending:    map[string]pendingAuth{},
 	}
 	if err := m.load(); err != nil {
 		return nil, err
 	}
+	if err := m.loadClients(); err != nil {
+		return nil, err
+	}
 	return m, nil
+}
+
+func (m *Manager) loadClients() error {
+	data, err := os.ReadFile(m.clientFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, &m.dynamic)
+}
+
+func (m *Manager) saveClientsLocked() error {
+	data, err := json.MarshalIndent(m.dynamic, "", "  ")
+	if err != nil {
+		return err
+	}
+	temp := m.clientFile + ".tmp"
+	if err := os.WriteFile(temp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(temp, m.clientFile)
+}
+
+func (m *Manager) lookupClient(name string) (Client, bool) {
+	if client, ok := m.cfg.Clients[name]; ok {
+		return client, true
+	}
+	client, ok := m.dynamic[name]
+	return client, ok
+}
+
+// Client returns one configured or dynamically registered client.
+func (m *Manager) Client(name string) (Client, bool) {
+	if m == nil {
+		return Client{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lookupClient(name)
+}
+
+// AddClient stores a dynamically registered client for later logins.
+func (m *Manager) AddClient(name string, client Client) error {
+	if m == nil {
+		return errors.New("oauth is not configured")
+	}
+	if strings.TrimSpace(name) == "" {
+		return errors.New("oauth client name is empty")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dynamic == nil {
+		m.dynamic = map[string]Client{}
+	}
+	m.dynamic[name] = client
+	return m.saveClientsLocked()
+}
+
+// AccessTokenOptional returns a token only when a client is configured for
+// name. Servers that allow anonymous access can use this without failing.
+func (m *Manager) AccessTokenOptional(ctx context.Context, name string) (string, bool, error) {
+	if m == nil {
+		return "", false, nil
+	}
+	m.mu.Lock()
+	_, ok := m.lookupClient(name)
+	m.mu.Unlock()
+	if !ok {
+		return "", false, nil
+	}
+	token, err := m.AccessToken(ctx, name)
+	return token, true, err
+}
+
+// PendingName returns the endpoint name waiting for one authorization state.
+func (m *Manager) PendingName(state string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending, ok := m.pending[state]
+	return pending.name, ok
+}
+
+// ExchangeState completes a flow using the pending state and returns the
+// endpoint name that started it.
+func (m *Manager) ExchangeState(ctx context.Context, code, state string) (string, Token, error) {
+	if m == nil {
+		return "", Token{}, errors.New("oauth is not configured")
+	}
+	m.mu.Lock()
+	pending, ok := m.pending[state]
+	delete(m.pending, state)
+	m.mu.Unlock()
+	if !ok {
+		return "", Token{}, errors.New("authorization state is invalid or expired")
+	}
+	token, err := m.Exchange(ctx, pending.name, code, pending.verifier)
+	return pending.name, token, err
+}
+
+// Options overrides discovery defaults for one per-server OAuth client.
+type Options struct {
+	ClientID     string
+	ClientSecret string
+	Scope        string
+	RedirectURI  string
+}
+
+// Configured reports whether any option is set.
+func (o Options) Configured() bool {
+	return o.ClientID != "" || o.ClientSecret != "" || o.Scope != "" || o.RedirectURI != ""
+}
+
+// EnsureClient discovers one resource's authorization server and registers a
+// public client for the loopback redirect when no client is configured yet.
+// Options override discovery defaults for automatic, per-server clients.
+func (m *Manager) EnsureClient(ctx context.Context, name, resourceURL, redirectURI, metadataURL string, options ...Options) (Client, error) {
+	if m == nil {
+		return Client{}, errors.New("oauth is not configured")
+	}
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if opts.RedirectURI != "" {
+		redirectURI = opts.RedirectURI
+	}
+	if client, ok := m.Client(name); ok {
+		if opts.Configured() {
+			if opts.ClientID != "" {
+				client.ClientID = opts.ClientID
+			}
+			if opts.ClientSecret != "" {
+				client.ClientSecret = opts.ClientSecret
+			}
+			if opts.Scope != "" {
+				client.Scopes = strings.Fields(opts.Scope)
+			}
+			if opts.RedirectURI != "" {
+				client.RedirectURI = opts.RedirectURI
+			}
+			if err := m.AddClient(name, client); err != nil {
+				return Client{}, err
+			}
+		}
+		return client, nil
+	}
+	resourceURL = strings.TrimSpace(resourceURL)
+	redirectURI = strings.TrimSpace(redirectURI)
+	if resourceURL == "" || redirectURI == "" {
+		return Client{}, errors.New("oauth discovery needs a resource url and redirect uri")
+	}
+	resource, err := discoverResourceMetadata(ctx, m.client, resourceURL, metadataURL)
+	if err != nil {
+		return Client{}, err
+	}
+	issuer := ""
+	if len(resource.AuthorizationServers) > 0 {
+		issuer = strings.TrimSpace(resource.AuthorizationServers[0])
+	}
+	if issuer == "" {
+		if parsed, err := url.Parse(resourceURL); err == nil {
+			issuer = parsed.Scheme + "://" + parsed.Host
+		}
+	}
+	metadata, err := discoverAuthServer(ctx, m.client, issuer)
+	if err != nil {
+		return Client{}, err
+	}
+	if metadata.Issuer != "" && strings.TrimRight(metadata.Issuer, "/") != strings.TrimRight(issuer, "/") {
+		return Client{}, fmt.Errorf("oauth authorization server issuer mismatch: got %q, want %q", metadata.Issuer, issuer)
+	}
+	scopes := resource.ScopesSupported
+	if len(scopes) == 0 {
+		scopes = metadata.ScopesSupported
+	}
+	if opts.Scope != "" {
+		scopes = strings.Fields(opts.Scope)
+	}
+	clientID := opts.ClientID
+	clientSecret := opts.ClientSecret
+	if clientID == "" {
+		if metadata.RegistrationEndpoint == "" {
+			return Client{}, fmt.Errorf("oauth authorization server %q does not support dynamic registration", issuer)
+		}
+		registered, err := registerClient(ctx, m.client, metadata.RegistrationEndpoint, redirectURI)
+		if err != nil {
+			return Client{}, err
+		}
+		clientID = registered.ClientID
+		clientSecret = registered.ClientSecret
+	}
+	client := Client{
+		AuthorizationURL: metadata.AuthorizationEndpoint,
+		TokenURL:         metadata.TokenEndpoint,
+		ClientID:         clientID,
+		ClientSecret:     clientSecret,
+		Scopes:           scopes,
+		Grant:            "authorization_code",
+		RedirectURI:      redirectURI,
+		Resource:         strings.TrimSpace(resourceURL),
+		AuthMethod:       "none",
+	}
+	if err := m.AddClient(name, client); err != nil {
+		return Client{}, err
+	}
+	return client, nil
 }
 
 func (m *Manager) load() error {
@@ -168,9 +391,16 @@ func (m *Manager) List() []Status {
 	if m == nil {
 		return []Status{}
 	}
-	names := make([]string, 0, len(m.cfg.Clients))
+	names := make([]string, 0, len(m.cfg.Clients)+len(m.dynamic))
+	seen := map[string]bool{}
 	for name := range m.cfg.Clients {
 		names = append(names, name)
+		seen[name] = true
+	}
+	for name := range m.dynamic {
+		if !seen[name] {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	out := make([]Status, 0, len(names))
@@ -187,14 +417,14 @@ func (m *Manager) Status(name string) (Status, bool) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.cfg.Clients[name]; !ok {
+	if _, ok := m.lookupClient(name); !ok {
 		return Status{}, false
 	}
 	return m.statusLocked(name), true
 }
 
 func (m *Manager) statusLocked(name string) Status {
-	client := m.cfg.Clients[name]
+	client, _ := m.lookupClient(name)
 	token := m.tokens[name]
 	now := time.Now()
 	return Status{
@@ -228,7 +458,7 @@ func (m *Manager) Token(ctx context.Context, name string) (Token, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	client, ok := m.cfg.Clients[name]
+	client, ok := m.lookupClient(name)
 	if !ok {
 		return Token{}, fmt.Errorf("oauth endpoint %q is not configured", name)
 	}
@@ -262,7 +492,7 @@ func (m *Manager) Refresh(ctx context.Context, name string) (Token, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	client, ok := m.cfg.Clients[name]
+	client, ok := m.lookupClient(name)
 	if !ok {
 		return Token{}, fmt.Errorf("oauth endpoint %q is not configured", name)
 	}
@@ -304,7 +534,7 @@ func (m *Manager) AuthorizeURL(name, state, verifier string) (string, error) {
 	if m == nil {
 		return "", errors.New("oauth is not configured")
 	}
-	client, ok := m.cfg.Clients[name]
+	client, ok := m.lookupClient(name)
 	if !ok {
 		return "", fmt.Errorf("oauth endpoint %q is not configured", name)
 	}
@@ -334,6 +564,9 @@ func (m *Manager) AuthorizeURL(name, state, verifier string) (string, error) {
 	}
 	if client.Audience != "" {
 		query.Set("audience", client.Audience)
+	}
+	if client.Resource != "" {
+		query.Set("resource", client.Resource)
 	}
 	for key, value := range client.ExtraParams {
 		query.Set(key, value)
@@ -391,7 +624,7 @@ func (m *Manager) Revoke(name string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.cfg.Clients[name]; !ok {
+	if _, ok := m.lookupClient(name); !ok {
 		return fmt.Errorf("oauth endpoint %q is not configured", name)
 	}
 	delete(m.tokens, name)
@@ -403,7 +636,7 @@ func (m *Manager) exchange(ctx context.Context, name string, values url.Values) 
 }
 
 func (m *Manager) exchangeLocked(ctx context.Context, name string, values url.Values) (Token, error) {
-	client := m.cfg.Clients[name]
+	client, _ := m.lookupClient(name)
 	if strings.TrimSpace(client.TokenURL) == "" {
 		return Token{}, fmt.Errorf("oauth endpoint %q has no token url", name)
 	}
@@ -412,6 +645,9 @@ func (m *Manager) exchangeLocked(ctx context.Context, name string, values url.Va
 	}
 	if client.Audience != "" {
 		values.Set("audience", client.Audience)
+	}
+	if client.Resource != "" && values.Get("resource") == "" {
+		values.Set("resource", client.Resource)
 	}
 	switch strings.ToLower(strings.TrimSpace(client.AuthMethod)) {
 	case "post", "client_secret_post":
@@ -487,6 +723,147 @@ func (m *Manager) exchangeLocked(ctx context.Context, name string, values url.Va
 		return Token{}, err
 	}
 	return token, nil
+}
+
+type protectedMetadata struct {
+	AuthorizationServers []string `json:"authorization_servers"`
+	ScopesSupported      []string `json:"scopes_supported"`
+	Resource             string   `json:"resource"`
+}
+
+type authMetadata struct {
+	Issuer                string   `json:"issuer"`
+	AuthorizationEndpoint string   `json:"authorization_endpoint"`
+	TokenEndpoint         string   `json:"token_endpoint"`
+	RegistrationEndpoint  string   `json:"registration_endpoint"`
+	ScopesSupported       []string `json:"scopes_supported"`
+}
+
+type registeredClient struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+func fetchJSON(ctx context.Context, client *http.Client, target string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, out)
+}
+
+func discoverResourceMetadata(ctx context.Context, client *http.Client, resourceURL, metadataURL string) (protectedMetadata, error) {
+	parsed, err := url.Parse(resourceURL)
+	if err != nil {
+		return protectedMetadata{}, err
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	trimmed := strings.TrimRight(resourceURL, "/")
+	var candidates []string
+	if strings.TrimSpace(metadataURL) != "" {
+		candidates = append(candidates, strings.TrimSpace(metadataURL))
+	}
+	candidates = append(candidates,
+		trimmed+"/.well-known/oauth-protected-resource",
+		origin+"/.well-known/oauth-protected-resource",
+		origin+"/.well-known/oauth-protected-resource"+parsed.EscapedPath(),
+	)
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		var metadata protectedMetadata
+		if err := fetchJSON(ctx, client, candidate, &metadata); err == nil {
+			return metadata, nil
+		}
+	}
+	// A server may only publish authorization server metadata. Fall back to
+	// the resource origin rather than failing discovery outright.
+	return protectedMetadata{}, nil
+}
+
+func discoverAuthServer(ctx context.Context, client *http.Client, issuer string) (authMetadata, error) {
+	parsed, err := url.Parse(issuer)
+	if err != nil || parsed.Host == "" {
+		return authMetadata{}, fmt.Errorf("invalid oauth issuer %q", issuer)
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	issuerPath := strings.TrimSuffix(parsed.EscapedPath(), "/")
+	candidates := []string{
+		strings.TrimRight(issuer, "/") + "/.well-known/oauth-authorization-server",
+		strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration",
+		origin + "/.well-known/oauth-authorization-server" + issuerPath,
+		origin + "/.well-known/openid-configuration" + issuerPath,
+		origin + "/.well-known/oauth-authorization-server",
+		origin + "/.well-known/openid-configuration",
+	}
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		var metadata authMetadata
+		if err := fetchJSON(ctx, client, candidate, &metadata); err != nil {
+			continue
+		}
+		if metadata.AuthorizationEndpoint != "" && metadata.TokenEndpoint != "" {
+			return metadata, nil
+		}
+	}
+	return authMetadata{}, fmt.Errorf("no oauth authorization server metadata at %q", issuer)
+}
+
+func registerClient(ctx context.Context, client *http.Client, endpoint, redirectURI string) (registeredClient, error) {
+	payload, err := json.Marshal(map[string]any{
+		"client_name":                "Lingzhu",
+		"redirect_uris":              []string{redirectURI},
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"response_types":             []string{"code"},
+		"token_endpoint_auth_method": "none",
+	})
+	if err != nil {
+		return registeredClient{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return registeredClient{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return registeredClient{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return registeredClient{}, fmt.Errorf("oauth registration: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var registered registeredClient
+	if err := json.Unmarshal(body, &registered); err != nil {
+		return registeredClient{}, err
+	}
+	if strings.TrimSpace(registered.ClientID) == "" {
+		return registeredClient{}, errors.New("oauth registration returned no client_id")
+	}
+	return registered, nil
 }
 
 // RandomVerifier returns a PKCE code verifier.

@@ -10,21 +10,29 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 type modernState struct {
-	mu          sync.Mutex
-	discover    int
-	initialize  int
-	toolsList   int
-	toolsCall   int
-	envelopeBad int
+	mu            sync.Mutex
+	discover      int
+	initialize    int
+	toolsList     int
+	toolsCall     int
+	subscriptions int
+	envelopeBad   int
 }
 
 func (s *modernState) snapshot() (int, int, int, int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.discover, s.initialize, s.toolsList, s.toolsCall, s.envelopeBad
+}
+
+func (s *modernState) subscriptionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.subscriptions
 }
 
 func envelopeVersion(params json.RawMessage) string {
@@ -95,6 +103,11 @@ func modernServer(t *testing.T, state *modernState, modern bool) *httptest.Serve
 				"description": "Echo",
 				"inputSchema": map[string]any{"type": "object"},
 			}}})
+		case "subscriptions/listen":
+			state.mu.Lock()
+			state.subscriptions++
+			state.mu.Unlock()
+			reply(map[string]any{})
 		case "tools/call":
 			state.mu.Lock()
 			state.toolsCall++
@@ -137,6 +150,13 @@ func TestModernProtocolNegotiation(t *testing.T) {
 
 	if got := manager.Servers(); len(got) != 1 || got[0] != "modern" {
 		t.Fatalf("modern server did not connect: %v", got)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && state.subscriptionCount() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state.subscriptionCount() == 0 {
+		t.Fatal("modern catalog subscription was not opened")
 	}
 	found := false
 	for _, item := range manager.Tools() {
@@ -247,6 +267,68 @@ func TestPoolingSharesModernConnection(t *testing.T) {
 	}
 	if !names["alpha_echo"] || !names["beta_echo"] {
 		t.Fatalf("pooled tools missing: %v", names)
+	}
+}
+
+func TestPoolSharesOneConnectionAcrossManagers(t *testing.T) {
+	state := &modernState{}
+	server := modernServer(t, state, true)
+	defer server.Close()
+	config := Config{Servers: map[string]Server{
+		"shared": {
+			Type:     "remote",
+			URL:      server.URL,
+			Protocol: "2026-07-28",
+			Pool:     true,
+			Timeout:  Timeout{Startup: 5000, Catalog: 5000, Execution: 5000},
+		},
+	}}
+
+	first := Start(context.Background(), config, t.TempDir(), t.Logf)
+	if got := first.Servers(); len(got) != 1 || got[0] != "shared" {
+		t.Fatalf("first manager did not connect: %v", got)
+	}
+	second := Start(context.Background(), config, t.TempDir(), t.Logf)
+
+	discover, initialize, _, _, _ := state.snapshot()
+	if discover != 1 || initialize != 0 {
+		t.Fatalf("managers should share one handshake: discover=%d initialize=%d", discover, initialize)
+	}
+	for index, manager := range []*Manager{first, second} {
+		found := false
+		for _, item := range manager.Tools() {
+			if item.Name() == "shared_echo" {
+				found = true
+				out, err := item.Run(context.Background(), call("shared_echo", `{"text":"ok"}`))
+				if err != nil || out != "echo:ok" {
+					t.Fatalf("manager %d tool failed: %q %v", index, out, err)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("manager %d is missing the pooled tool", index)
+		}
+	}
+	if client, ok := first.client("shared"); !ok {
+		t.Fatal("first manager lost its client")
+	} else if roots := client.rootsResult()["roots"].([]any); len(roots) != 0 {
+		t.Fatalf("shared connections must not answer workspace roots: %+v", roots)
+	}
+
+	first.Close()
+	if got := second.Servers(); len(got) != 1 {
+		t.Fatalf("closing one manager broke the shared connection: %v", got)
+	}
+	second.Close()
+
+	third := Start(context.Background(), config, t.TempDir(), t.Logf)
+	defer third.Close()
+	if got := third.Servers(); len(got) != 1 {
+		t.Fatalf("third manager did not reconnect: %v", got)
+	}
+	discover, _, _, _, _ = state.snapshot()
+	if discover != 2 {
+		t.Fatalf("closing every manager should close the pooled connection: discover=%d", discover)
 	}
 }
 

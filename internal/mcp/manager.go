@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"lingzhu/internal/oauth"
 	"lingzhu/internal/tool"
 )
 
@@ -19,7 +21,18 @@ const (
 	StatusFailed    = "failed"
 	StatusDisabled  = "disabled"
 	StatusPending   = "pending"
+	StatusNeedsAuth = "needs_auth"
 )
+
+// OAuthService is the subset of the OAuth manager MCP needs for automatic
+// discovery, dynamic registration, and interactive login.
+type OAuthService interface {
+	AccessTokenOptional(ctx context.Context, name string) (string, bool, error)
+	Refresh(ctx context.Context, name string) (oauth.Token, error)
+	EnsureClient(ctx context.Context, name, resourceURL, redirectURI, metadataURL string, options ...oauth.Options) (oauth.Client, error)
+	StartAuthorization(name string) (string, string, error)
+	ExchangeState(ctx context.Context, code, state string) (string, oauth.Token, error)
+}
 
 // Manager owns every configured MCP server, the connections that succeeded,
 // and the tools discovered from them. Entries survive a failed connection so
@@ -37,19 +50,40 @@ type Manager struct {
 	tools   []tool.Tool
 	prompts []PromptInfo
 
-	onChange func()
-	logf     func(string, ...any)
-	workdir  string
-	tokens   TokenFunc
+	onChange    func()
+	logf        func(string, ...any)
+	workdir     string
+	tokens      TokenFunc
+	oauth       OAuthService
+	redirectURI string
+	sampling    SamplingHandler
+	elicitation func(ctx context.Context, server, sessionID string, params json.RawMessage) (any, error)
+	closed      bool
+
+	// observers and releases are keyed by client because pooled aliases and
+	// shared connections must be detached exactly once.
+	observers map[*Client]func()
+	releases  map[*Client]func()
+
+	// attached holds caller-owned transports stacked by server name. They are
+	// never reconciled against configuration and are restored in reverse order.
+	attached   map[string][]*attachedEntry
+	attachBase map[string]attachedBase
+
+	// ready closes after the first connection pass settles, so a prompt can
+	// briefly wait for servers that are still starting.
+	ready     chan struct{}
+	readyOnce sync.Once
 
 	// opMu serializes reconnects; refresh callbacks do not hold it.
 	opMu sync.Mutex
 }
 
 type serverState struct {
-	config Server
-	status string
-	err    string
+	config              Server
+	status              string
+	err                 string
+	resourceMetadataURL string
 }
 
 // Start connects enabled local, remote, and legacy SSE servers, discovers their
@@ -63,6 +97,21 @@ func Start(ctx context.Context, cfg Config, workdir string, logf func(string, ..
 // StartWithTokens is Start with an OAuth token resolver for servers that set
 // "oauth" to a configured oauth endpoint name.
 func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(string, ...any), tokens TokenFunc) *Manager {
+	m := newManager(cfg, workdir, logf, tokens)
+	m.connectAll(ctx, cfg)
+	return m
+}
+
+// StartBackground creates the manager immediately and connects servers in the
+// background. Tools and resources arrive through the change callback as each
+// server finishes.
+func StartBackground(ctx context.Context, cfg Config, workdir string, logf func(string, ...any), tokens TokenFunc) *Manager {
+	m := newManager(cfg, workdir, logf, tokens)
+	go m.connectAll(ctx, cfg)
+	return m
+}
+
+func newManager(cfg Config, workdir string, logf func(string, ...any), tokens TokenFunc) *Manager {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -75,7 +124,35 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 		logf:          logf,
 		workdir:       workdir,
 		tokens:        tokens,
+		ready:         make(chan struct{}),
+		observers:     map[*Client]func(){},
+		releases:      map[*Client]func(){},
+		attached:      map[string][]*attachedEntry{},
+		attachBase:    map[string]attachedBase{},
 	}
+	for name, server := range cfg.Servers {
+		server.Timeout = mergeTimeout(server.Timeout, cfg.Timeout)
+		state := &serverState{config: server, status: StatusPending}
+		m.states[name] = state
+		if !server.On() {
+			state.status = StatusDisabled
+			continue
+		}
+		if !supportedKind(server.Kind()) {
+			state.status = StatusFailed
+			state.err = fmt.Sprintf("unsupported transport %q", server.Kind())
+			logf("mcp: skipping server %q: unsupported transport %q", name, server.Kind())
+		}
+	}
+	return m
+}
+
+func (m *Manager) connectAll(ctx context.Context, cfg Config) {
+	defer m.readyOnce.Do(func() {
+		if m.ready != nil {
+			close(m.ready)
+		}
+	})
 	names := make([]string, 0, len(cfg.Servers))
 	for name := range cfg.Servers {
 		names = append(names, name)
@@ -93,15 +170,7 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 	byKey := map[string]*group{}
 	for _, name := range names {
 		server := cfg.Servers[name]
-		m.states[name] = &serverState{config: server, status: StatusPending}
-		if !server.On() {
-			m.states[name].status = StatusDisabled
-			continue
-		}
-		if !supportedKind(server.Kind()) {
-			m.states[name].status = StatusFailed
-			m.states[name].err = fmt.Sprintf("unsupported transport %q", server.Kind())
-			logf("mcp: skipping server %q: unsupported transport %q", name, server.Kind())
+		if !server.On() || !supportedKind(server.Kind()) {
 			continue
 		}
 		if !server.Pooled() || !remoteKind(server.Kind()) {
@@ -112,7 +181,7 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 			existing.names = append(existing.names, name)
 			groups[existing.canonical] = append([]string(nil), existing.names...)
 			canonical[name] = existing.canonical
-			logf("mcp: %q shares the connection of %q", name, existing.canonical)
+			m.logf("mcp: %q shares the connection of %q", name, existing.canonical)
 			continue
 		}
 		byKey[key] = &group{canonical: name, names: []string{name}}
@@ -123,6 +192,7 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 	type started struct {
 		names     []string
 		client    *Client
+		release   func()
 		tools     []ToolInfo
 		resources []Resource
 		prompts   []PromptInfo
@@ -131,8 +201,11 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 	results := make(chan started, len(names))
 	var wg sync.WaitGroup
 	for _, name := range names {
+		m.mu.RLock()
 		state := m.states[name]
-		if state.status != StatusPending {
+		closed := m.closed
+		m.mu.RUnlock()
+		if closed || state == nil || state.status != StatusPending {
 			continue
 		}
 		if canonical[name] != "" && canonical[name] != name {
@@ -147,7 +220,8 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 		go func(name string, targets []string, server Server) {
 			defer wg.Done()
 			item := started{names: targets}
-			client, err := connect(ctx, name, server, workdir, tokens)
+			client, release, err := m.openClient(ctx, name, server)
+			item.release = release
 			if err != nil {
 				item.err = err
 				results <- item
@@ -156,18 +230,22 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 			item.client = client
 			item.tools, err = client.Tools(ctx)
 			if err != nil {
-				_ = client.Close()
+				if item.release != nil {
+					item.release()
+				} else {
+					_ = client.Close()
+				}
 				item.err = fmt.Errorf("list tools: %w", err)
 				results <- item
 				return
 			}
 			item.resources, err = client.Resources(ctx)
 			if err != nil {
-				logf("mcp: list resources for %q: %v", name, err)
+				m.logf("mcp: list resources for %q: %v", name, err)
 			}
 			item.prompts, err = client.Prompts(ctx)
 			if err != nil {
-				logf("mcp: list prompts for %q: %v", name, err)
+				m.logf("mcp: list prompts for %q: %v", name, err)
 			}
 			results <- item
 		}(name, targets, server)
@@ -178,8 +256,26 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 	}()
 
 	for item := range results {
+		m.mu.RLock()
+		closed := m.closed
+		m.mu.RUnlock()
+		if closed {
+			if item.client != nil {
+				if item.release != nil {
+					item.release()
+				} else {
+					_ = item.client.Close()
+				}
+			}
+			continue
+		}
 		if item.client == nil {
-			m.markFailed(item.names, item.err)
+			var authErr *AuthRequiredError
+			if errors.As(item.err, &authErr) {
+				m.markAuthRequired(item.names, authErr)
+			} else {
+				m.markFailed(item.names, item.err)
+			}
 			continue
 		}
 		m.mu.Lock()
@@ -187,18 +283,226 @@ func StartWithTokens(ctx context.Context, cfg Config, workdir string, logf func(
 			m.states[name].status = StatusConnected
 			m.states[name].err = ""
 			m.clients[name] = item.client
-			m.serverTools[name] = toolsForServer(name, item.client, item.tools)
+			m.serverTools[name] = toolsForServer(name, item.client, item.tools, m.states[name].config.CodemodeEnabled())
 			m.serverPrompts[name] = promptsForServer(name, item.prompts)
 			m.resources[name] = item.resources
 		}
 		m.rebuildLocked()
 		m.mu.Unlock()
-		m.observeClient(item.client)
+		item.client.SetLogger(m.logf)
+		remove := m.observeClient(item.client)
+		m.trackClient(item.client, remove, item.release)
 		if item.client.Closed() {
 			m.handleClosed(item.client)
 		}
 	}
-	return m
+}
+
+// openClient joins a pooled modern connection when allowed, or opens a private
+// one. The release function is nil for private connections.
+func (m *Manager) openClient(ctx context.Context, name string, server Server) (*Client, func(), error) {
+	if !sharedEligible(server) {
+		client, err := connect(ctx, name, server, m.workdir, m.tokens)
+		return client, nil, err
+	}
+	return processPool.acquire(ctx, sharedKey(name, server), func() (*Client, error) {
+		return connect(ctx, name, server, m.workdir, m.tokens)
+	})
+}
+
+// SetOAuth installs the OAuth manager used for automatic discovery and login.
+func (m *Manager) SetOAuth(service OAuthService, redirectURI string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.oauth = service
+	m.redirectURI = redirectURI
+	m.mu.Unlock()
+}
+
+func oauthName(cfg Server, name string) string {
+	if strings.TrimSpace(cfg.OAuth.Name) != "" {
+		return strings.TrimSpace(cfg.OAuth.Name)
+	}
+	return "mcp:" + name
+}
+
+// AuthStart discovers the authorization server and returns a consent URL.
+func (m *Manager) AuthStart(ctx context.Context, name string) (string, string, error) {
+	if m == nil {
+		return "", "", fmt.Errorf("MCP is not available")
+	}
+	m.mu.RLock()
+	state, ok := m.states[name]
+	service := m.oauth
+	redirectURI := m.redirectURI
+	m.mu.RUnlock()
+	if !ok {
+		return "", "", fmt.Errorf("MCP server %q is not configured", name)
+	}
+	if service == nil {
+		return "", "", fmt.Errorf("OAuth is not available")
+	}
+	authName := oauthName(state.config, name)
+	if strings.TrimSpace(state.config.OAuth.Name) == "" {
+		options := oauth.Options{
+			ClientID:     state.config.OAuth.ClientID,
+			ClientSecret: state.config.OAuth.ClientSecret,
+			Scope:        state.config.OAuth.Scope,
+		}
+		if state.config.OAuth.CallbackPort > 0 {
+			options.RedirectURI = fmt.Sprintf("http://127.0.0.1:%d/oauth/callback", state.config.OAuth.CallbackPort)
+		}
+		if state.config.OAuth.RedirectURI != "" {
+			options.RedirectURI = state.config.OAuth.RedirectURI
+		}
+		if _, err := service.EnsureClient(ctx, authName, state.config.URL, redirectURI, state.resourceMetadataURL, options); err != nil {
+			return "", "", err
+		}
+	}
+	return service.StartAuthorization(authName)
+}
+
+// AuthExchange completes a pasted-code login and reconnects the server.
+func (m *Manager) AuthExchange(ctx context.Context, name, code, state string) (ServerStatus, error) {
+	if m == nil {
+		return ServerStatus{}, fmt.Errorf("MCP is not available")
+	}
+	m.mu.RLock()
+	server, ok := m.states[name]
+	service := m.oauth
+	m.mu.RUnlock()
+	if !ok {
+		return ServerStatus{}, fmt.Errorf("MCP server %q is not configured", name)
+	}
+	if service == nil {
+		return ServerStatus{}, fmt.Errorf("OAuth is not available")
+	}
+	authName, _, err := service.ExchangeState(ctx, code, state)
+	if err != nil {
+		return m.statusFor(name), err
+	}
+	if authName != oauthName(server.config, name) {
+		return m.statusFor(name), fmt.Errorf("authorization state belongs to %q", authName)
+	}
+	return m.Reconnect(ctx, name)
+}
+
+// ServerForAuth maps an OAuth client name back to one MCP server.
+func (m *Manager) ServerForAuth(authName string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for name, state := range m.states {
+		if oauthName(state.config, name) == authName {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func (m *Manager) markAuthRequired(names []string, authErr *AuthRequiredError) {
+	if m == nil || len(names) == 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	for _, name := range names {
+		delete(m.clients, name)
+		delete(m.serverTools, name)
+		delete(m.serverPrompts, name)
+		delete(m.resources, name)
+		if state := m.states[name]; state != nil {
+			state.status = StatusNeedsAuth
+			state.err = authErr.Error()
+			state.resourceMetadataURL = authErr.ResourceMetadataURL
+		}
+	}
+	m.rebuildLocked()
+	m.mu.Unlock()
+	m.logf("mcp: %s requires authorization", strings.Join(names, ", "))
+	m.notify()
+}
+
+// SetSampling installs the handler for server-initiated sampling.
+func (m *Manager) SetSampling(handler SamplingHandler) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.sampling = handler
+	m.mu.Unlock()
+}
+
+func (m *Manager) sample(client *Client, params json.RawMessage) (any, error) {
+	m.mu.RLock()
+	names := m.aliasesLocked(client)
+	handler := m.sampling
+	var config Server
+	if len(names) > 0 {
+		if state := m.states[names[0]]; state != nil {
+			config = state.config
+		}
+	}
+	m.mu.RUnlock()
+	if len(names) == 0 {
+		return nil, fmt.Errorf("MCP connection is no longer active")
+	}
+	if !config.Sampling {
+		return nil, fmt.Errorf("sampling is disabled for %q", names[0])
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("sampling is not configured")
+	}
+	var request SamplingRequest
+	if err := json.Unmarshal(params, &request); err != nil {
+		return nil, fmt.Errorf("invalid sampling request: %w", err)
+	}
+	return handler(context.Background(), names[0], request)
+}
+
+// SetElicitation installs the handler for server-initiated user input.
+func (m *Manager) SetElicitation(handler func(ctx context.Context, server, sessionID string, params json.RawMessage) (any, error)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.elicitation = handler
+	m.mu.Unlock()
+}
+
+func (m *Manager) elicit(client *Client, params json.RawMessage) (any, error) {
+	m.mu.RLock()
+	names := m.aliasesLocked(client)
+	handler := m.elicitation
+	var config Server
+	if len(names) > 0 {
+		if state := m.states[names[0]]; state != nil {
+			config = state.config
+		}
+	}
+	m.mu.RUnlock()
+	if len(names) == 0 {
+		return map[string]any{"action": "decline"}, nil
+	}
+	if !config.Elicitation || handler == nil {
+		return map[string]any{"action": "decline"}, nil
+	}
+	sessionID := client.ActiveSession()
+	if sessionID == "" {
+		return map[string]any{"action": "decline"}, nil
+	}
+	result, err := handler(context.Background(), names[0], sessionID, params)
+	if err != nil {
+		return map[string]any{"action": "decline"}, nil
+	}
+	return result, nil
 }
 
 // SetOnChange installs the callback run after a catalog or status change. The
@@ -210,6 +514,28 @@ func (m *Manager) SetOnChange(callback func()) {
 	m.mu.Lock()
 	m.onChange = callback
 	m.mu.Unlock()
+}
+
+// AwaitStartup waits for the first connection pass to settle, or until grace
+// expires. It never extends a turn after startup has already finished.
+func (m *Manager) AwaitStartup(ctx context.Context, grace time.Duration) {
+	if m == nil || m.ready == nil {
+		return
+	}
+	if grace <= 0 {
+		select {
+		case <-m.ready:
+		case <-ctx.Done():
+		}
+		return
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-m.ready:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func (m *Manager) notify() {
@@ -224,11 +550,56 @@ func (m *Manager) notify() {
 	}
 }
 
-func (m *Manager) observeClient(client *Client) {
+func (m *Manager) observeClient(client *Client) func() {
+	if client == nil {
+		return func() {}
+	}
+	remove := client.AddHandlers(func(string) { m.refresh(client) }, func() { m.handleClosed(client) })
+	if !client.shared {
+		client.SetSampling(func(ctx context.Context, params json.RawMessage) (any, error) {
+			return m.sample(client, params)
+		})
+		client.SetElicitation(func(ctx context.Context, params json.RawMessage) (any, error) {
+			return m.elicit(client, params)
+		})
+	}
+	return remove
+}
+
+func (m *Manager) trackClient(client *Client, remove func(), release func()) {
 	if client == nil {
 		return
 	}
-	client.SetHandlers(func(string) { m.refresh(client) }, func() { m.handleClosed(client) })
+	m.mu.Lock()
+	if _, exists := m.observers[client]; !exists {
+		m.observers[client] = remove
+		if release != nil {
+			m.releases[client] = release
+		}
+	}
+	m.mu.Unlock()
+}
+
+// releaseClient detaches one manager from a client. A shared client stays open
+// until its last manager lets go.
+func (m *Manager) releaseClient(client *Client) {
+	if client == nil {
+		return
+	}
+	m.mu.Lock()
+	remove := m.observers[client]
+	delete(m.observers, client)
+	release := m.releases[client]
+	delete(m.releases, client)
+	m.mu.Unlock()
+	if remove != nil {
+		remove()
+	}
+	if release != nil {
+		release()
+		return
+	}
+	_ = client.Close()
 }
 
 // refresh re-lists all catalogs after a server notification. A notification
@@ -257,7 +628,11 @@ func (m *Manager) refresh(client *Client) {
 		}
 		if toolsErr == nil {
 			for _, name := range names {
-				m.serverTools[name] = toolsForServer(name, client, tools)
+				codemode := true
+				if state := m.states[name]; state != nil {
+					codemode = state.config.CodemodeEnabled()
+				}
+				m.serverTools[name] = toolsForServer(name, client, tools, codemode)
 			}
 		} else {
 			m.logf("mcp: refresh tools: %v", toolsErr)
@@ -316,6 +691,8 @@ func (m *Manager) handleClosed(client *Client) {
 			state.err = "connection closed"
 		}
 	}
+	delete(m.observers, client)
+	delete(m.releases, client)
 	m.rebuildLocked()
 	m.mu.Unlock()
 	m.logf("mcp: connection closed for %s", strings.Join(names, ", "))
@@ -356,7 +733,7 @@ func (m *Manager) Reconnect(ctx context.Context, name string) (ServerStatus, err
 	}
 
 	if old != nil {
-		_ = old.Close()
+		m.releaseClient(old)
 	}
 	m.mu.Lock()
 	for _, alias := range names {
@@ -373,16 +750,30 @@ func (m *Manager) Reconnect(ctx context.Context, name string) (ServerStatus, err
 	m.mu.Unlock()
 	m.notify()
 
-	client, err := connect(ctx, name, cfg, m.workdir, m.tokens)
+	client, release, err := m.openClient(ctx, name, cfg)
 	if err != nil {
-		m.markFailed(names, err)
+		var authErr *AuthRequiredError
+		if errors.As(err, &authErr) {
+			m.markAuthRequired(names, authErr)
+		} else {
+			m.markFailed(names, err)
+		}
 		return m.statusFor(name), err
 	}
 	tools, err := client.Tools(ctx)
 	if err != nil {
-		_ = client.Close()
+		if release != nil {
+			release()
+		} else {
+			_ = client.Close()
+		}
 		err = fmt.Errorf("list tools: %w", err)
-		m.markFailed(names, err)
+		var authErr *AuthRequiredError
+		if errors.As(err, &authErr) {
+			m.markAuthRequired(names, authErr)
+		} else {
+			m.markFailed(names, err)
+		}
 		return m.statusFor(name), err
 	}
 	resources, err := client.Resources(ctx)
@@ -401,16 +792,58 @@ func (m *Manager) Reconnect(ctx context.Context, name string) (ServerStatus, err
 			current.err = ""
 		}
 		m.clients[alias] = client
-		m.serverTools[alias] = toolsForServer(alias, client, tools)
+		codemode := true
+		if state := m.states[alias]; state != nil {
+			codemode = state.config.CodemodeEnabled()
+		}
+		m.serverTools[alias] = toolsForServer(alias, client, tools, codemode)
 		m.serverPrompts[alias] = promptsForServer(alias, prompts)
 		m.resources[alias] = resources
 	}
 	m.rebuildLocked()
 	m.mu.Unlock()
-	m.observeClient(client)
+	client.SetLogger(m.logf)
+	remove := m.observeClient(client)
+	m.trackClient(client, remove, release)
 	if client.Closed() {
 		m.handleClosed(client)
 	}
+	m.notify()
+	return m.statusFor(name), nil
+}
+
+// Disconnect stops one connected server, and every alias sharing its client,
+// without changing its configuration. Reconnect starts it again.
+func (m *Manager) Disconnect(name string) (ServerStatus, error) {
+	if m == nil {
+		return ServerStatus{}, fmt.Errorf("MCP is not available")
+	}
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+
+	m.mu.Lock()
+	if _, ok := m.states[name]; !ok {
+		m.mu.Unlock()
+		return ServerStatus{}, fmt.Errorf("MCP server %q is not configured", name)
+	}
+	client := m.clients[name]
+	names := m.aliasesLocked(client)
+	if len(names) == 0 {
+		names = []string{name}
+	}
+	for _, alias := range names {
+		delete(m.clients, alias)
+		delete(m.serverTools, alias)
+		delete(m.serverPrompts, alias)
+		delete(m.resources, alias)
+		if state := m.states[alias]; state != nil {
+			state.status = StatusDisabled
+			state.err = ""
+		}
+	}
+	m.rebuildLocked()
+	m.mu.Unlock()
+	m.releaseClient(client)
 	m.notify()
 	return m.statusFor(name), nil
 }
@@ -424,6 +857,10 @@ func (m *Manager) markFailed(names []string, err error) {
 		message = err.Error()
 	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
 	for _, name := range names {
 		delete(m.clients, name)
 		delete(m.serverTools, name)
@@ -470,7 +907,7 @@ func (m *Manager) rebuildLocked() {
 	m.prompts = prompts
 }
 
-func toolsForServer(server string, client *Client, items []ToolInfo) []tool.Tool {
+func toolsForServer(server string, client *Client, items []ToolInfo, codemode bool) []tool.Tool {
 	out := make([]tool.Tool, 0, len(items))
 	for _, info := range items {
 		out = append(out, &mcpTool{
@@ -478,8 +915,12 @@ func toolsForServer(server string, client *Client, items []ToolInfo) []tool.Tool
 			server:      server,
 			rawName:     info.Name,
 			name:        ToolName(server, info.Name),
+			title:       info.Title,
 			description: info.Description,
 			schema:      info.InputSchema,
+			annotations: info.Annotations,
+			output:      info.OutputSchema,
+			codemode:    codemode,
 		})
 	}
 	return out
@@ -629,6 +1070,9 @@ func (m *Manager) Servers() []string {
 	defer m.mu.RUnlock()
 	names := make([]string, 0, len(m.clients))
 	for name := range m.clients {
+		if _, configured := m.states[name]; !configured {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -678,6 +1122,49 @@ func (m *Manager) ReadResource(ctx context.Context, server, uri string) ([]Resou
 	return client.ReadResource(ctx, uri)
 }
 
+// Complete asks one connected server for prompt or resource completions.
+func (m *Manager) Complete(ctx context.Context, server, refType, ref, argument, value string) (Completion, error) {
+	client, ok := m.client(server)
+	if !ok {
+		return Completion{}, fmt.Errorf("MCP server %q is not connected", server)
+	}
+	var refValue map[string]any
+	switch refType {
+	case "prompt":
+		refValue = map[string]any{"type": "ref/prompt", "name": ref}
+	case "resource":
+		refValue = map[string]any{"type": "ref/resource", "uri": ref}
+	default:
+		return Completion{}, fmt.Errorf("unsupported completion reference %q", refType)
+	}
+	return client.Complete(ctx, refValue, argument, value)
+}
+
+// EventsSupported reports whether a connected server declares MCP Events.
+func (m *Manager) EventsSupported(server string) bool {
+	client, ok := m.client(server)
+	return ok && client.EventsSupported()
+}
+
+// EventTypes lists the event types a connected server offers.
+func (m *Manager) EventTypes(ctx context.Context, server string) ([]EventType, error) {
+	client, ok := m.client(server)
+	if !ok {
+		return nil, fmt.Errorf("MCP server %q is not connected", server)
+	}
+	return client.EventTypes(ctx)
+}
+
+// StreamEvents follows one event type on a connected server. The stop function
+// cancels the subscription.
+func (m *Manager) StreamEvents(ctx context.Context, server, name string, args map[string]any, cursor *string, maxAgeMs int) (<-chan EventMessage, func(), error) {
+	client, ok := m.client(server)
+	if !ok {
+		return nil, nil, fmt.Errorf("MCP server %q is not connected", server)
+	}
+	return client.StreamEvents(ctx, name, args, cursor, maxAgeMs)
+}
+
 // CallTool invokes one MCP tool by server and original tool name.
 func (m *Manager) CallTool(ctx context.Context, server, name string, args map[string]any) (*CallResult, error) {
 	client, ok := m.client(server)
@@ -703,11 +1190,18 @@ func (m *Manager) Close() {
 		return
 	}
 	m.mu.Lock()
+	m.closed = true
 	clients := m.clients
+	observers := m.observers
+	releases := m.releases
 	m.clients = map[string]*Client{}
 	m.serverTools = map[string][]tool.Tool{}
 	m.serverPrompts = map[string][]PromptInfo{}
 	m.resources = map[string][]Resource{}
+	m.observers = map[*Client]func(){}
+	m.releases = map[*Client]func(){}
+	m.attached = map[string][]*attachedEntry{}
+	m.attachBase = map[string]attachedBase{}
 	m.tools = nil
 	m.prompts = nil
 	m.mu.Unlock()
@@ -717,6 +1211,13 @@ func (m *Manager) Close() {
 			continue
 		}
 		seen[client] = true
+		if remove := observers[client]; remove != nil {
+			remove()
+		}
+		if release := releases[client]; release != nil {
+			release()
+			continue
+		}
 		_ = client.Close()
 	}
 }

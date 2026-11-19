@@ -633,3 +633,28 @@ func TestLoadCodemodeOnly(t *testing.T) {
 		t.Fatal("codemode_only was not loaded")
 	}
 }
+
+func TestForDirMergesGlobalAndProjectSkills(t *testing.T) {
+	root := t.TempDir()
+	global := filepath.Join(root, "config.json")
+	projectDir := filepath.Join(root, "project")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(global, []byte(`{"skills":{"paths":["global"],"urls":["https://global.example"]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "lingzhu.json"), []byte(`{"skills":["project","https://project.example"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ForDir(projectDir, global)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Skills.Paths) != 2 || cfg.Skills.Paths[0] != "global" || cfg.Skills.Paths[1] != "project" {
+		t.Fatalf("unexpected merged paths: %+v", cfg.Skills)
+	}
+	if len(cfg.Skills.URLs) != 2 || cfg.Skills.URLs[0] != "https://global.example" {
+		t.Fatalf("unexpected merged urls: %+v", cfg.Skills)
+	}
+}

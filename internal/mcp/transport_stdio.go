@@ -33,10 +33,16 @@ func startStdio(name string, cfg Server, workdir string, onMessage func(rpc.Mess
 
 	cwd := workdir
 	if cfg.Cwd != "" {
-		if filepath.IsAbs(cfg.Cwd) {
-			cwd = cfg.Cwd
+		value := cfg.Cwd
+		if strings.HasPrefix(value, "~/") || strings.HasPrefix(value, `~\`) {
+			if home, err := os.UserHomeDir(); err == nil {
+				value = filepath.Join(home, value[2:])
+			}
+		}
+		if filepath.IsAbs(value) {
+			cwd = value
 		} else {
-			cwd = filepath.Join(workdir, cfg.Cwd)
+			cwd = filepath.Join(workdir, value)
 		}
 	}
 	cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)

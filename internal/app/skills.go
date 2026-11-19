@@ -31,23 +31,26 @@ var skillSkipDirs = map[string]bool{
 // from. The watcher rescans those roots, and the refresh endpoint re-runs the
 // remote pull before rescanning.
 type skillsState struct {
-	mu      sync.RWMutex
-	manager *skill.Manager
-	roots   []string
-	cfg     config.Config
-	workdir string
-	logf    func(string, ...any)
-	keep    func(string) bool
+	mu         sync.RWMutex
+	manager    *skill.Manager
+	roots      []string
+	localRoots []string
+	errors     []skill.SourceError
+	cfg        config.Config
+	workdir    string
+	logf       func(string, ...any)
+	keep       func(string) bool
 }
 
 func newSkillsState(manager *skill.Manager, roots []string, cfg config.Config, workdir string, logf func(string, ...any), keep func(string) bool) *skillsState {
 	return &skillsState{
-		manager: manager,
-		roots:   append([]string(nil), roots...),
-		cfg:     cfg,
-		workdir: workdir,
-		logf:    logf,
-		keep:    keep,
+		manager:    manager,
+		roots:      append([]string(nil), roots...),
+		localRoots: skill.Roots(cfg.Skills.Paths, cfg.Path, workdir),
+		cfg:        cfg,
+		workdir:    workdir,
+		logf:       logf,
+		keep:       keep,
 	}
 }
 
@@ -69,21 +72,157 @@ func (s *skillsState) refresh(ctx context.Context) error {
 	local := skill.Roots(s.cfg.Skills.Paths, s.cfg.Path, s.workdir)
 	roots := local
 	var pullErr error
+	var pullErrors []skill.SourceError
 	if len(s.cfg.Skills.URLs) > 0 {
-		remote := skill.Pull(ctx, s.cfg.Skills.URLs, global.Cache(), s.logf)
-		if len(remote) > 0 {
-			roots = append(remote, local...)
+		result := skill.PullStatus(ctx, s.cfg.Skills.URLs, global.Cache(), s.logf)
+		pullErrors = result.Errors
+		if len(result.Roots) > 0 {
+			roots = append(result.Roots, local...)
 		} else {
-			pullErr = fmt.Errorf("no remote skill source could be loaded")
 			roots = append(s.Roots(), local...)
+		}
+		if len(result.Errors) > 0 {
+			parts := make([]string, 0, len(result.Errors))
+			for _, item := range result.Errors {
+				if item.URL == "" {
+					parts = append(parts, item.Error)
+				} else {
+					parts = append(parts, item.URL+": "+item.Error)
+				}
+			}
+			pullErr = fmt.Errorf("skill sources: %s", strings.Join(parts, "; "))
 		}
 	}
 	s.manager.Reload(roots, s.logf)
 	s.manager.Filter(s.keep)
 	s.mu.Lock()
 	s.roots = roots
+	s.localRoots = local
+	if len(s.cfg.Skills.URLs) > 0 {
+		s.errors = append([]skill.SourceError(nil), pullErrors...)
+	}
 	s.mu.Unlock()
 	return pullErr
+}
+
+// SourceErrors returns the last per-source pull failures.
+func (s *skillsState) SourceErrors() []skill.SourceError {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]skill.SourceError(nil), s.errors...)
+}
+
+// reloadLocal rescans the roots already known without touching the network.
+func (s *skillsState) reloadLocal() {
+	s.manager.Reload(s.Roots(), s.logf)
+	s.manager.Filter(s.keep)
+}
+
+// CreateSkill writes a new SKILL.md under the first configured local root.
+func (s *skillsState) CreateSkill(ctx context.Context, id, name, description, content string) error {
+	if s == nil {
+		return fmt.Errorf("skills are not available")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\`) || filepath.Base(id) != id {
+		return fmt.Errorf("invalid skill id %q", id)
+	}
+	s.mu.RLock()
+	roots := append([]string(nil), s.localRoots...)
+	s.mu.RUnlock()
+	// Prefer the project's own skill directory so new skills do not land in a
+	// shared home directory by accident.
+	root := ""
+	if strings.TrimSpace(s.workdir) != "" {
+		root = filepath.Join(s.workdir, ".lingzhu", "skills")
+	}
+	if root == "" && len(roots) > 0 {
+		root = roots[0]
+	}
+	if root == "" {
+		return fmt.Errorf("no local skill root is configured")
+	}
+	s.mu.Lock()
+	if !containsRoot(s.roots, root) {
+		s.roots = append(s.roots, root)
+	}
+	if !containsRoot(s.localRoots, root) {
+		s.localRoots = append(s.localRoots, root)
+	}
+	s.mu.Unlock()
+	directory := filepath.Join(root, id)
+	if _, err := os.Stat(directory); err == nil {
+		return fmt.Errorf("skill %q already exists", id)
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return err
+	}
+	if strings.TrimSpace(name) == "" {
+		name = id
+	}
+	if strings.TrimSpace(content) == "" {
+		content = "# " + name
+	}
+	body := fmt.Sprintf("---\nname: %q\ndescription: %q\n---\n%s\n", name, strings.TrimSpace(description), strings.TrimSpace(content))
+	if err := os.WriteFile(filepath.Join(directory, "SKILL.md"), []byte(body), 0o644); err != nil {
+		return err
+	}
+	s.reloadLocal()
+	return nil
+}
+
+// DeleteSkill removes a skill whose directory is inside a configured local
+// root. Remote cache packages are never deleted from the UI.
+func (s *skillsState) DeleteSkill(id string) error {
+	if s == nil {
+		return fmt.Errorf("skills are not available")
+	}
+	item, ok := s.manager.Get(strings.TrimSpace(id))
+	if !ok {
+		return fmt.Errorf("skill %q not found", id)
+	}
+	s.mu.RLock()
+	roots := append([]string(nil), s.localRoots...)
+	s.mu.RUnlock()
+	allowed := false
+	flat := filepath.Clean(filepath.Dir(item.Path)) == filepath.Clean(item.Directory) &&
+		strings.EqualFold(filepath.Ext(item.Path), ".md") &&
+		!strings.EqualFold(filepath.Base(item.Path), "SKILL.md")
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if flat && strings.HasPrefix(filepath.Clean(item.Path), root+string(filepath.Separator)) {
+			allowed = true
+			break
+		}
+		if !flat && strings.HasPrefix(filepath.Clean(item.Directory), root+string(filepath.Separator)) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("skill %q is not in a local root", id)
+	}
+	if flat {
+		if err := os.Remove(item.Path); err != nil {
+			return err
+		}
+	} else if err := os.RemoveAll(item.Directory); err != nil {
+		return err
+	}
+	s.reloadLocal()
+	return nil
+}
+
+func containsRoot(roots []string, target string) bool {
+	for _, root := range roots {
+		if filepath.Clean(root) == filepath.Clean(target) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *skillsState) watch(ctx context.Context) {

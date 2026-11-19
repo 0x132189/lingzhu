@@ -47,6 +47,28 @@ func TestMCPStatusReportsFailedServer(t *testing.T) {
 	}
 }
 
+func TestMCPEventStreamValidation(t *testing.T) {
+	srv, _ := newSessionServer(t, nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp/demo/events/stream", nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("missing manager should 501, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	srv, _ = newSessionServer(t, func(s *Server) { s.SetMCP(&mcp.Manager{}) })
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp/demo/events/stream", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing event name should 400, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp/demo/events/stream?name=job.finished", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown server should 404, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestMCPResourceRead(t *testing.T) {
 	srv, _ := newSessionServer(t, nil)
 	rec := httptest.NewRecorder()
