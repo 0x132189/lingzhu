@@ -12,14 +12,14 @@ import (
 // CatalogEntry is one tool rendered for the Code Mode catalog.
 type CatalogEntry struct {
 	// Path is the call expression inside execute, such as "read" or "lingzhu.models".
-	Path string
+	Path string `json:"path"`
 	// Signature is the rendered call expression with its parameter object and
 	// return type.
-	Signature string
+	Signature string `json:"signature"`
 	// Description is the first line of the tool description.
-	Description string
+	Description string `json:"description"`
 	// Namespace is the leading path segment, or "" for a top-level tool.
-	Namespace string
+	Namespace string `json:"namespace"`
 }
 
 // descriptionLimit keeps one catalog line readable.
@@ -27,6 +27,11 @@ const descriptionLimit = 120
 
 // catalogBudget is the approximate character budget for the inline catalog.
 const catalogBudget = 8000
+
+// searchSignature documents the `search` helper used by a partial catalog. It
+// mirrors the returned JSON so a model can use the result without guessing
+// field names or the accepted argument shapes.
+const searchSignature = "search(query: string | { query?: string; namespace?: string; limit?: number; offset?: number }): { items: { path: string; signature: string; description: string; namespace: string }[]; remaining: number; next: { offset: number } | null }"
 
 // noCodemodeTools is the reference harness wording for a session without
 // Code Mode-eligible tools, such as a plain built-in-only session.
@@ -94,11 +99,13 @@ func sectionFromDefs(defs []model.ToolDef) string {
 	if shown < len(lines) {
 		b.WriteString("The tools listed below, and `search`, cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.\n\n")
 		b.WriteString("The catalog is partial. Before calling a tool that is not listed below, find it with the global `search(...)` function. Do not guess tool names. Each result's `path` is the complete call expression: write it out as code, for example `await tools.ns.tool_name({ ... })`. Do not use it as a key such as `tools[path]`.\n")
+		b.WriteString("- " + searchSignature + "\n")
 	} else {
 		b.WriteString("The tools listed below cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.\n\n")
 		b.WriteString("The catalog is complete. Do not guess tool names.\n")
 	}
-	b.WriteString("Every nested call resolves to the tool's text output as a string. Return a value or log with `console.log` to see it in the result.\n")
+	b.WriteString("Only the tools listed below, plus any returned by `search`, are available inside `execute`. Never call or recommend a tool that is not in this catalog.\n")
+	b.WriteString("Every nested tool call resolves to the tool's text output as a string; `search` returns a structured object. Return a value or log with `console.log` to see it in the result.\n")
 	b.WriteString("\n## Code Mode tools (call only inside `execute`)\n\n")
 	b.WriteString(strings.Join(lines[:shown], "\n"))
 	if shown < len(lines) {

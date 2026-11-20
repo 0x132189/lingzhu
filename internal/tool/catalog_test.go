@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -166,6 +167,18 @@ func TestCatalogSignature(t *testing.T) {
 	}
 }
 
+func TestCatalogEntryJSONTags(t *testing.T) {
+	data, err := json.Marshal(CatalogEntry{Path: "tools.echo", Signature: "echo()", Description: "Echo.", Namespace: "echo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"path":"tools.echo"`, `"signature":"echo()"`, `"description":"Echo."`, `"namespace":"echo"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("catalog entry missing %s: %s", want, data)
+		}
+	}
+}
+
 func TestCatalogSectionExplainsNestedResults(t *testing.T) {
 	section := catalogRegistry().Catalog()
 	for _, want := range []string{"# Code Mode", "Code Mode tools (call only inside `execute`)", "text output as a string"} {
@@ -195,6 +208,30 @@ func TestCatalogSectionMentionsSearch(t *testing.T) {
 	for _, want := range []string{"# Code Mode", "tools.read({", "The catalog is complete"} {
 		if !strings.Contains(section, want) {
 			t.Fatalf("section missing %q:\n%s", want, section)
+		}
+	}
+}
+
+func TestCatalogSectionMentionsCatalogOnlyRule(t *testing.T) {
+	section := catalogRegistry().Catalog()
+	if !strings.Contains(section, "Never call or recommend a tool that is not in this catalog") {
+		t.Fatalf("catalog must forbid tools outside the catalog:\n%s", section)
+	}
+}
+
+func TestCatalogPartialSectionMentionsSearchSignature(t *testing.T) {
+	registry := NewRegistry()
+	for i := 0; i < 200; i++ {
+		registry.Add(Codemode(catalogTool{
+			name:        fmt.Sprintf("sample_%03d", i),
+			description: strings.Repeat("x", 40),
+			schema:      `{"type":"object"}`,
+		}))
+	}
+	section := registry.Catalog()
+	for _, want := range []string{"The catalog is partial", "search(query: string |", "remaining: number", "next: { offset: number } | null"} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("partial catalog missing %q:\n%s", want, section)
 		}
 	}
 }

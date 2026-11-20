@@ -57,6 +57,87 @@ func TestExecuteRunsNestedTools(t *testing.T) {
 	}
 }
 
+func TestExecuteSearchAcceptsString(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not available")
+	}
+	registry := NewRegistry()
+	registry.Add(Codemode(echoTool{}))
+	execute := NewExecute(registry, ".")
+	out, err := execute.Run(context.Background(), Call{
+		Name:     "execute",
+		Input:    json.RawMessage(`{"code":"const a = await search('echo'); const b = await search('tools.echo'); return a.items[0].path + '|' + b.items[0].path;"}`),
+		Metadata: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "tools.echo|tools.echo" {
+		t.Fatalf("search path = %q, want tools.echo|tools.echo", out)
+	}
+}
+
+func TestExecuteSearchReturnsObject(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not available")
+	}
+	registry := NewRegistry()
+	registry.Add(Codemode(echoTool{}))
+	execute := NewExecute(registry, ".")
+	code := "const r = await search({ query: 'echo' }); return JSON.stringify({ array: Array.isArray(r.items), path: r.items[0].path, sig: typeof r.items[0].signature });"
+	out, err := execute.Run(context.Background(), Call{
+		Name:     "execute",
+		Input:    json.RawMessage(`{"code":"` + code + `"}`),
+		Metadata: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != `{"array":true,"path":"tools.echo","sig":"string"}` {
+		t.Fatalf("search result = %q", out)
+	}
+}
+
+func TestExecuteSearchEmptyItems(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not available")
+	}
+	registry := NewRegistry()
+	registry.Add(Codemode(echoTool{}))
+	execute := NewExecute(registry, ".")
+	code := "const r = await search('no-such-tool'); return JSON.stringify({ array: Array.isArray(r.items), len: r.items.length, next: r.next });"
+	out, err := execute.Run(context.Background(), Call{
+		Name:     "execute",
+		Input:    json.RawMessage(`{"code":"` + code + `"}`),
+		Metadata: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != `{"array":true,"len":0,"next":null}` {
+		t.Fatalf("empty search result = %q", out)
+	}
+}
+
+func TestExecuteFetchRejectsFileURL(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not available")
+	}
+	execute := NewExecute(NewRegistry(), ".")
+	code := "try { await fetch('file:///C:/'); return 'no-error'; } catch (e) { return String(e.message || e); }"
+	out, err := execute.Run(context.Background(), Call{
+		Name:     "execute",
+		Input:    json.RawMessage(`{"code":"` + code + `"}`),
+		Metadata: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "fetch cannot be used for filesystem access." {
+		t.Fatalf("file fetch error = %q", out)
+	}
+}
+
 func TestExecuteFileGlobals(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node is not available")

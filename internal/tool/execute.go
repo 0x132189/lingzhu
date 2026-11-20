@@ -20,9 +20,8 @@ import (
 	"time"
 )
 
-// Execute runs JavaScript in Code Mode. The script can call the other tools
-// through tool(name, args) or tools.name(args); the host performs each call and
-// returns its text result to the script.
+// Execute runs JavaScript in Code Mode. The script calls the other tools through
+// tools.name(args); the host performs each call and returns its text result.
 type Execute struct {
 	Registry *Registry
 	Dir      string
@@ -46,9 +45,9 @@ func (e *Execute) AcceptsRawInput() bool { return true }
 
 func (e *Execute) Description() string {
 	if e.FullCodemode {
-		return "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results. Call other tools with tool(name, args) or tools.name(args) when they are listed in the system prompt; `shell`, `read`, `write`, `edit` and `patch` are Code Mode tools there, while `glob`, `grep` and `webfetch` are direct tools. `fetch` is available for HTTP requests, and Bun's file APIs (`Bun.file`, `Bun.write`, `Bun.Glob`) for files, in place of Node's `fs` (`Bun.Glob.scan` is async; `scanSync` is unavailable). Imports and timers are unavailable: there is no `setTimeout` or sleep. The same permission rules as the direct tools apply. Return a string or JSON value, or log with console.log."
+		return "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results. Call other tools through `tools.name(args)` only when they are listed in the Code Mode catalog; `shell`, `read`, `write`, `edit` and `patch` are Code Mode tools there, while `glob`, `grep` and `webfetch` are direct tools. `fetch` is available for HTTP requests, and Bun's file APIs (`Bun.file`, `Bun.write`, `Bun.Glob`) for files, in place of Node's `fs` (`Bun.Glob.scan` is async; `scanSync` is unavailable). Imports and timers are unavailable: there is no `setTimeout` or sleep. The same permission rules as the direct tools apply. Inside `execute`, only the tools listed in the Code Mode catalog or returned by `search` are callable; ignore tools shown outside the catalog. Use exact paths, await every call whose completion matters, and prefer an explicit return over a bare final expression. Log with `console.log` to see intermediate values."
 	}
-	return "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results. Call other tools with tool(name, args) or tools.name(args) only when they are listed in the system prompt; shell, read, write, edit, glob, grep, patch and webfetch are direct tools and must be called as top-level tool calls. `fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. The same permission rules as the direct tools apply. Return a string or JSON value, or log with console.log."
+	return "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results. Call other tools through `tools.name(args)` only when they are listed in the Code Mode catalog; shell, read, write, edit, glob, grep, patch and webfetch are direct tools and must be called as top-level tool calls. `fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. The same permission rules as the direct tools apply. Inside `execute`, only the tools listed in the Code Mode catalog or returned by `search` are callable; ignore tools shown outside the catalog. Use exact paths, await every call whose completion matters, and prefer an explicit return over a bare final expression. Log with `console.log` to see intermediate values."
 }
 
 func (e *Execute) Schema() json.RawMessage {
@@ -675,8 +674,11 @@ func (e *Execute) searchCatalog(raw json.RawMessage, call Call) (string, error) 
 		Offset    int    `json:"offset"`
 	}
 	if len(raw) > 0 && string(raw) != "null" {
-		if err := json.Unmarshal(raw, &input); err != nil {
-			return "", fmt.Errorf("search: %w", err)
+		var query string
+		if err := json.Unmarshal(raw, &query); err == nil {
+			input.Query = query
+		} else if err := json.Unmarshal(raw, &input); err != nil {
+			return "", errors.New("search: expected a query string or an object with query, namespace, limit and offset")
 		}
 	}
 	var entries []CatalogEntry
@@ -694,7 +696,18 @@ func (e *Execute) searchCatalog(raw json.RawMessage, call Call) (string, error) 
 		}
 		entries = allowed
 	}
-	items, remaining, next := searchEntries(entries, input.Query, input.Namespace, input.Limit, input.Offset)
+	query := strings.TrimPrefix(input.Query, "tools.")
+	namespace := strings.TrimPrefix(input.Namespace, "tools.")
+	if namespace == "tools" {
+		namespace = ""
+	}
+	items, remaining, next := searchEntries(entries, query, namespace, input.Limit, input.Offset)
+	if items == nil {
+		items = []CatalogEntry{}
+	}
+	for index := range items {
+		items[index].Path = "tools." + items[index].Path
+	}
 	result := map[string]any{
 		"items":     items,
 		"remaining": remaining,
@@ -791,8 +804,9 @@ const guardedFetch = async (input, init) => {
   const raw = typeof input === "string" ? input : input && typeof input === "object" && "url" in input ? String(input.url) : "";
   if (!raw) throw new TypeError("fetch: URL is required");
   const parsed = new URL(raw);
+  if (parsed.protocol === "file:") throw new Error("fetch cannot be used for filesystem access.");
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("fetch only supports http and https URLs");
-  if (parsed.username || parsed.password) throw new TypeError("fetch cannot use credentials in the URL");
+  if (parsed.username || parsed.password) throw new TypeError("fetch cannot be used with credentials in the URL");
   if (typeof nativeFetch !== "function") throw new Error("fetch is unavailable in this Node.js runtime");
   const timeout = AbortSignal.timeout(30000);
   const signal = init && init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
@@ -991,7 +1005,7 @@ input.on("line", (line) => {
       for (const name of toolNames) tools[name] = (args) => call(String(name), args);
       globalThis.tool = call;
       globalThis.tools = tools;
-      globalThis.search = (input) => call("__search", input ?? {});
+      globalThis.search = async (input) => JSON.parse(String(await call("__search", input ?? {})));
     ` + "`" + `, context);
     const value = await vm.runInContext("(async () => {\n" + code + "\n})()", context);
     let output;

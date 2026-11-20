@@ -83,6 +83,14 @@ func (echoTool) Run(ctx context.Context, call tool.Call) (string, error) {
 
 // barrierTool blocks until every concurrently started tool has announced
 // itself. A sequential runner would deadlock on the second tool.
+type lateTool struct{}
+
+func (lateTool) Name() string            { return "late" }
+func (lateTool) Description() string     { return "late tool" }
+func (lateTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+
+func (lateTool) Run(context.Context, tool.Call) (string, error) { return "", nil }
+
 type barrierTool struct {
 	name    string
 	started chan<- string
@@ -661,6 +669,54 @@ func TestInstructionStateFreezesPrefixAndSendsUpdates(t *testing.T) {
 	}
 	if !strings.Contains(snapshot.current["agents"], "project rules v2") {
 		t.Fatalf("current values should track the latest sections: %+v", snapshot.current)
+	}
+}
+
+func TestInstructionUpdateAddsLateCodemodeTool(t *testing.T) {
+	call := provider.Chunk{ToolCalls: []provider.ToolCallDelta{
+		{Index: 0, ID: "call_1", Name: "echo", Arguments: `{}`},
+	}}
+	fake := &fakeProvider{chunks: [][]provider.Chunk{{call}, {{Text: "done"}}}}
+	store := testStore(t)
+	registry := tool.NewRegistry()
+	registry.Add(echoTool{})
+
+	added := false
+	a := New(store, testCatalog(fake, "test-model", 0), registry, nil, Options{
+		MaxSteps: 4,
+		SystemPartsFunc: func(string, provider.Target) prompt.Parts {
+			// The first request starts with no Code Mode tools. The next request
+			// sees a tool that arrived while the turn was running.
+			if len(fake.requests) > 0 && !added {
+				registry.Add(tool.Codemode(lateTool{}))
+				added = true
+			}
+			return prompt.Parts{
+				Base: "base prompt",
+				Sections: []prompt.Section{
+					{Key: "codemode", Text: registry.Catalog()},
+				},
+			}
+		},
+	})
+
+	stream, err := a.Run(context.Background(), "s1", "go", provider.Selection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("want two model requests, got %d", len(fake.requests))
+	}
+	var update string
+	for _, message := range fake.requests[1].Messages {
+		if message.Synthetic && strings.Contains(message.Content, "tools.late") {
+			update = message.Content
+		}
+	}
+	if update == "" {
+		t.Fatalf("late Code Mode tool did not produce an instruction update: %+v", fake.requests[1].Messages)
 	}
 }
 
