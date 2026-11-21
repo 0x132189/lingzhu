@@ -51,6 +51,9 @@ func TestCreateListAndRemove(t *testing.T) {
 	if entry.Branch != "lingzhu/feature" {
 		t.Fatalf("unexpected branch: %+v", entry)
 	}
+	if !entry.Managed {
+		t.Fatalf("created worktree should be managed: %+v", entry)
+	}
 	if _, err := os.Stat(filepath.Join(entry.Path, "a.txt")); err != nil {
 		t.Fatalf("worktree files missing: %v", err)
 	}
@@ -64,6 +67,9 @@ func TestCreateListAndRemove(t *testing.T) {
 	}
 	if len(entries) != 2 || !entries[0].Main || entries[1].Path != entry.Path {
 		t.Fatalf("unexpected worktree list: %+v", entries)
+	}
+	if !entries[1].Managed {
+		t.Fatalf("created worktree should be managed: %+v", entries[1])
 	}
 
 	if _, err := manager.Create(ctx, "feature", "", ""); err == nil {
@@ -101,5 +107,45 @@ func TestRejectsInvalidNamesAndNonRepository(t *testing.T) {
 	}
 	if _, err := New(t.TempDir(), t.TempDir()); err == nil {
 		t.Fatal("non-git directory should be rejected")
+	}
+}
+
+func TestLinkedWorktreeUsesMainRepository(t *testing.T) {
+	repo := initRepo(t)
+	dataDir := t.TempDir()
+	manager, err := New(repo, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	entry, err := manager.Create(ctx, "feature", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	linked, err := New(entry.Path, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !samePath(linked.Repo(), repo) {
+		t.Fatalf("linked manager repo = %s, want %s", linked.Repo(), repo)
+	}
+	entries, err := linked.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || !entries[0].Main || !samePath(entries[0].Path, repo) {
+		t.Fatalf("linked manager should still mark the main checkout: %+v", entries)
+	}
+	if entries[1].Main || !entries[1].Managed {
+		t.Fatalf("linked checkout should be a managed worktree: %+v", entries[1])
+	}
+
+	second, err := linked.Create(ctx, "second", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Managed {
+		t.Fatalf("worktree created from a linked checkout should be managed: %+v", second)
 	}
 }

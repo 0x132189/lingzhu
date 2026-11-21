@@ -23,17 +23,20 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // Entry is one worktree reported by git.
 type Entry struct {
-	Path   string `json:"path"`
-	Branch string `json:"branch,omitempty"`
-	Head   string `json:"head,omitempty"`
-	Main   bool   `json:"main"`
-	Size   int64  `json:"size"`
+	Path    string `json:"path"`
+	Branch  string `json:"branch,omitempty"`
+	Head    string `json:"head,omitempty"`
+	Main    bool   `json:"main"`
+	Managed bool   `json:"managed"`
+	Size    int64  `json:"size"`
 }
 
 // Manager owns worktrees derived from one repository.
 type Manager struct {
 	repo string
+	main string
 	base string
+	root string
 	mu   sync.Mutex
 }
 
@@ -55,20 +58,44 @@ func New(workdir, dataDir string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(repo))))
-	base := filepath.Join(dataDir, "worktrees", hex.EncodeToString(sum[:8]))
+	main := mainWorktree(repo)
+	sum := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(main))))
+	root := filepath.Join(dataDir, "worktrees")
+	base := filepath.Join(root, hex.EncodeToString(sum[:8]))
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return nil, err
 	}
-	return &Manager{repo: repo, base: base}, nil
+	return &Manager{repo: repo, main: main, base: base, root: root}, nil
 }
 
-// Repo returns the discovered repository root.
+// mainWorktree resolves a linked checkout back to the repository's first
+// worktree, so every manager for the repository shares one storage directory
+// and marks the same checkout as main.
+func mainWorktree(repo string) string {
+	common, err := gitOutput(context.Background(), repo, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return repo
+	}
+	common = strings.TrimSpace(common)
+	if common == "" {
+		return repo
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(repo, common)
+	}
+	common = filepath.Clean(common)
+	if !strings.EqualFold(filepath.Base(common), ".git") {
+		return repo
+	}
+	return filepath.Dir(common)
+}
+
+// Repo returns the repository's main worktree.
 func (m *Manager) Repo() string {
 	if m == nil {
 		return ""
 	}
-	return m.repo
+	return m.main
 }
 
 // List returns the repository's worktrees, main first.
@@ -87,7 +114,8 @@ func (m *Manager) List(ctx context.Context) ([]Entry, error) {
 			return
 		}
 		current.Path = filepath.Clean(current.Path)
-		current.Main = samePath(current.Path, m.repo)
+		current.Main = samePath(current.Path, m.main)
+		current.Managed = isManagedPath(m.root, current.Path)
 		current.Size = directorySize(current.Path)
 		entries = append(entries, *current)
 		current = nil
@@ -226,7 +254,8 @@ func (m *Manager) listUnlocked(ctx context.Context) ([]Entry, error) {
 			return
 		}
 		current.Path = filepath.Clean(current.Path)
-		current.Main = samePath(current.Path, m.repo)
+		current.Main = samePath(current.Path, m.main)
+		current.Managed = isManagedPath(m.root, current.Path)
 		current.Size = directorySize(current.Path)
 		entries = append(entries, *current)
 		current = nil
@@ -263,6 +292,26 @@ func samePath(a, b string) bool {
 		return strings.EqualFold(a, b)
 	}
 	return a == b
+}
+
+// isManagedPath reports whether a checkout lives in this manager's storage
+// directory, which is how a worktree created by the app is distinguished from
+// one created outside it.
+func isManagedPath(base, path string) bool {
+	if base == "" {
+		return false
+	}
+	base = filepath.Clean(base)
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		base = strings.ToLower(base)
+		path = strings.ToLower(path)
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
